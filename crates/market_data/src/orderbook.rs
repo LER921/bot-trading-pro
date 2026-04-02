@@ -11,6 +11,8 @@ pub struct OrderBookCache {
     last_update_id: u64,
     exchange_time: Option<Timestamp>,
     observed_at: Option<Timestamp>,
+    last_event_latency_ms: Option<i64>,
+    book_crossed: bool,
     needs_resync: bool,
 }
 
@@ -23,6 +25,8 @@ impl OrderBookCache {
             last_update_id: 0,
             exchange_time: None,
             observed_at: None,
+            last_event_latency_ms: None,
+            book_crossed: false,
             needs_resync: true,
         }
     }
@@ -42,7 +46,16 @@ impl OrderBookCache {
         self.last_update_id = snapshot.last_update_id;
         self.exchange_time = snapshot.exchange_time;
         self.observed_at = Some(snapshot.observed_at);
+        self.last_event_latency_ms = snapshot
+            .exchange_time
+            .map(|exchange_time| (snapshot.observed_at - exchange_time).whole_milliseconds() as i64);
+        self.book_crossed = false;
         self.needs_resync = false;
+
+        if self.validate_book().is_err() {
+            self.book_crossed = true;
+            self.needs_resync = true;
+        }
     }
 
     pub fn apply_delta(&mut self, delta: OrderBookDelta) -> Result<()> {
@@ -54,13 +67,15 @@ impl OrderBookCache {
             return Ok(());
         }
 
-        if delta.first_update_id > self.last_update_id.saturating_add(1) {
+        let next_expected = self.last_update_id.saturating_add(1);
+        if delta.first_update_id > next_expected || delta.final_update_id < next_expected {
             self.needs_resync = true;
             bail!(
-                "missed depth updates for {}: {} > {} + 1",
+                "depth sequence gap for {}: expected {}, got [{}..={}]",
                 self.symbol,
+                next_expected,
                 delta.first_update_id,
-                self.last_update_id
+                delta.final_update_id
             );
         }
 
@@ -69,11 +84,23 @@ impl OrderBookCache {
         self.last_update_id = delta.final_update_id;
         self.exchange_time = Some(delta.exchange_time);
         self.observed_at = Some(delta.received_at);
+        self.last_event_latency_ms =
+            Some((delta.received_at - delta.exchange_time).whole_milliseconds() as i64);
+
+        self.validate_book()?;
         Ok(())
     }
 
     pub fn needs_resync(&self) -> bool {
         self.needs_resync
+    }
+
+    pub fn last_event_latency_ms(&self) -> Option<i64> {
+        self.last_event_latency_ms
+    }
+
+    pub fn book_crossed(&self) -> bool {
+        self.book_crossed
     }
 
     pub fn snapshot(&self, depth: usize) -> Option<OrderBookSnapshot> {
@@ -119,6 +146,27 @@ impl OrderBookCache {
             observed_at,
         })
     }
+
+    fn validate_book(&mut self) -> Result<()> {
+        let Some(best) = self.best_bid_ask() else {
+            self.needs_resync = true;
+            bail!("order book for {} has no best bid/ask", self.symbol);
+        };
+
+        if best.bid_price >= best.ask_price {
+            self.book_crossed = true;
+            self.needs_resync = true;
+            bail!(
+                "order book crossed for {}: bid {} >= ask {}",
+                self.symbol,
+                best.bid_price,
+                best.ask_price
+            );
+        }
+
+        self.book_crossed = false;
+        Ok(())
+    }
 }
 
 fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: Vec<PriceLevel>) {
@@ -128,5 +176,49 @@ fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: Vec<PriceLevel>) 
         } else {
             side.insert(level.price, level.quantity);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::now_utc;
+
+    fn snapshot() -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            symbol: Symbol::BtcUsdc,
+            bids: vec![PriceLevel {
+                price: Decimal::from(60_000u32),
+                quantity: Decimal::from_str_exact("0.5").unwrap(),
+            }],
+            asks: vec![PriceLevel {
+                price: Decimal::from(60_010u32),
+                quantity: Decimal::from_str_exact("0.4").unwrap(),
+            }],
+            last_update_id: 10,
+            exchange_time: Some(now_utc()),
+            observed_at: now_utc(),
+        }
+    }
+
+    #[test]
+    fn marks_book_for_resync_on_gap() {
+        let mut cache = OrderBookCache::new(Symbol::BtcUsdc);
+        cache.apply_snapshot(snapshot());
+
+        let error = cache
+            .apply_delta(OrderBookDelta {
+                symbol: Symbol::BtcUsdc,
+                first_update_id: 15,
+                final_update_id: 16,
+                bids: Vec::new(),
+                asks: Vec::new(),
+                exchange_time: now_utc(),
+                received_at: now_utc(),
+            })
+            .expect_err("gap should require resync");
+
+        assert!(error.to_string().contains("depth sequence gap"));
+        assert!(cache.needs_resync());
     }
 }

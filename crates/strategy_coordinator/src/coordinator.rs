@@ -1,3 +1,4 @@
+use common::Decimal;
 use domain::{RegimeState, RuntimeState, StrategyContext, StrategyOutcome};
 use strategy_mm::MarketMakingStrategy;
 use strategy_scalp::ScalpingStrategy;
@@ -24,7 +25,16 @@ impl DefaultStrategyCoordinator {
 
         match context.regime.state {
             RegimeState::Range => StrategySelection::MarketMaking,
-            RegimeState::TrendUp | RegimeState::TrendDown => StrategySelection::Scalping,
+            RegimeState::TrendUp | RegimeState::TrendDown => {
+                if context.features.local_momentum_bps.abs() >= Decimal::from(8u32)
+                    && context.features.trade_flow_imbalance.abs()
+                        >= Decimal::from_str_exact("0.20").unwrap()
+                {
+                    StrategySelection::Scalping
+                } else {
+                    StrategySelection::MarketMaking
+                }
+            }
             _ => StrategySelection::Standby,
         }
     }

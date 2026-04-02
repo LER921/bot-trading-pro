@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 common = { path = "../common" }
 domain = { path = "../domain" }
+time.workspace = true

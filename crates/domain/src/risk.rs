@@ -35,6 +35,8 @@ pub struct RiskLimits {
     pub inventory: InventoryControl,
     pub max_daily_loss_usdc: Decimal,
     pub max_symbol_drawdown_usdc: Decimal,
+    pub max_total_exposure_quote: Decimal,
+    pub max_reject_rate: Decimal,
     pub stale_market_data_ms: u64,
     pub stale_account_events_ms: u64,
     pub max_clock_drift_ms: i64,

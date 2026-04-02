@@ -121,16 +121,32 @@ impl PortfolioService for InMemoryPortfolioService {
             base_position: Decimal::ZERO,
             quote_position: Decimal::ZERO,
             mark_price: Some(fill.price),
+            average_entry_price: Some(fill.price),
             updated_at: fill.event_time,
         });
 
-        let signed_qty = match fill.side {
-            Side::Buy => fill.quantity,
-            Side::Sell => -fill.quantity,
-        };
+        match fill.side {
+            Side::Buy => {
+                let previous_base = entry.base_position.max(Decimal::ZERO);
+                let new_base = previous_base + fill.quantity;
+                entry.average_entry_price = if new_base.is_zero() {
+                    None
+                } else {
+                    let previous_cost = previous_base * entry.average_entry_price.unwrap_or(fill.price);
+                    Some((previous_cost + fill.quantity * fill.price) / new_base)
+                };
+                entry.base_position += fill.quantity;
+                entry.quote_position -= fill.quantity * fill.price;
+            }
+            Side::Sell => {
+                entry.base_position -= fill.quantity;
+                entry.quote_position += fill.quantity * fill.price;
+                if entry.base_position <= Decimal::ZERO {
+                    entry.average_entry_price = None;
+                }
+            }
+        }
 
-        entry.base_position += signed_qty;
-        entry.quote_position -= signed_qty * fill.price;
         entry.mark_price = Some(fill.price);
         entry.updated_at = fill.event_time;
         Ok(())
@@ -143,6 +159,7 @@ impl PortfolioService for InMemoryPortfolioService {
             base_position: Decimal::ZERO,
             quote_position: Decimal::ZERO,
             mark_price: Some(mark_price),
+            average_entry_price: None,
             updated_at: now_utc(),
         });
         entry.mark_price = Some(mark_price);
@@ -206,6 +223,7 @@ fn sync_inventory(
         base_position: Decimal::ZERO,
         quote_position,
         mark_price: None,
+        average_entry_price: None,
         updated_at,
     });
 

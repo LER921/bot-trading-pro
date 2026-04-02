@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+common = { path = "../common" }
 domain = { path = "../domain" }
 strategy_mm = { path = "../strategy_mm" }
 strategy_scalp = { path = "../strategy_scalp" }

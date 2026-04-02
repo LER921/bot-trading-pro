@@ -108,6 +108,7 @@ pub struct MarketTrade {
     pub quantity: Decimal,
     pub aggressor_side: Side,
     pub event_time: Timestamp,
+    pub received_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +117,11 @@ pub struct MarketDataStatus {
     pub needs_resync: bool,
     pub last_orderbook_update_at: Option<Timestamp>,
     pub last_trade_update_at: Option<Timestamp>,
+    pub last_event_latency_ms: Option<i64>,
+    pub book_age_ms: Option<i64>,
+    pub trade_flow_rate: Decimal,
+    pub book_crossed: bool,
+    pub ws_reconnect_counter: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -124,5 +130,6 @@ pub struct MarketSnapshot {
     pub best_bid_ask: Option<BestBidAsk>,
     pub orderbook: Option<OrderBookSnapshot>,
     pub last_trade: Option<MarketTrade>,
+    pub recent_trades: Vec<MarketTrade>,
     pub status: MarketDataStatus,
 }

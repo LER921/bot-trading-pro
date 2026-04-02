@@ -849,6 +849,7 @@ fn parse_my_trade_response(symbol: Symbol, trade: BinanceMyTradeResponse) -> Res
 }
 
 fn parse_market_trade_response(symbol: Symbol, trade: BinanceTradeResponse) -> Result<MarketTrade> {
+    let event_time = millis_timestamp(trade.time as i64)?;
     Ok(MarketTrade {
         symbol,
         trade_id: trade.id.to_string(),
@@ -859,13 +860,15 @@ fn parse_market_trade_response(symbol: Symbol, trade: BinanceTradeResponse) -> R
         } else {
             Side::Buy
         },
-        event_time: millis_timestamp(trade.time as i64)?,
+        event_time,
+        received_at: now_utc(),
     })
 }
 
 fn parse_order_response(expected_symbol: Symbol, response: BinanceOrderResponse) -> Result<domain::ExecutionReport> {
     let filled_quantity = parse_decimal(&response.executed_quantity)?;
     let cumulative_quote = parse_decimal(&response.cumulative_quote_quantity)?;
+    let requested_price = None::<Decimal>;
     Ok(domain::ExecutionReport {
         client_order_id: response.client_order_id,
         exchange_order_id: Some(response.order_id.to_string()),
@@ -873,6 +876,10 @@ fn parse_order_response(expected_symbol: Symbol, response: BinanceOrderResponse)
         status: parse_order_status(&response.status)?,
         filled_quantity,
         average_fill_price: average_fill_price(filled_quantity, cumulative_quote),
+        fill_ratio: Decimal::ZERO,
+        requested_price,
+        slippage_bps: None,
+        decision_latency_ms: None,
         message: Some(format!("order accepted for {}", expected_symbol)),
         event_time: millis_timestamp(response.transact_time as i64)?,
     })
@@ -905,6 +912,7 @@ fn parse_depth_event(data: &Value) -> Result<BinanceMarketEvent> {
 
 fn parse_trade_event(data: &Value) -> Result<BinanceMarketEvent> {
     let symbol = parse_symbol(required_str(data, "s")?)?;
+    let event_time = millis_timestamp(required_i64(data, "T")?)?;
     Ok(BinanceMarketEvent::Trade(MarketTrade {
         symbol,
         trade_id: required_u64(data, "t")?.to_string(),
@@ -915,7 +923,8 @@ fn parse_trade_event(data: &Value) -> Result<BinanceMarketEvent> {
         } else {
             Side::Buy
         },
-        event_time: millis_timestamp(required_i64(data, "T")?)?,
+        event_time,
+        received_at: now_utc(),
     }))
 }
 
@@ -976,6 +985,29 @@ fn parse_execution_report_event(event: &Value) -> Result<BinanceUserStreamEvent>
             status,
             filled_quantity: cumulative_filled_quantity,
             average_fill_price: average_fill_price(cumulative_filled_quantity, cumulative_quote_quantity),
+            fill_ratio: {
+                let original_quantity = parse_decimal(required_str(event, "q")?)?;
+                if original_quantity.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    cumulative_filled_quantity / original_quantity
+                }
+            },
+            requested_price: optional_decimal(required_str(event, "p")?)?,
+            slippage_bps: match (
+                last_executed_price,
+                optional_decimal(required_str(event, "p")?)?,
+            ) {
+                (Some(fill_price), Some(limit_price)) if !limit_price.is_zero() => Some(
+                    ((fill_price - limit_price).abs() / limit_price) * Decimal::from(10_000u32),
+                ),
+                _ => None,
+            },
+            decision_latency_ms: event
+                .get("O")
+                .and_then(Value::as_i64)
+                .map(|created| required_i64(event, "E").map(|event_time| event_time - created))
+                .transpose()?,
             message: non_empty_string(event.get("r").and_then(Value::as_str))
                 .filter(|reason| reason != "NONE"),
             event_time: millis_timestamp(required_i64(event, "E")?)?,
@@ -1485,6 +1517,14 @@ impl BinanceSpotGateway for MockBinanceSpotGateway {
                 Decimal::ZERO
             },
             average_fill_price: request.price,
+            fill_ratio: if matches!(request.order_type, OrderType::Market) {
+                Decimal::ONE
+            } else {
+                Decimal::ZERO
+            },
+            requested_price: request.price,
+            slippage_bps: None,
+            decision_latency_ms: Some(0),
             message: Some("mock order accepted".to_string()),
             event_time: state.clock_time,
         };

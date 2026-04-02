@@ -9,4 +9,5 @@ anyhow.workspace = true
 async-trait.workspace = true
 common = { path = "../common" }
 domain = { path = "../domain" }
+time.workspace = true
 tokio.workspace = true

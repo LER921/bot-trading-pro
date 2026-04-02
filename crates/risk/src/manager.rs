@@ -2,9 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use common::{Decimal, now_utc};
 use domain::{
-    AccountSnapshot, ControlPlaneDecision, HealthState, InventorySnapshot, OpenOrder,
-    OperatorCommand, RiskAction, RiskDecision, RiskLimits, RiskMode, RuntimeState, Symbol,
-    SystemHealth, TradeIntent,
+    AccountSnapshot, ControlPlaneDecision, ExecutionStats, HealthState, InventorySnapshot, OpenOrder,
+    OperatorCommand, PnlSnapshot, RiskAction, RiskDecision, RiskLimits, RiskMode, RuntimeState,
+    Symbol, SystemHealth, TradeIntent,
 };
 use std::collections::HashMap;
 
@@ -16,6 +16,8 @@ pub struct RiskContext {
     pub inventory: HashMap<Symbol, InventorySnapshot>,
     pub open_orders: Vec<OpenOrder>,
     pub mid_prices: HashMap<Symbol, Decimal>,
+    pub pnl: PnlSnapshot,
+    pub execution_stats: ExecutionStats,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,16 +124,71 @@ impl StrictRiskManager {
         Some(reduced)
     }
 
-    fn check_drawdown_guard(&self) -> Option<String> {
-        self.hooks
-            .drawdown_guard_triggered
-            .then(|| "drawdown guard hook triggered".to_string())
+    fn total_exposure_quote(&self, context: &RiskContext) -> Decimal {
+        context.inventory.iter().fold(Decimal::ZERO, |acc, (symbol, inventory)| {
+            let mark = context
+                .mid_prices
+                .get(symbol)
+                .copied()
+                .or(inventory.mark_price)
+                .unwrap_or(Decimal::ZERO);
+            acc + inventory.base_position.abs() * mark
+        })
     }
 
-    fn check_reject_rate_guard(&self) -> Option<String> {
-        self.hooks
-            .reject_rate_guard_triggered
-            .then(|| "reject-rate guard hook triggered".to_string())
+    fn symbol_exposure_quote(&self, context: &RiskContext, symbol: Symbol) -> Decimal {
+        context
+            .inventory
+            .get(&symbol)
+            .map(|inventory| {
+                let mark = context
+                    .mid_prices
+                    .get(&symbol)
+                    .copied()
+                    .or(inventory.mark_price)
+                    .unwrap_or(Decimal::ZERO);
+                inventory.base_position.abs() * mark
+            })
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    fn check_drawdown_guard(&self, context: &RiskContext) -> Option<String> {
+        if self.hooks.drawdown_guard_triggered {
+            return Some("drawdown guard hook triggered".to_string());
+        }
+
+        if context.pnl.daily_pnl_quote <= -self.limits.max_daily_loss_usdc {
+            return Some("daily loss limit breached".to_string());
+        }
+
+        if context.pnl.drawdown_quote >= self.limits.max_daily_loss_usdc {
+            return Some("global drawdown limit breached".to_string());
+        }
+
+        if context
+            .pnl
+            .per_symbol
+            .iter()
+            .any(|symbol| symbol.drawdown_quote >= self.limits.max_symbol_drawdown_usdc)
+        {
+            return Some("per-symbol drawdown limit breached".to_string());
+        }
+
+        None
+    }
+
+    fn check_reject_rate_guard(&self, context: &RiskContext) -> Option<String> {
+        if self.hooks.reject_rate_guard_triggered {
+            return Some("reject-rate guard hook triggered".to_string());
+        }
+
+        if context.execution_stats.total_submitted >= 10
+            && context.execution_stats.reject_rate >= self.limits.max_reject_rate
+        {
+            return Some("reject-rate limit breached".to_string());
+        }
+
+        None
     }
 }
 
@@ -141,8 +198,8 @@ impl RiskManager for StrictRiskManager {
         let resulting_mode = self.resulting_mode(context.runtime_state);
         let runtime_block = !context.runtime_state.allows_new_orders();
         let health_block = self.is_health_blocking(&context.health);
-        let drawdown_guard = self.check_drawdown_guard();
-        let reject_rate_guard = self.check_reject_rate_guard();
+        let drawdown_guard = self.check_drawdown_guard(context);
+        let reject_rate_guard = self.check_reject_rate_guard(context);
         let mut projected_positions: HashMap<Symbol, Decimal> = context
             .inventory
             .iter()
@@ -163,38 +220,25 @@ impl RiskManager for StrictRiskManager {
         let mut decisions = Vec::with_capacity(intents.len());
         for intent in intents {
             let Some(symbol_limits) = self.limit_for_symbol(intent.symbol) else {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: "missing per-symbol risk limits".to_string(),
-                    resulting_mode,
-                    decided_at: now_utc(),
-                });
+                decisions.push(block(intent, "missing per-symbol risk limits", resulting_mode));
                 continue;
             };
 
             if runtime_block {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: "runtime state does not allow new orders".to_string(),
+                decisions.push(block(
+                    intent,
+                    "runtime state does not allow new orders",
                     resulting_mode,
-                    decided_at: now_utc(),
-                });
+                ));
                 continue;
             }
 
             if health_block {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: format!("health is not healthy: {:?}", context.health.overall_state),
+                decisions.push(block(
+                    intent,
+                    &format!("health is not healthy: {:?}", context.health.overall_state),
                     resulting_mode,
-                    decided_at: now_utc(),
-                });
+                ));
                 continue;
             }
 
@@ -225,26 +269,34 @@ impl RiskManager for StrictRiskManager {
                 .unwrap_or_default()
                 >= symbol_limits.max_open_orders as usize
             {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: "max open orders reached for symbol".to_string(),
-                    resulting_mode,
-                    decided_at: now_utc(),
-                });
+                decisions.push(block(intent, "max open orders reached for symbol", resulting_mode));
                 continue;
             }
 
             if self.notional_for_intent(&intent, context) > symbol_limits.max_quote_notional {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: "intent notional exceeds per-symbol limit".to_string(),
+                decisions.push(block(
+                    intent,
+                    "intent notional exceeds per-symbol limit",
                     resulting_mode,
-                    decided_at: now_utc(),
-                });
+                ));
+                continue;
+            }
+
+            if self.symbol_exposure_quote(context, intent.symbol) > symbol_limits.max_quote_notional
+                && !self.would_reduce_inventory(current_position, &intent)
+            {
+                decisions.push(block(
+                    intent,
+                    "symbol exposure already above allowed quote limit",
+                    resulting_mode,
+                ));
+                continue;
+            }
+
+            if self.total_exposure_quote(context) > self.limits.max_total_exposure_quote
+                && !self.would_reduce_inventory(current_position, &intent)
+            {
+                decisions.push(block(intent, "global quote exposure above limit", resulting_mode));
                 continue;
             }
 
@@ -252,14 +304,7 @@ impl RiskManager for StrictRiskManager {
             if projected_after.abs() > symbol_limits.max_inventory_base
                 && !self.would_reduce_inventory(current_position, &intent)
             {
-                decisions.push(RiskDecision {
-                    action: RiskAction::Block,
-                    original_intent: intent,
-                    approved_intent: None,
-                    reason: "intent would breach max inventory".to_string(),
-                    resulting_mode,
-                    decided_at: now_utc(),
-                });
+                decisions.push(block(intent, "intent would breach max inventory", resulting_mode));
                 continue;
             }
 
@@ -275,8 +320,10 @@ impl RiskManager for StrictRiskManager {
                         RiskAction::Approve
                     };
 
-                    projected_positions
-                        .insert(intent.symbol, project_inventory_position(current_position, &approved_intent));
+                    projected_positions.insert(
+                        intent.symbol,
+                        project_inventory_position(current_position, &approved_intent),
+                    );
                     *projected_open_orders.entry(intent.symbol).or_default() += 1;
 
                     decisions.push(RiskDecision {
@@ -334,6 +381,17 @@ impl RiskManager for StrictRiskManager {
     }
 }
 
+fn block(intent: TradeIntent, reason: &str, resulting_mode: RiskMode) -> RiskDecision {
+    RiskDecision {
+        action: RiskAction::Block,
+        original_intent: intent,
+        approved_intent: None,
+        reason: reason.to_string(),
+        resulting_mode,
+        decided_at: now_utc(),
+    }
+}
+
 fn project_inventory_position(position: Decimal, intent: &TradeIntent) -> Decimal {
     match intent.side {
         domain::Side::Buy => position + intent.quantity,
@@ -344,9 +402,7 @@ fn project_inventory_position(position: Decimal, intent: &TradeIntent) -> Decima
 #[cfg(test)]
 mod tests {
     use super::*;
-    use domain::{
-        Balance, RuntimeState, StrategyKind, Symbol, SystemHealth,
-    };
+    use domain::{Balance, RuntimeState, StrategyKind, SystemHealth};
 
     fn sample_limits() -> RiskLimits {
         RiskLimits {
@@ -364,9 +420,25 @@ mod tests {
             },
             max_daily_loss_usdc: Decimal::from(100u32),
             max_symbol_drawdown_usdc: Decimal::from(50u32),
+            max_total_exposure_quote: Decimal::from(5_000u32),
+            max_reject_rate: Decimal::from_str_exact("0.30").unwrap(),
             stale_market_data_ms: 1_000,
             stale_account_events_ms: 1_000,
             max_clock_drift_ms: 100,
+        }
+    }
+
+    fn empty_pnl(now: common::Timestamp) -> PnlSnapshot {
+        PnlSnapshot {
+            realized_pnl_quote: Decimal::ZERO,
+            unrealized_pnl_quote: Decimal::ZERO,
+            net_pnl_quote: Decimal::ZERO,
+            fees_quote: Decimal::ZERO,
+            daily_pnl_quote: Decimal::ZERO,
+            peak_net_pnl_quote: Decimal::ZERO,
+            drawdown_quote: Decimal::ZERO,
+            per_symbol: Vec::new(),
+            updated_at: now,
         }
     }
 
@@ -386,6 +458,8 @@ mod tests {
             inventory: HashMap::new(),
             open_orders: Vec::new(),
             mid_prices: HashMap::from([(Symbol::BtcUsdc, Decimal::from(60_000u32))]),
+            pnl: empty_pnl(now),
+            execution_stats: ExecutionStats::empty(now),
         }
     }
 
@@ -401,8 +475,13 @@ mod tests {
             post_only: true,
             reduce_only: false,
             time_in_force: Some(domain::TimeInForce::Gtc),
+            expected_edge_bps: Decimal::from(5u32),
+            expected_fee_bps: Decimal::ONE,
+            expected_slippage_bps: Decimal::ONE,
+            edge_after_cost_bps: Decimal::from(3u32),
             reason: "test".to_string(),
             created_at: now_utc(),
+            expires_at: None,
         }
     }
 
@@ -437,6 +516,7 @@ mod tests {
                 base_position: Decimal::from_str_exact("0.095").unwrap(),
                 quote_position: Decimal::ZERO,
                 mark_price: Some(Decimal::from(60_000u32)),
+                average_entry_price: Some(Decimal::from(59_900u32)),
                 updated_at: now_utc(),
             },
         );
@@ -451,5 +531,15 @@ mod tests {
             .as_ref()
             .expect("approved intent")
             .reduce_only);
+    }
+
+    #[tokio::test]
+    async fn blocks_when_daily_loss_limit_is_breached() {
+        let manager = StrictRiskManager::new(sample_limits());
+        let mut context = sample_context();
+        context.pnl.daily_pnl_quote = Decimal::from(-150i32);
+
+        let decisions = manager.evaluate(vec![sample_intent()], &context).await.unwrap();
+        assert_eq!(decisions[0].action, RiskAction::Block);
     }
 }

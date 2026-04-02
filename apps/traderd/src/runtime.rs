@@ -18,16 +18,19 @@ use portfolio::{InMemoryPortfolioService, PortfolioService};
 use regime::{ExecutionRegimeDetector, RegimeDetector};
 use risk::{RiskContext, RiskManager, StrictRiskManager};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use storage::{MemoryStorage, StorageEngine};
+use storage::{MemoryStorage, SqliteStorage, StorageEngine};
 use strategy_coordinator::DefaultStrategyCoordinator;
 use telemetry::{TelemetrySink, TracingTelemetry};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{info, warn};
 
 const LOOP_INTERVAL_MS: u64 = 1_000;
+const STALE_QUOTE_CANCEL_MS: i64 = 5_000;
+const BOOTSTRAP_TRADE_SEED_LIMIT: usize = 50;
 
-#[derive(Debug)]
 pub struct TraderRuntime<G>
 where
     G: BinanceSpotGateway + Clone + Send + Sync + 'static,
@@ -45,7 +48,7 @@ where
     execution: BinanceExecutionEngine<G>,
     portfolio: InMemoryPortfolioService,
     accounting: InMemoryAccountingService,
-    storage: MemoryStorage,
+    storage: Arc<dyn StorageEngine>,
     telemetry: TracingTelemetry,
     seen_fills: HashSet<String>,
     market_stream: Option<MarketStreamHandle>,
@@ -56,7 +59,7 @@ impl<G> TraderRuntime<G>
 where
     G: BinanceSpotGateway + Clone + Send + Sync + 'static,
 {
-    pub fn new(config: AppConfig, gateway: G) -> Self {
+    pub fn new(config: AppConfig, gateway: G) -> Result<Self> {
         let symbols = config.enabled_symbols();
         let budgets = config
             .pairs
@@ -70,7 +73,14 @@ where
             })
             .collect::<Vec<_>>();
 
-        Self {
+        let storage_path = PathBuf::from(&config.runtime.state_dir).join("traderd.sqlite3");
+        let storage: Arc<dyn StorageEngine> = if config.runtime.environment.eq_ignore_ascii_case("test") {
+            Arc::new(MemoryStorage::default())
+        } else {
+            Arc::new(SqliteStorage::new(storage_path)?)
+        };
+
+        Ok(Self {
             risk_manager: StrictRiskManager::new(config.risk_limits()),
             execution: BinanceExecutionEngine::new(gateway.clone(), symbols.clone()),
             portfolio: InMemoryPortfolioService::new(budgets),
@@ -80,16 +90,16 @@ where
             state_machine: RuntimeStateMachine::new(RuntimeState::Bootstrap, "runtime initialized"),
             health_tracker: HealthTracker::default(),
             market_data: InMemoryMarketDataService::default(),
-            features: SimpleFeatureEngine,
+            features: SimpleFeatureEngine::default(),
             regime_detector: ExecutionRegimeDetector::default(),
             strategy_coordinator: DefaultStrategyCoordinator::default(),
             accounting: InMemoryAccountingService::default(),
-            storage: MemoryStorage::default(),
+            storage,
             telemetry: TracingTelemetry,
             seen_fills: HashSet::new(),
             market_stream: None,
             user_stream: None,
-        }
+        })
     }
 
     pub fn state(&self) -> RuntimeState {
@@ -137,12 +147,10 @@ where
             self.market_data.apply_orderbook_snapshot(orderbook).await?;
             self.health_tracker.record_orderbook(symbol, observed_at);
 
-            if let Some(trade) = self
+            for trade in self
                 .gateway
-                .fetch_recent_trades(symbol, 1)
+                .fetch_recent_trades(symbol, BOOTSTRAP_TRADE_SEED_LIMIT)
                 .await?
-                .into_iter()
-                .last()
             {
                 self.health_tracker.record_trade(symbol, trade.event_time);
                 self.market_data.apply_trade(trade).await?;
@@ -207,6 +215,19 @@ where
         let open_orders = self.execution.open_orders().await;
         let inventory_map = self.collect_inventory().await;
         let mid_prices = self.collect_mid_prices().await;
+        for (&symbol, &mark_price) in &mid_prices {
+            self.accounting
+                .mark_to_market(symbol, mark_price, now_utc())
+                .await?;
+        }
+        let pnl_snapshot = self.accounting.snapshot().await;
+        self.storage.persist_pnl_snapshot(&pnl_snapshot).await?;
+        self.telemetry.emit_pnl_snapshot(&pnl_snapshot).await?;
+        let execution_stats = self.execution.stats().await;
+        self.telemetry.emit_execution_stats(&execution_stats).await?;
+        self.execution
+            .cancel_stale_orders(STALE_QUOTE_CANCEL_MS, &mid_prices)
+            .await?;
         let risk_context = RiskContext {
             account: account.clone(),
             health: health.clone(),
@@ -214,6 +235,8 @@ where
             inventory: inventory_map.clone(),
             open_orders: open_orders.clone(),
             mid_prices,
+            pnl: pnl_snapshot.clone(),
+            execution_stats: execution_stats.clone(),
         };
 
         let mut placed_reports = 0usize;
@@ -228,10 +251,12 @@ where
             };
 
             let feature_snapshot = self.features.compute(&snapshot).await?;
+            self.telemetry.emit_features(&feature_snapshot).await?;
             let regime = self
                 .regime_detector
                 .detect(symbol, &feature_snapshot, &health)
                 .await?;
+            self.telemetry.emit_regime(&regime).await?;
             let inventory = inventory_map
                 .get(&symbol)
                 .cloned()
@@ -355,6 +380,11 @@ where
 
         for status in statuses {
             self.health_tracker.apply_stream_status(&status);
+            if matches!(status.kind, StreamKind::MarketWs) {
+                self.market_data
+                    .set_market_ws_reconnect_counter(status.reconnect_count)
+                    .await?;
+            }
             info!(
                 kind = ?status.kind,
                 lifecycle = ?status.lifecycle,
@@ -380,11 +410,11 @@ where
         }
 
         for event in market_events {
-            self.handle_market_event(event).await?;
+            self.handle_market_event(event, true).await?;
         }
 
         for event in user_events {
-            self.handle_user_event(event).await?;
+            self.handle_user_event(event, true).await?;
         }
 
         Ok(())
@@ -392,7 +422,7 @@ where
 
     async fn ingest_market_events(&mut self) -> Result<()> {
         for event in self.gateway.poll_market_events(&self.symbols).await? {
-            self.handle_market_event(event).await?;
+            self.handle_market_event(event, false).await?;
         }
 
         Ok(())
@@ -400,26 +430,38 @@ where
 
     async fn ingest_account_events(&mut self) -> Result<()> {
         for event in self.gateway.poll_account_events(&self.symbols).await? {
-            self.handle_user_event(event).await?;
+            self.handle_user_event(event, false).await?;
         }
 
         Ok(())
     }
 
-    async fn handle_market_event(&mut self, event: BinanceMarketEvent) -> Result<()> {
+    async fn handle_market_event(&mut self, event: BinanceMarketEvent, from_ws: bool) -> Result<()> {
         match event {
             BinanceMarketEvent::OrderBookSnapshot(snapshot) => {
+                if from_ws {
+                    self.health_tracker
+                        .record_market_ws_message(snapshot.observed_at);
+                }
                 self.health_tracker
                     .record_orderbook(snapshot.symbol, snapshot.observed_at);
                 self.market_data.apply_orderbook_snapshot(snapshot).await?;
             }
             BinanceMarketEvent::OrderBookDelta(delta) => {
+                if from_ws {
+                    self.health_tracker
+                        .record_market_ws_message(delta.received_at);
+                }
                 self.health_tracker.record_orderbook(delta.symbol, delta.received_at);
                 if let Err(error) = self.market_data.apply_orderbook_delta(delta.clone()).await {
                     warn!(symbol = %delta.symbol, ?error, "failed to apply order book delta, forcing resync");
                 }
             }
             BinanceMarketEvent::Trade(trade) => {
+                if from_ws {
+                    self.health_tracker
+                        .record_market_ws_message(trade.received_at);
+                }
                 self.health_tracker.record_trade(trade.symbol, trade.event_time);
                 self.market_data.apply_trade(trade).await?;
             }
@@ -428,13 +470,20 @@ where
         Ok(())
     }
 
-    async fn handle_user_event(&mut self, event: BinanceUserStreamEvent) -> Result<()> {
+    async fn handle_user_event(&mut self, event: BinanceUserStreamEvent, from_ws: bool) -> Result<()> {
         match event {
             BinanceUserStreamEvent::AccountSnapshot(snapshot) => {
+                if from_ws {
+                    self.health_tracker
+                        .record_user_ws_message(snapshot.updated_at);
+                }
                 self.health_tracker.record_account_snapshot(snapshot.updated_at);
                 self.portfolio.apply_account_snapshot(snapshot).await?;
             }
             BinanceUserStreamEvent::AccountPosition { balances, updated_at } => {
+                if from_ws {
+                    self.health_tracker.record_user_ws_message(updated_at);
+                }
                 self.health_tracker.record_balance_update(updated_at);
                 self.portfolio
                     .apply_account_position(balances, updated_at)
@@ -446,13 +495,16 @@ where
                 event_time,
                 ..
             } => {
+                if from_ws {
+                    self.health_tracker.record_user_ws_message(event_time);
+                }
                 self.health_tracker.record_balance_update(event_time);
                 self.portfolio
                     .apply_balance_delta(asset, delta, event_time)
                     .await?;
             }
             BinanceUserStreamEvent::Execution(execution) => {
-                self.handle_execution_event(execution).await?;
+                self.handle_execution_event(execution, from_ws).await?;
             }
             BinanceUserStreamEvent::EventStreamTerminated { event_time } => {
                 self.health_tracker.apply_stream_status(&StreamStatus::disconnected(
@@ -467,8 +519,11 @@ where
         Ok(())
     }
 
-    async fn handle_execution_event(&mut self, execution: BinanceExecutionEvent) -> Result<()> {
-        self.health_tracker.record_user_message(execution.transaction_time);
+    async fn handle_execution_event(&mut self, execution: BinanceExecutionEvent, from_ws: bool) -> Result<()> {
+        if from_ws {
+            self.health_tracker
+                .record_user_ws_message(execution.transaction_time);
+        }
         self.execution.apply_execution_event(&execution).await?;
         self.handle_execution_report(&execution.report).await?;
 
@@ -601,18 +656,24 @@ where
     }
 
     async fn align_runtime_state_with_health(&mut self, health: &SystemHealth) -> Result<()> {
-        if matches!(self.state(), RuntimeState::Trading | RuntimeState::Reduced)
-            && health.overall_state != HealthState::Healthy
-        {
-            self.transition(RuntimeState::RiskOff, "health is not healthy")
+        let hard_block = health.market_data.state != HealthState::Healthy
+            || health.clock_drift.state != HealthState::Healthy
+            || health.rest.state == HealthState::Unhealthy;
+        let ws_degraded = health.market_ws.state != HealthState::Healthy
+            || health.user_ws.state != HealthState::Healthy;
+
+        if matches!(self.state(), RuntimeState::Trading | RuntimeState::Reduced) && hard_block {
+            self.transition(RuntimeState::RiskOff, "hard health block triggered")
                 .await?;
-        } else if self.state() == RuntimeState::Trading && health.fallback_active {
-            self.transition(RuntimeState::Reduced, "REST fallback active").await?;
+        } else if matches!(self.state(), RuntimeState::Trading) && ws_degraded {
+            self.transition(RuntimeState::Reduced, "websocket degradation detected")
+                .await?;
         } else if self.state() == RuntimeState::Reduced
-            && !health.fallback_active
+            && !ws_degraded
+            && !hard_block
             && self.config.live.trading_enabled
         {
-            self.transition(RuntimeState::Trading, "websocket streams recovered")
+            self.transition(RuntimeState::Trading, "live health recovered")
                 .await?;
         }
 
@@ -658,6 +719,7 @@ fn empty_inventory(symbol: Symbol) -> InventorySnapshot {
         base_position: Decimal::ZERO,
         quote_position: Decimal::ZERO,
         mark_price: None,
+        average_entry_price: None,
         updated_at: now_utc(),
     }
 }
@@ -776,7 +838,7 @@ mod tests {
                 quantity: Decimal::from_str_exact("0.5").unwrap(),
             }],
             asks: vec![PriceLevel {
-                price: Decimal::from(60_010u32),
+                price: Decimal::from(60_030u32),
                 quantity: Decimal::from_str_exact("0.4").unwrap(),
             }],
             last_update_id: 1,
@@ -789,11 +851,45 @@ mod tests {
         domain::MarketTrade {
             symbol: Symbol::BtcUsdc,
             trade_id: "trade-1".to_string(),
-            price: Decimal::from(60_005u32),
+            price: Decimal::from(60_015u32),
             quantity: Decimal::from_str_exact("0.01").unwrap(),
             aggressor_side: Side::Buy,
             event_time: now_utc(),
+            received_at: now_utc(),
         }
+    }
+
+    fn sample_trades() -> Vec<domain::MarketTrade> {
+        let now = now_utc();
+        vec![
+            domain::MarketTrade {
+                trade_id: "trade-1".to_string(),
+                event_time: now - time::Duration::seconds(6),
+                received_at: now - time::Duration::seconds(6),
+                ..sample_trade()
+            },
+            domain::MarketTrade {
+                trade_id: "trade-2".to_string(),
+                price: Decimal::from(60_020u32),
+                event_time: now - time::Duration::seconds(4),
+                received_at: now - time::Duration::seconds(4),
+                ..sample_trade()
+            },
+            domain::MarketTrade {
+                trade_id: "trade-3".to_string(),
+                price: Decimal::from(60_025u32),
+                event_time: now - time::Duration::seconds(2),
+                received_at: now - time::Duration::seconds(2),
+                ..sample_trade()
+            },
+            domain::MarketTrade {
+                trade_id: "trade-4".to_string(),
+                price: Decimal::from(60_018u32),
+                event_time: now,
+                received_at: now,
+                ..sample_trade()
+            },
+        ]
     }
 
     fn sample_execution_event(status: OrderStatus) -> BinanceExecutionEvent {
@@ -805,6 +901,10 @@ mod tests {
                 status,
                 filled_quantity: Decimal::from_str_exact("0.005").unwrap(),
                 average_fill_price: Some(Decimal::from(60_000u32)),
+                fill_ratio: Decimal::from_str_exact("0.50").unwrap(),
+                requested_price: Some(Decimal::from(60_000u32)),
+                slippage_bps: Some(Decimal::ZERO),
+                decision_latency_ms: Some(10),
                 message: None,
                 event_time: now_utc(),
             },
@@ -842,10 +942,10 @@ mod tests {
         let gateway = MockBinanceSpotGateway::new();
         gateway.seed_account(sample_account()).await;
         gateway.seed_orderbook(sample_book()).await;
-        gateway.seed_trades(Symbol::BtcUsdc, vec![sample_trade()]).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;
 
-        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone());
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
 
         assert_eq!(runtime.state(), RuntimeState::Trading);
@@ -856,10 +956,10 @@ mod tests {
         let gateway = MockBinanceSpotGateway::new();
         gateway.seed_account(sample_account()).await;
         gateway.seed_orderbook(sample_book()).await;
-        gateway.seed_trades(Symbol::BtcUsdc, vec![sample_trade()]).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;
 
-        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone());
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
         let placed = runtime.run_cycle().await.unwrap();
 
@@ -872,10 +972,10 @@ mod tests {
         let gateway = MockBinanceSpotGateway::new();
         gateway.seed_account(sample_account()).await;
         gateway.seed_orderbook(sample_book()).await;
-        gateway.seed_trades(Symbol::BtcUsdc, vec![sample_trade()]).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;
 
-        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone());
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
         gateway
             .emit_market_stream_status(StreamStatus::reconnecting(
@@ -897,10 +997,10 @@ mod tests {
         let gateway = MockBinanceSpotGateway::new();
         gateway.seed_account(sample_account()).await;
         gateway.seed_orderbook(sample_book()).await;
-        gateway.seed_trades(Symbol::BtcUsdc, vec![sample_trade()]).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;
 
-        let mut runtime = TraderRuntime::new(sample_config(false), gateway.clone());
+        let mut runtime = TraderRuntime::new(sample_config(false), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
         gateway
             .emit_user_stream_event(BinanceUserStreamEvent::Execution(sample_execution_event(
@@ -923,10 +1023,10 @@ mod tests {
         let gateway = MockBinanceSpotGateway::new();
         gateway.seed_account(sample_account()).await;
         gateway.seed_orderbook(sample_book()).await;
-        gateway.seed_trades(Symbol::BtcUsdc, vec![sample_trade()]).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;
 
-        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone());
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
         gateway
             .emit_market_stream_event(BinanceMarketEvent::OrderBookDelta(OrderBookDelta {

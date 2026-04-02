@@ -37,8 +37,13 @@ pub struct TradeIntent {
     pub post_only: bool,
     pub reduce_only: bool,
     pub time_in_force: Option<TimeInForce>,
+    pub expected_edge_bps: Decimal,
+    pub expected_fee_bps: Decimal,
+    pub expected_slippage_bps: Decimal,
+    pub edge_after_cost_bps: Decimal,
     pub reason: String,
     pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

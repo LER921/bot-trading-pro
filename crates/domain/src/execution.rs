@@ -63,6 +63,10 @@ pub struct ExecutionReport {
     pub status: OrderStatus,
     pub filled_quantity: Decimal,
     pub average_fill_price: Option<Decimal>,
+    pub fill_ratio: Decimal,
+    pub requested_price: Option<Decimal>,
+    pub slippage_bps: Option<Decimal>,
+    pub decision_latency_ms: Option<i64>,
     pub message: Option<String>,
     pub event_time: Timestamp,
 }
@@ -81,6 +85,37 @@ impl ExecutionReport {
             reduce_only: request.reduce_only,
             updated_at: self.event_time,
         })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionStats {
+    pub total_submitted: u64,
+    pub total_rejected: u64,
+    pub total_canceled: u64,
+    pub total_filled_reports: u64,
+    pub total_stale_cancels: u64,
+    pub reject_rate: Decimal,
+    pub avg_fill_ratio: Decimal,
+    pub avg_slippage_bps: Decimal,
+    pub avg_decision_latency_ms: Decimal,
+    pub updated_at: Timestamp,
+}
+
+impl ExecutionStats {
+    pub fn empty(updated_at: Timestamp) -> Self {
+        Self {
+            total_submitted: 0,
+            total_rejected: 0,
+            total_canceled: 0,
+            total_filled_reports: 0,
+            total_stale_cancels: 0,
+            reject_rate: Decimal::ZERO,
+            avg_fill_ratio: Decimal::ZERO,
+            avg_slippage_bps: Decimal::ZERO,
+            avg_decision_latency_ms: Decimal::ZERO,
+            updated_at,
+        }
     }
 }
 

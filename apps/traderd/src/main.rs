@@ -23,5 +23,5 @@ async fn main() -> Result<()> {
         credentials,
     )?;
 
-    TraderRuntime::new(config, gateway).run_until_shutdown().await
+    TraderRuntime::new(config, gateway)?.run_until_shutdown().await
 }

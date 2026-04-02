@@ -27,20 +27,25 @@ impl AppConfig {
     }
 
     pub fn risk_limits(&self) -> RiskLimits {
+        let per_symbol = self
+            .pairs
+            .pairs
+            .iter()
+            .filter(|pair| pair.enabled)
+            .map(|pair| SymbolRiskLimits {
+                symbol: pair.symbol,
+                max_inventory_base: pair.max_inventory_base,
+                soft_inventory_base: pair.soft_inventory_base,
+                max_quote_notional: pair.max_quote_notional,
+                max_open_orders: self.risk.max_open_orders_per_symbol,
+            })
+            .collect::<Vec<_>>();
+        let max_total_exposure_quote = per_symbol
+            .iter()
+            .fold(Decimal::ZERO, |acc, limits| acc + limits.max_quote_notional);
+
         RiskLimits {
-            per_symbol: self
-                .pairs
-                .pairs
-                .iter()
-                .filter(|pair| pair.enabled)
-                .map(|pair| SymbolRiskLimits {
-                    symbol: pair.symbol,
-                    max_inventory_base: pair.max_inventory_base,
-                    soft_inventory_base: pair.soft_inventory_base,
-                    max_quote_notional: pair.max_quote_notional,
-                    max_open_orders: self.risk.max_open_orders_per_symbol,
-                })
-                .collect(),
+            per_symbol,
             inventory: InventoryControl {
                 quote_skew_bps_per_inventory_unit: self.risk.inventory.quote_skew_bps_per_inventory_unit,
                 neutralization_clip_fraction: self.risk.inventory.neutralization_clip_fraction,
@@ -48,6 +53,8 @@ impl AppConfig {
             },
             max_daily_loss_usdc: self.risk.max_daily_loss_usdc,
             max_symbol_drawdown_usdc: self.risk.max_symbol_drawdown_usdc,
+            max_total_exposure_quote,
+            max_reject_rate: Decimal::from_str_exact("0.30").expect("static decimal"),
             stale_market_data_ms: self.risk.stale_market_data_ms,
             stale_account_events_ms: self.risk.stale_account_events_ms,
             max_clock_drift_ms: self.risk.max_clock_drift_ms,

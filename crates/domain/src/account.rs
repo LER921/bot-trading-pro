@@ -35,6 +35,7 @@ pub struct InventorySnapshot {
     pub base_position: Decimal,
     pub quote_position: Decimal,
     pub mark_price: Option<Decimal>,
+    pub average_entry_price: Option<Decimal>,
     pub updated_at: Timestamp,
 }
 
@@ -43,4 +44,31 @@ pub struct SymbolBudget {
     pub symbol: Symbol,
     pub max_quote_notional: Decimal,
     pub reserved_quote_notional: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolPnlSnapshot {
+    pub symbol: Symbol,
+    pub position_base: Decimal,
+    pub average_entry_price: Option<Decimal>,
+    pub mark_price: Option<Decimal>,
+    pub realized_pnl_quote: Decimal,
+    pub unrealized_pnl_quote: Decimal,
+    pub net_pnl_quote: Decimal,
+    pub fees_quote: Decimal,
+    pub peak_net_pnl_quote: Decimal,
+    pub drawdown_quote: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PnlSnapshot {
+    pub realized_pnl_quote: Decimal,
+    pub unrealized_pnl_quote: Decimal,
+    pub net_pnl_quote: Decimal,
+    pub fees_quote: Decimal,
+    pub daily_pnl_quote: Decimal,
+    pub peak_net_pnl_quote: Decimal,
+    pub drawdown_quote: Decimal,
+    pub per_symbol: Vec<SymbolPnlSnapshot>,
+    pub updated_at: Timestamp,
 }

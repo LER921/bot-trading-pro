@@ -73,12 +73,12 @@ impl HealthTracker {
         self.fallback_active = enabled;
     }
 
-    pub fn record_market_message(&mut self, at: Timestamp) {
+    pub fn record_market_ws_message(&mut self, at: Timestamp) {
         self.market_ws.last_message_at = Some(at);
         self.market_ws.lifecycle = StreamRuntimeState::Connected;
     }
 
-    pub fn record_user_message(&mut self, at: Timestamp) {
+    pub fn record_user_ws_message(&mut self, at: Timestamp) {
         self.user_ws.last_message_at = Some(at);
         self.user_ws.lifecycle = StreamRuntimeState::Connected;
     }
@@ -101,7 +101,6 @@ impl HealthTracker {
     }
 
     pub fn record_orderbook(&mut self, symbol: Symbol, at: Timestamp) {
-        self.record_market_message(at);
         self.market_times
             .entry(symbol)
             .or_default()
@@ -109,22 +108,18 @@ impl HealthTracker {
     }
 
     pub fn record_trade(&mut self, symbol: Symbol, at: Timestamp) {
-        self.record_market_message(at);
         self.market_times.entry(symbol).or_default().last_trade_update_at = Some(at);
     }
 
     pub fn record_account_snapshot(&mut self, at: Timestamp) {
-        self.record_user_message(at);
         self.last_balance_event_at = Some(at);
     }
 
     pub fn record_balance_update(&mut self, at: Timestamp) {
-        self.record_user_message(at);
         self.last_balance_event_at = Some(at);
     }
 
     pub fn record_fill(&mut self, at: Timestamp) {
-        self.record_user_message(at);
         self.last_fill_event_at = Some(at);
     }
 
@@ -290,8 +285,8 @@ mod tests {
     fn marks_market_ws_stale_when_last_message_is_too_old() {
         let mut tracker = HealthTracker::default();
         let stale_at = now_utc() - Duration::seconds(30);
-        tracker.record_market_message(stale_at);
-        tracker.record_user_message(now_utc());
+        tracker.record_market_ws_message(stale_at);
+        tracker.record_user_ws_message(now_utc());
         tracker.record_rest_success(now_utc());
         tracker.record_clock_sample(now_utc());
         tracker.record_orderbook(Symbol::BtcUsdc, stale_at);
@@ -303,11 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn fallback_mode_can_keep_overall_health_healthy_when_rest_path_is_fresh() {
+    fn fallback_mode_does_not_hide_stale_ws_health() {
         let mut tracker = HealthTracker::default();
         let now = now_utc();
-        tracker.record_market_message(now - Duration::seconds(30));
-        tracker.record_user_message(now - Duration::seconds(30));
+        tracker.record_market_ws_message(now - Duration::seconds(30));
+        tracker.record_user_ws_message(now - Duration::seconds(30));
         tracker.record_orderbook(Symbol::BtcUsdc, now);
         tracker.record_trade(Symbol::BtcUsdc, now);
         tracker.record_account_snapshot(now);
@@ -318,6 +313,6 @@ mod tests {
 
         let health = tracker.snapshot(&[Symbol::BtcUsdc], 1_000, 1_000, 500);
         assert!(health.fallback_active);
-        assert_eq!(health.overall_state, HealthState::Healthy);
+        assert_ne!(health.overall_state, HealthState::Healthy);
     }
 }

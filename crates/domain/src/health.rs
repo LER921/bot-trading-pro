@@ -117,24 +117,17 @@ impl SystemHealth {
     }
 
     pub fn derive_overall_state(&self) -> HealthState {
-        if matches!(self.rest.state, HealthState::Unhealthy)
+        if matches!(self.market_ws.state, HealthState::Unhealthy)
+            || matches!(self.user_ws.state, HealthState::Unhealthy)
+            || matches!(self.rest.state, HealthState::Unhealthy)
             || matches!(self.clock_drift.state, HealthState::Unhealthy)
         {
             return HealthState::Unhealthy;
         }
 
-        if !self.fallback_active {
-            return worst_health_state([
-                self.market_ws.state,
-                self.user_ws.state,
-                self.rest.state,
-                self.clock_drift.state,
-                self.market_data.state,
-                self.account_events.state,
-            ]);
-        }
-
         worst_health_state([
+            self.market_ws.state,
+            self.user_ws.state,
             self.rest.state,
             self.clock_drift.state,
             self.market_data.state,

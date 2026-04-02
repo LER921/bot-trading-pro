@@ -1,40 +1,39 @@
 # Notes
 
-## Arbitrages techniques V2
+## Arbitrages techniques
 
-- La priorite reste un runtime live sobre, testable et robuste, pas la sophistication strategique.
-- Binance Spot est cable avec deux chemins complementaires:
-  - WebSocket prioritaire pour le live event-driven
-  - REST pour bootstrap, health sampling, resync et reconciliation
-- Le market stream combine `depth@100ms` et `trade`.
-- Le user stream est traite comme une source temps reel pour:
-  - execution reports
-  - fills
-  - balance/account updates
+- Le runtime reste volontairement sobre: pas de ML, pas de microservices, pas de sophistication gratuite.
+- Binance Spot est traite en WS-first:
+  - market WS pour `depth` + `trade`
+  - user WS pour execution reports, fills et balances
+  - REST pour bootstrap, sampling health, resync et fallback
+- Les features et le regime detector sont volontairement deterministes, explicables et testables.
 
-## Arbitrage Binance user stream
+## Pourquoi certains choix ont ete durcis
 
-- La documentation Spot Binance actuelle met en avant `userDataStream.subscribe.signature` via WebSocket API.
-- L'implementation suit donc ce modele signe, plutot qu'un cycle legacy `listenKey` + keepalive.
-- Le cycle reel devient:
-  - `connect`
-  - `subscribe.signature`
-  - `consume events`
-  - `reconnect/resubscribe` si la session degrade
-- Le fallback REST garde la coherence compte/open orders pendant les deconnexions ou les resyncs.
+- Le book local refuse les deltas incoherents et force un resync au lieu de continuer sur un carnet potentiellement faux.
+- Le bootstrap seed maintenant une vraie fenetre de trades recents pour que les features ne demarrent pas dans un etat artificiellement vide.
+- Le score de toxicite a ete rendu moins brutal qu'une simple somme saturee, afin d'eviter de couper le market making a la moindre asymetrie de flux.
+- La sante globale continue de tenir compte des WS meme en fallback: le fallback permet de survivre, pas de masquer une degradation structurelle.
 
-## Pourquoi ce design
+## Ce qui est reellement en place
 
-- Le runtime devient reactif en live sans perdre le filet de securite REST.
-- Les deltas market sont appliques localement tant que la sequence reste coherente.
-- Un trou de sequence force un resync propre par snapshot REST au lieu de continuer sur un book potentiellement faux.
-- Les execution reports mettent a jour l'etat local de l'execution sans attendre un polling.
+- runtime live event-driven avec market/user WS prioritaires
+- orderbook local avec gap detection, resync et freshness
+- moteur de features non stubs
+- regime detector explicable
+- market making avec filtre d'edge net apres couts
+- scalping secondaire avec filtres stricts
+- risk manager branche sur sante, inventaire, drawdown, exposure et reject rate
+- execution stats, slippage, fill ratio et cancel-on-stale
+- PnL realise / non realise / journalier
+- persistance SQLite WAL des evenements critiques
+- telemetry structuree pour sante, regime, execution et PnL
 
-## Limites volontairement conservees
+## Limites restantes
 
-- Pas encore de pricing avance de market making.
-- Pas encore de logique scalp riche.
-- Pas encore de persistance durable SQLite/Postgres; le storage courant reste memoire.
-- Pas encore de traitement exhaustif de toutes les variantes de payload Binance.
-- Les hooks `drawdown guard` et `reject-rate guard` sont prepares mais pas encore completes.
-- `reduce-only` spot reste une regle interne du bot, pas un flag natif Binance Spot.
+- le pricing market making reste volontairement simple; il est robuste mais pas encore optimise finement pour la capture d'edge
+- le scalping reste conservateur et ne couvre pas encore de scenarios plus riches de breakout/reversal
+- la telemetry est exposee en logs structures; il manque encore une exposition dashboard/API plus riche et des compteurs Prometheus explicites
+- le storage SQLite couvre deja l'audit critique, mais pas encore tous les objets secondaires ni les migrations versionnees
+- la couverture de tests est bonne sur les chemins critiques, mais il reste de la marge sur les cas Binance rares et les incidents long-run
