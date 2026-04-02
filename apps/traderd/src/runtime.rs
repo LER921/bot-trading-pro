@@ -4,7 +4,8 @@ use anyhow::{bail, Context, Result};
 use common::{Decimal, now_utc};
 use config_loader::AppConfig;
 use domain::{
-    ExecutionReport, HealthState, InventorySnapshot, MarketSnapshot, OpenOrder, RuntimeState,
+    ControlPlaneDecision, ControlPlaneRequest, ExecutionReport, HealthState,
+    InventorySnapshot, MarketSnapshot, OpenOrder, OperatorCommand, RuntimeState,
     StrategyContext, Symbol, SymbolBudget, SystemHealth,
 };
 use execution::{BinanceExecutionEngine, ExecutionEngine};
@@ -75,6 +76,9 @@ where
     telemetry: TracingTelemetry,
     seen_fills: HashSet<FillKey>,
     pending_fill_recoveries: HashMap<FillKey, BinanceFillRecoveryRequest>,
+    operator_pause_active: bool,
+    consecutive_cycle_failures: u32,
+    risk_off_cancel_applied: bool,
     market_stream: Option<MarketStreamHandle>,
     user_stream: Option<UserStreamHandle>,
 }
@@ -86,6 +90,8 @@ where
     pub fn new(config: AppConfig, gateway: G) -> Result<Self> {
         let symbols = config.enabled_symbols();
         let risk_limits = config.risk_limits();
+        let operator_pause_active =
+            config.live.start_in_paused_mode || !config.live.trading_enabled;
         let budgets = config
             .pairs
             .pairs
@@ -127,6 +133,9 @@ where
             telemetry: TracingTelemetry,
             seen_fills: HashSet::new(),
             pending_fill_recoveries: HashMap::new(),
+            operator_pause_active,
+            consecutive_cycle_failures: 0,
+            risk_off_cancel_applied: false,
             market_stream: None,
             user_stream: None,
         })
@@ -205,8 +214,10 @@ where
             .await?;
 
         if self.config.live.trading_enabled && !self.config.live.start_in_paused_mode {
+            self.operator_pause_active = false;
             self.transition(RuntimeState::Trading, "live trading enabled").await?;
         } else {
+            self.operator_pause_active = true;
             self.transition(RuntimeState::Paused, "waiting for explicit trading enable").await?;
         }
 
@@ -236,7 +247,8 @@ where
         let health = self.health();
         self.telemetry.emit_health(&health).await?;
 
-        self.align_runtime_state_with_health(&health).await?;
+        self.align_runtime_state_with_health(&health, fallback_active)
+            .await?;
 
         let account = self
             .portfolio
@@ -322,7 +334,141 @@ where
             }
         }
 
+        self.consecutive_cycle_failures = 0;
         Ok(placed_reports)
+    }
+
+    pub async fn apply_control_plane_request(
+        &mut self,
+        request: ControlPlaneRequest,
+    ) -> Result<ControlPlaneDecision> {
+        let health = self.health();
+        let mut decision = self
+            .risk_manager
+            .authorize_operator_command(&request.command, self.state(), &health)
+            .await?;
+        if !decision.accepted {
+            return Ok(decision);
+        }
+
+        match request.command {
+            OperatorCommand::Pause => {
+                self.operator_pause_active = true;
+                self.transition(
+                    RuntimeState::Paused,
+                    format!("operator pause requested by {}", request.submitted_by),
+                )
+                .await?;
+                decision.message = "operator pause applied by runtime".to_string();
+            }
+            OperatorCommand::Resume => {
+                if !self.config.live.trading_enabled {
+                    decision.accepted = false;
+                    decision.message =
+                        "operator resume rejected because live trading is disabled in config"
+                            .to_string();
+                    return Ok(decision);
+                }
+
+                if self.state() == RuntimeState::Trading {
+                    decision.message = "operator resume ignored because runtime is already trading"
+                        .to_string();
+                    return Ok(decision);
+                }
+
+                self.operator_pause_active = false;
+                let ws_degraded = self.is_ws_degraded(&health, self.should_enable_fallback().await);
+                let recovery_required = self.recovery_required(&health).await;
+                if ws_degraded || recovery_required {
+                    if self.state() != RuntimeState::Reconciling {
+                        self.transition(
+                            RuntimeState::Reconciling,
+                            format!(
+                                "operator resume requested by {}; recovery gate active",
+                                request.submitted_by
+                            ),
+                        )
+                        .await?;
+                    }
+                    decision.message =
+                        "operator resume accepted; runtime moved into reconciliation".to_string();
+                } else if self.state() == RuntimeState::Reduced {
+                    self.transition(
+                        RuntimeState::Trading,
+                        "operator resume conditions satisfied",
+                    )
+                    .await?;
+                    decision.message = "operator resume applied by runtime".to_string();
+                } else {
+                    if self.state() == RuntimeState::RiskOff {
+                        self.transition(
+                            RuntimeState::Reconciling,
+                            format!(
+                                "operator resume requested by {}; exiting risk-off through reconciliation",
+                                request.submitted_by
+                            ),
+                        )
+                        .await?;
+                    }
+                    if self.state() != RuntimeState::Ready {
+                        self.transition(
+                            RuntimeState::Ready,
+                            format!("operator resume requested by {}", request.submitted_by),
+                        )
+                        .await?;
+                    }
+                    if self.state() != RuntimeState::Trading {
+                        self.transition(
+                            RuntimeState::Trading,
+                            "operator resume conditions satisfied",
+                        )
+                        .await?;
+                    }
+                    decision.message = "operator resume applied by runtime".to_string();
+                }
+            }
+            OperatorCommand::EnterReduced => {
+                self.transition(
+                    RuntimeState::Reduced,
+                    format!("operator reduced mode requested by {}", request.submitted_by),
+                )
+                .await?;
+                decision.message = "operator reduced mode applied by runtime".to_string();
+            }
+            OperatorCommand::EnterRiskOff => {
+                self.transition(
+                    RuntimeState::RiskOff,
+                    format!("operator risk-off requested by {}", request.submitted_by),
+                )
+                .await?;
+                decision.message = "operator risk-off applied by runtime".to_string();
+            }
+            OperatorCommand::CancelAll { symbol } => {
+                self.execution.cancel_all(symbol).await?;
+                decision.message = "operator cancel-all applied by runtime".to_string();
+            }
+            OperatorCommand::Flatten { symbol } => {
+                self.execution.cancel_all(Some(symbol)).await?;
+                decision.message =
+                    "operator flatten request canceled open orders for the symbol; active flatten execution is not wired"
+                        .to_string();
+            }
+            OperatorCommand::ReloadConfig => {
+                decision.message =
+                    "operator reload-config accepted but runtime hot reload is not wired".to_string();
+            }
+            OperatorCommand::Shutdown => {
+                self.transition(
+                    RuntimeState::Shutdown,
+                    format!("operator shutdown requested by {}", request.submitted_by),
+                )
+                .await?;
+                decision.message = "operator shutdown applied by runtime".to_string();
+            }
+        }
+
+        decision.resulting_state = self.state();
+        Ok(decision)
     }
 
     pub async fn run_until_shutdown(mut self) -> Result<()> {
@@ -333,14 +479,18 @@ where
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     self.transition(RuntimeState::Shutdown, "received ctrl-c").await?;
-                    self.shutdown_streams();
                     break;
                 }
                 _ = interval.tick() => {
                     if self.state() == RuntimeState::Shutdown {
                         break;
                     }
-                    self.run_cycle().await?;
+                    match self.run_cycle().await {
+                        Ok(_) => {}
+                        Err(error) => {
+                            self.handle_cycle_error(&error).await?;
+                        }
+                    }
                 }
             }
         }
@@ -766,32 +916,110 @@ where
             || health.account_events.state == HealthState::Stale
     }
 
-    async fn align_runtime_state_with_health(&mut self, health: &SystemHealth) -> Result<()> {
-        let hard_block = health.market_data.state != HealthState::Healthy
-            || health.clock_drift.state != HealthState::Healthy
+    async fn align_runtime_state_with_health(
+        &mut self,
+        health: &SystemHealth,
+        fallback_active: bool,
+    ) -> Result<()> {
+        let hard_block = health.market_data.state == HealthState::Stale
+            || health.clock_drift.state == HealthState::Unhealthy
             || health.rest.state == HealthState::Unhealthy;
-        let ws_degraded = health.market_ws.state != HealthState::Healthy
-            || health.user_ws.state != HealthState::Healthy;
+        let ws_degraded = self.is_ws_degraded(health, fallback_active);
+        let recovery_required = self.recovery_required(health).await;
 
-        if matches!(self.state(), RuntimeState::Trading | RuntimeState::Reduced) && hard_block {
+        if matches!(self.state(), RuntimeState::Bootstrap | RuntimeState::Shutdown) {
+            return Ok(());
+        }
+
+        if hard_block {
             self.transition(RuntimeState::RiskOff, "hard health block triggered")
                 .await?;
-        } else if matches!(self.state(), RuntimeState::Trading) && ws_degraded {
+            return Ok(());
+        }
+
+        if self.state() == RuntimeState::RiskOff {
+            return Ok(());
+        }
+
+        if recovery_required
+            && matches!(
+                self.state(),
+                RuntimeState::Trading | RuntimeState::Reduced | RuntimeState::Ready
+            )
+        {
+            self.transition(RuntimeState::Reconciling, "runtime recovery gate active")
+                .await?;
+            return Ok(());
+        }
+
+        if matches!(self.state(), RuntimeState::Trading) && ws_degraded {
             self.transition(RuntimeState::Reduced, "websocket degradation detected")
                 .await?;
-        } else if self.state() == RuntimeState::Reduced
-            && !ws_degraded
-            && !hard_block
-            && self.config.live.trading_enabled
-        {
-            self.transition(RuntimeState::Trading, "live health recovered")
+            return Ok(());
+        }
+
+        if self.state() == RuntimeState::Reduced && !ws_degraded && !recovery_required {
+            self.promote_runtime_after_recovery("live health recovered")
+                .await?;
+            return Ok(());
+        }
+
+        if self.state() == RuntimeState::Reconciling && !ws_degraded && !recovery_required {
+            self.promote_runtime_after_recovery("runtime recovery completed")
+                .await?;
+            return Ok(());
+        }
+
+        if self.state() == RuntimeState::Ready && !ws_degraded && !recovery_required {
+            self.promote_runtime_after_recovery("runtime ready for controlled resume")
                 .await?;
         }
 
-        if self.state() == RuntimeState::RiskOff && self.config.live.cancel_all_on_risk_off {
-            self.execution.cancel_all(None).await?;
-        }
+        Ok(())
+    }
 
+    async fn recovery_required(&self, health: &SystemHealth) -> bool {
+        health.market_data.state == HealthState::Degraded
+            || health.clock_drift.state == HealthState::Degraded
+            || health.account_events.state != HealthState::Healthy
+            || !self.pending_fill_recoveries.is_empty()
+            || self.has_market_data_resync_backlog().await
+    }
+
+    fn is_ws_degraded(&self, health: &SystemHealth, fallback_active: bool) -> bool {
+        fallback_active
+            || health.market_ws.state != HealthState::Healthy
+            || health.user_ws.state != HealthState::Healthy
+    }
+
+    async fn has_market_data_resync_backlog(&self) -> bool {
+        for &symbol in &self.symbols {
+            if self.market_data.needs_resync(symbol).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn should_auto_resume_trading(&self) -> bool {
+        self.config.live.trading_enabled && !self.operator_pause_active
+    }
+
+    async fn promote_runtime_after_recovery(&mut self, reason: &str) -> Result<()> {
+        self.transition(RuntimeState::Ready, reason).await?;
+        if self.should_auto_resume_trading() {
+            self.transition(
+                RuntimeState::Trading,
+                "runtime recovered and live trading resumed",
+            )
+            .await?;
+        } else {
+            self.transition(
+                RuntimeState::Paused,
+                "runtime recovered; waiting for operator resume",
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -801,14 +1029,62 @@ where
         Ok(())
     }
 
+    async fn handle_cycle_error(&mut self, error: &anyhow::Error) -> Result<()> {
+        self.consecutive_cycle_failures = self.consecutive_cycle_failures.saturating_add(1);
+        warn!(
+            ?error,
+            failures = self.consecutive_cycle_failures,
+            state = ?self.state(),
+            "runtime cycle failed"
+        );
+
+        if self.consecutive_cycle_failures >= 3 {
+            self.transition(
+                RuntimeState::RiskOff,
+                format!(
+                    "repeated runtime cycle failures ({})",
+                    self.consecutive_cycle_failures
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if matches!(
+            self.state(),
+            RuntimeState::Trading | RuntimeState::Reduced | RuntimeState::Ready
+        ) {
+            self.transition(
+                RuntimeState::Reconciling,
+                format!("runtime cycle error absorbed: {error}"),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
     async fn transition(&mut self, next: RuntimeState, reason: impl Into<String>) -> Result<()> {
         let reason = reason.into();
         if let Some(transition) = self.state_machine.transition(next, reason.clone())? {
+            if transition.to != RuntimeState::RiskOff {
+                self.risk_off_cancel_applied = false;
+            }
             self.storage.persist_runtime_transition(&transition).await?;
             self.telemetry
                 .emit_runtime_state(&self.state_machine.snapshot())
                 .await?;
             info!(from = ?transition.from, to = ?transition.to, reason = transition.reason, "runtime transition");
+            if transition.to == RuntimeState::RiskOff
+                && self.config.live.cancel_all_on_risk_off
+                && !self.risk_off_cancel_applied
+            {
+                self.execution.cancel_all(None).await?;
+                self.risk_off_cancel_applied = true;
+            }
+            if transition.to == RuntimeState::Shutdown {
+                self.shutdown_streams();
+            }
         }
         Ok(())
     }
@@ -864,8 +1140,9 @@ mod tests {
         PairsConfig, RiskConfig, RuntimeConfig,
     };
     use domain::{
-        AccountSnapshot, Balance, ExecutionReport, FillEvent, OrderBookDelta, OrderBookSnapshot,
-        OrderStatus, OrderType, PriceLevel, RuntimeState, Side, TimeInForce,
+        AccountSnapshot, Balance, ControlPlaneRequest, ExecutionReport, FillEvent, OperatorCommand,
+        OrderBookDelta, OrderBookSnapshot, OrderStatus, OrderType, PriceLevel, RuntimeState, Side,
+        TimeInForce,
     };
     use exchange_binance_spot::{
         BinanceExecutionEvent, BinanceUserStreamEvent, MockBinanceSpotGateway, StreamKind,
@@ -964,6 +1241,23 @@ mod tests {
             ],
             updated_at: now_utc(),
         }
+    }
+
+    async fn mark_streams_healthy(gateway: &MockBinanceSpotGateway) {
+        gateway
+            .emit_market_stream_status(StreamStatus::connected(
+                StreamKind::MarketWs,
+                0,
+                "market stream healthy",
+            ))
+            .await;
+        gateway
+            .emit_user_stream_status(StreamStatus::connected(
+                StreamKind::UserWs,
+                0,
+                "user stream healthy",
+            ))
+            .await;
     }
 
     fn sample_book() -> OrderBookSnapshot {
@@ -1191,6 +1485,9 @@ mod tests {
 
         let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
         runtime.bootstrap().await.unwrap();
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
         gateway
             .emit_market_stream_status(StreamStatus::reconnecting(
                 StreamKind::MarketWs,
@@ -1204,6 +1501,137 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::Reduced);
         assert!(runtime.health().fallback_active);
         assert_eq!(runtime.health().market_ws.reconnect_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pending_fill_recovery_moves_runtime_into_reconciling_and_back_to_trading() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+
+        let mut execution = sample_execution_event(OrderStatus::PartiallyFilled);
+        execution.fill = None;
+        execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "runtime-recovery-fill".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "fee quote enrichment failed; recover via REST".to_string(),
+        });
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(execution))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        assert_eq!(runtime.state(), RuntimeState::Reconciling);
+        assert!(runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "runtime-recovery-fill".to_string(),
+        }));
+
+        gateway
+            .seed_fills(
+                Symbol::BtcUsdc,
+                vec![FillEvent {
+                    trade_id: "runtime-recovery-fill".to_string(),
+                    order_id: "42".to_string(),
+                    symbol: Symbol::BtcUsdc,
+                    side: Side::Buy,
+                    price: Decimal::from(60_000u32),
+                    quantity: Decimal::from_str_exact("0.005").unwrap(),
+                    fee: Decimal::from_str_exact("0.001").unwrap(),
+                    fee_asset: "BNB".to_string(),
+                    fee_quote: Some(Decimal::from_str_exact("0.6").unwrap()),
+                    liquidity_side: domain::LiquiditySide::Taker,
+                    event_time: now_utc(),
+                }],
+            )
+            .await;
+        mark_streams_healthy(&gateway).await;
+
+        runtime.run_cycle().await.unwrap();
+
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+        assert!(!runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "runtime-recovery-fill".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn operator_pause_and_resume_transition_cleanly() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+
+        let pause = runtime
+            .apply_control_plane_request(ControlPlaneRequest {
+                command: OperatorCommand::Pause,
+                submitted_by: "operator".to_string(),
+                submitted_at: now_utc(),
+            })
+            .await
+            .unwrap();
+        assert!(pause.accepted);
+        assert_eq!(pause.resulting_state, RuntimeState::Paused);
+        assert_eq!(runtime.state(), RuntimeState::Paused);
+
+        mark_streams_healthy(&gateway).await;
+        let resume = runtime
+            .apply_control_plane_request(ControlPlaneRequest {
+                command: OperatorCommand::Resume,
+                submitted_by: "operator".to_string(),
+                submitted_at: now_utc(),
+            })
+            .await
+            .unwrap();
+        assert!(resume.accepted);
+        assert_eq!(resume.resulting_state, RuntimeState::Trading);
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+    }
+
+    #[tokio::test]
+    async fn absorbable_cycle_error_enters_reconciling_without_risking_shutdown() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+
+        runtime
+            .handle_cycle_error(&anyhow::anyhow!("temporary reconciliation failure"))
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.state(), RuntimeState::Reconciling);
+        assert!(runtime.state() != RuntimeState::RiskOff);
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
     }
 
     #[tokio::test]
