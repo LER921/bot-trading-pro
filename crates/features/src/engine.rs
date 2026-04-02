@@ -1,13 +1,21 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use common::{Decimal, now_utc};
+use common::{Decimal, Timestamp, now_utc};
 use domain::{FeatureSnapshot, MarketSnapshot, Symbol, VolatilityRegime};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 const FEATURE_HISTORY_SECS: i64 = 120;
-const TRADE_WINDOW_SECS: i64 = 30;
+const REALIZED_VOL_WINDOW_SECS: i64 = 30;
+const VWAP_WINDOW_SECS: i64 = 30;
+const SPREAD_WINDOW_SECS: i64 = 60;
+const IMBALANCE_WINDOW_SECS: i64 = 30;
+const TRADE_RATE_WINDOW_SECS: i64 = 30;
+const MOMENTUM_1S_WINDOW_SECS: i64 = 1;
+const MOMENTUM_5S_WINDOW_SECS: i64 = 5;
+const MOMENTUM_15S_WINDOW_SECS: i64 = 15;
+const MIN_RATE_WINDOW_MS: i64 = 1_000;
 
 #[async_trait]
 pub trait FeatureEngine: Send + Sync {
@@ -16,7 +24,7 @@ pub trait FeatureEngine: Send + Sync {
 
 #[derive(Debug, Clone, Copy)]
 struct TimedDecimal {
-    at: common::Timestamp,
+    at: Timestamp,
     value: Decimal,
 }
 
@@ -38,42 +46,63 @@ pub type SimpleFeatureEngine = RollingFeatureEngine;
 impl FeatureEngine for RollingFeatureEngine {
     async fn compute(&self, snapshot: &MarketSnapshot) -> Result<FeatureSnapshot> {
         let computed_at = now_utc();
-        let book_time = snapshot
-            .status
-            .last_orderbook_update_at
-            .unwrap_or(computed_at);
-        let recent_trades = recent_trades(&snapshot.recent_trades, computed_at);
+        let anchor_time = feature_anchor_time(snapshot, computed_at);
         let current_mid = current_mid(snapshot);
         let current_spread_bps = current_spread_bps(snapshot, current_mid);
         let current_imbalance = current_imbalance(snapshot);
+        let vwap_window = trades_in_window(&snapshot.recent_trades, anchor_time, VWAP_WINDOW_SECS);
+        let trade_window = trades_in_window(&snapshot.recent_trades, anchor_time, TRADE_RATE_WINDOW_SECS);
 
         let mut state = self.state.write().await;
         let entry = state.entry(snapshot.symbol).or_default();
-        push_point(&mut entry.mid_history, book_time, current_mid);
-        push_point(&mut entry.spread_history, book_time, current_spread_bps);
-        push_point(&mut entry.imbalance_history, book_time, current_imbalance);
-        prune_points(&mut entry.mid_history, computed_at);
-        prune_points(&mut entry.spread_history, computed_at);
-        prune_points(&mut entry.imbalance_history, computed_at);
+        push_point(&mut entry.mid_history, anchor_time, current_mid);
+        push_point(&mut entry.spread_history, anchor_time, current_spread_bps);
+        push_point(&mut entry.imbalance_history, anchor_time, current_imbalance);
+        prune_points(&mut entry.mid_history, anchor_time);
+        prune_points(&mut entry.spread_history, anchor_time);
+        prune_points(&mut entry.imbalance_history, anchor_time);
 
-        let vwap = vwap_from_trades(&recent_trades).unwrap_or(current_mid);
-        let realized_volatility_bps = realized_volatility_bps(&entry.mid_history);
-        let spread_mean_bps = mean(entry.spread_history.iter().map(|point| point.value));
-        let spread_std_bps = stddev(entry.spread_history.iter().map(|point| point.value), spread_mean_bps);
+        let mid_window = points_in_window(&entry.mid_history, anchor_time, REALIZED_VOL_WINDOW_SECS);
+        let spread_window = points_in_window(&entry.spread_history, anchor_time, SPREAD_WINDOW_SECS);
+        let imbalance_window = points_in_window(&entry.imbalance_history, anchor_time, IMBALANCE_WINDOW_SECS);
+
+        let vwap = vwap_from_trades(&vwap_window)
+            .or_else(|| snapshot.last_trade.as_ref().map(|trade| trade.price))
+            .unwrap_or(current_mid);
+        let realized_volatility_bps = realized_volatility_bps(&mid_window, &trade_window);
+        let spread_mean_bps = mean_or_fallback(
+            spread_window.iter().map(|point| point.value),
+            current_spread_bps,
+        );
+        let spread_std_bps = stddev(spread_window.iter().map(|point| point.value), spread_mean_bps);
         let spread_zscore = zscore(current_spread_bps, spread_mean_bps, spread_std_bps);
-        let imbalance_rolling = mean(entry.imbalance_history.iter().map(|point| point.value));
-        let trade_flow_imbalance = trade_flow_imbalance(&recent_trades);
-        let trade_flow_rate = trade_flow_rate(&recent_trades);
-        let trade_rate_per_sec = rate_per_sec(recent_trades.len(), TRADE_WINDOW_SECS);
-        let tick_rate_per_sec = tick_rate_per_sec(&recent_trades);
-        let momentum_1s_bps = momentum_bps(&entry.mid_history, current_mid, 1);
-        let momentum_5s_bps = momentum_bps(&entry.mid_history, current_mid, 5);
-        let momentum_15s_bps = momentum_bps(&entry.mid_history, current_mid, 15);
-        let local_momentum_bps =
-            (momentum_1s_bps * Decimal::from(5u32)
-                + momentum_5s_bps * Decimal::from(3u32)
-                + momentum_15s_bps * Decimal::from(2u32))
-                / Decimal::from(10u32);
+        let imbalance_rolling = mean_or_fallback(
+            imbalance_window.iter().map(|point| point.value),
+            current_imbalance,
+        );
+        let trade_flow_imbalance = trade_flow_imbalance(&trade_window);
+        let trade_flow_rate = trade_flow_rate(&trade_window, anchor_time);
+        let trade_rate_per_sec = trade_rate_per_sec(&trade_window, anchor_time);
+        let tick_rate_per_sec = tick_rate_per_sec(&trade_window, anchor_time);
+        let momentum_1s_bps = momentum_bps(
+            &entry.mid_history,
+            current_mid,
+            anchor_time,
+            MOMENTUM_1S_WINDOW_SECS,
+        );
+        let momentum_5s_bps = momentum_bps(
+            &entry.mid_history,
+            current_mid,
+            anchor_time,
+            MOMENTUM_5S_WINDOW_SECS,
+        );
+        let momentum_15s_bps = momentum_bps(
+            &entry.mid_history,
+            current_mid,
+            anchor_time,
+            MOMENTUM_15S_WINDOW_SECS,
+        );
+        let local_momentum_bps = weighted_momentum(momentum_1s_bps, momentum_5s_bps, momentum_15s_bps);
         let top_of_book_depth_quote = top_of_book_depth_quote(snapshot);
         let liquidity_score = if current_spread_bps.is_zero() {
             top_of_book_depth_quote
@@ -91,7 +120,7 @@ impl FeatureEngine for RollingFeatureEngine {
 
         Ok(FeatureSnapshot {
             symbol: snapshot.symbol,
-            microprice: snapshot.best_bid_ask.as_ref().and_then(|best| microprice(best)),
+            microprice: snapshot.best_bid_ask.as_ref().and_then(microprice),
             top_of_book_depth_quote,
             orderbook_imbalance: snapshot.best_bid_ask.as_ref().map(|_| current_imbalance),
             orderbook_imbalance_rolling: imbalance_rolling,
@@ -119,22 +148,60 @@ impl FeatureEngine for RollingFeatureEngine {
     }
 }
 
-fn push_point(points: &mut VecDeque<TimedDecimal>, at: common::Timestamp, value: Decimal) {
-    points.push_back(TimedDecimal { at, value });
+fn feature_anchor_time(snapshot: &MarketSnapshot, fallback: Timestamp) -> Timestamp {
+    [
+        snapshot.status.last_orderbook_update_at,
+        snapshot.status.last_trade_update_at,
+        snapshot.best_bid_ask.as_ref().map(|best| best.observed_at),
+        snapshot.last_trade.as_ref().map(|trade| trade.received_at),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(fallback)
 }
 
-fn prune_points(points: &mut VecDeque<TimedDecimal>, now: common::Timestamp) {
-    let cutoff = now - time::Duration::seconds(FEATURE_HISTORY_SECS);
+fn push_point(points: &mut VecDeque<TimedDecimal>, at: Timestamp, value: Decimal) {
+    match points.back_mut() {
+        Some(last) if last.at == at => {
+            last.value = value;
+        }
+        Some(last) if last.at > at => {
+            // Ignore out-of-order observations instead of corrupting time ordering.
+        }
+        _ => points.push_back(TimedDecimal { at, value }),
+    }
+}
+
+fn prune_points(points: &mut VecDeque<TimedDecimal>, anchor_time: Timestamp) {
+    let cutoff = anchor_time - time::Duration::seconds(FEATURE_HISTORY_SECS);
     while matches!(points.front(), Some(point) if point.at < cutoff) {
         points.pop_front();
     }
 }
 
-fn recent_trades(trades: &[domain::MarketTrade], now: common::Timestamp) -> Vec<domain::MarketTrade> {
-    let cutoff = now - time::Duration::seconds(TRADE_WINDOW_SECS);
+fn points_in_window(
+    history: &VecDeque<TimedDecimal>,
+    anchor_time: Timestamp,
+    window_secs: i64,
+) -> Vec<TimedDecimal> {
+    let cutoff = anchor_time - time::Duration::seconds(window_secs);
+    history
+        .iter()
+        .copied()
+        .filter(|point| point.at >= cutoff && point.at <= anchor_time)
+        .collect()
+}
+
+fn trades_in_window(
+    trades: &[domain::MarketTrade],
+    anchor_time: Timestamp,
+    window_secs: i64,
+) -> Vec<domain::MarketTrade> {
+    let cutoff = anchor_time - time::Duration::seconds(window_secs);
     trades
         .iter()
-        .filter(|trade| trade.received_at >= cutoff)
+        .filter(|trade| trade.received_at >= cutoff && trade.received_at <= anchor_time)
         .cloned()
         .collect()
 }
@@ -199,29 +266,34 @@ fn vwap_from_trades(trades: &[domain::MarketTrade]) -> Option<Decimal> {
     Some(total_notional / total_quantity)
 }
 
-fn realized_volatility_bps(history: &VecDeque<TimedDecimal>) -> Decimal {
-    if history.len() < 2 {
-        return Decimal::ZERO;
-    }
+fn realized_volatility_bps(
+    mid_window: &[TimedDecimal],
+    trade_window: &[domain::MarketTrade],
+) -> Decimal {
+    rms_return_bps(mid_window.iter().map(|point| point.value)).unwrap_or_else(|| {
+        rms_return_bps(trade_window.iter().map(|trade| trade.price)).unwrap_or(Decimal::ZERO)
+    })
+}
 
+fn rms_return_bps<I>(series: I) -> Option<Decimal>
+where
+    I: IntoIterator<Item = Decimal>,
+{
+    let mut values = series.into_iter().filter(|value| !value.is_zero());
+    let mut previous = values.next()?;
     let mut squared_returns = Vec::new();
-    let mut previous = history.front().map(|point| point.value).unwrap_or(Decimal::ZERO);
-    for point in history.iter().skip(1) {
-        if previous.is_zero() || point.value.is_zero() {
-            previous = point.value;
-            continue;
-        }
 
-        let return_bps = ((point.value - previous) / previous) * Decimal::from(10_000u32);
+    for value in values {
+        let return_bps = ((value - previous) / previous) * Decimal::from(10_000u32);
         squared_returns.push(return_bps * return_bps);
-        previous = point.value;
+        previous = value;
     }
 
     if squared_returns.is_empty() {
-        return Decimal::ZERO;
+        None
+    } else {
+        decimal_sqrt(mean(squared_returns.into_iter()))
     }
-
-    decimal_sqrt(mean(squared_returns.into_iter())).unwrap_or(Decimal::ZERO)
 }
 
 fn mean<I>(values: I) -> Decimal
@@ -237,6 +309,24 @@ where
 
     if count == 0 {
         Decimal::ZERO
+    } else {
+        total / Decimal::from(count)
+    }
+}
+
+fn mean_or_fallback<I>(values: I, fallback: Decimal) -> Decimal
+where
+    I: IntoIterator<Item = Decimal>,
+{
+    let mut total = Decimal::ZERO;
+    let mut count = 0u64;
+    for value in values {
+        total += value;
+        count += 1;
+    }
+
+    if count == 0 {
+        fallback
     } else {
         total / Decimal::from(count)
     }
@@ -270,60 +360,75 @@ fn zscore(value: Decimal, mean_value: Decimal, stddev_value: Decimal) -> Decimal
 }
 
 fn trade_flow_imbalance(trades: &[domain::MarketTrade]) -> Decimal {
-    let buy_qty = trades
+    let buy_notional = trades
         .iter()
         .filter(|trade| matches!(trade.aggressor_side, domain::Side::Buy))
-        .fold(Decimal::ZERO, |acc, trade| acc + trade.quantity);
-    let sell_qty = trades
+        .fold(Decimal::ZERO, |acc, trade| acc + trade.price * trade.quantity);
+    let sell_notional = trades
         .iter()
         .filter(|trade| matches!(trade.aggressor_side, domain::Side::Sell))
-        .fold(Decimal::ZERO, |acc, trade| acc + trade.quantity);
-    let total = buy_qty + sell_qty;
-    if total.is_zero() {
+        .fold(Decimal::ZERO, |acc, trade| acc + trade.price * trade.quantity);
+    let total_notional = buy_notional + sell_notional;
+
+    if total_notional.is_zero() {
         Decimal::ZERO
     } else {
-        (buy_qty - sell_qty) / total
+        (buy_notional - sell_notional) / total_notional
     }
 }
 
-fn trade_flow_rate(trades: &[domain::MarketTrade]) -> Decimal {
-    let total_qty = trades
-        .iter()
-        .fold(Decimal::ZERO, |acc, trade| acc + trade.quantity);
-    total_qty / Decimal::from(TRADE_WINDOW_SECS)
-}
-
-fn rate_per_sec(count: usize, window_secs: i64) -> Decimal {
-    if window_secs <= 0 {
-        Decimal::ZERO
-    } else {
-        Decimal::from(count as u64) / Decimal::from(window_secs)
-    }
-}
-
-fn tick_rate_per_sec(trades: &[domain::MarketTrade]) -> Decimal {
+fn trade_flow_rate(trades: &[domain::MarketTrade], anchor_time: Timestamp) -> Decimal {
     if trades.is_empty() {
         return Decimal::ZERO;
     }
 
-    let mut price_changes = 1u64;
-    let mut previous = trades[0].price;
-    for trade in trades.iter().skip(1) {
-        if trade.price != previous {
-            price_changes += 1;
-            previous = trade.price;
-        }
-    }
-
-    Decimal::from(price_changes) / Decimal::from(TRADE_WINDOW_SECS)
+    let total_quantity = trades
+        .iter()
+        .fold(Decimal::ZERO, |acc, trade| acc + trade.quantity);
+    total_quantity / effective_window_secs(trades, anchor_time)
 }
 
-fn momentum_bps(history: &VecDeque<TimedDecimal>, current_mid: Decimal, horizon_secs: i64) -> Decimal {
+fn trade_rate_per_sec(trades: &[domain::MarketTrade], anchor_time: Timestamp) -> Decimal {
+    if trades.is_empty() {
+        return Decimal::ZERO;
+    }
+
+    Decimal::from(trades.len() as u64) / effective_window_secs(trades, anchor_time)
+}
+
+fn tick_rate_per_sec(trades: &[domain::MarketTrade], anchor_time: Timestamp) -> Decimal {
+    if trades.len() < 2 {
+        return Decimal::ZERO;
+    }
+
+    let transitions = trades
+        .windows(2)
+        .filter(|pair| pair[0].price != pair[1].price)
+        .count() as u64;
+    Decimal::from(transitions) / effective_window_secs(trades, anchor_time)
+}
+
+fn effective_window_secs(trades: &[domain::MarketTrade], anchor_time: Timestamp) -> Decimal {
+    let earliest = trades
+        .iter()
+        .map(|trade| trade.received_at)
+        .min()
+        .unwrap_or(anchor_time);
+    let elapsed_ms = ((anchor_time - earliest).whole_milliseconds() as i64).max(MIN_RATE_WINDOW_MS);
+    Decimal::from(elapsed_ms) / Decimal::from(1_000u32)
+}
+
+fn momentum_bps(
+    history: &VecDeque<TimedDecimal>,
+    current_mid: Decimal,
+    anchor_time: Timestamp,
+    horizon_secs: i64,
+) -> Decimal {
     if current_mid.is_zero() || history.is_empty() {
         return Decimal::ZERO;
     }
 
-    let target = now_utc() - time::Duration::seconds(horizon_secs);
+    let target = anchor_time - time::Duration::seconds(horizon_secs);
     let base = history
         .iter()
         .rev()
@@ -337,6 +442,13 @@ fn momentum_bps(history: &VecDeque<TimedDecimal>, current_mid: Decimal, horizon_
     } else {
         ((current_mid - base) / base) * Decimal::from(10_000u32)
     }
+}
+
+fn weighted_momentum(momentum_1s_bps: Decimal, momentum_5s_bps: Decimal, momentum_15s_bps: Decimal) -> Decimal {
+    (momentum_1s_bps * Decimal::from(5u32)
+        + momentum_5s_bps * Decimal::from(3u32)
+        + momentum_15s_bps * Decimal::from(2u32))
+        / Decimal::from(10u32)
 }
 
 fn top_of_book_depth_quote(snapshot: &MarketSnapshot) -> Decimal {
@@ -408,102 +520,208 @@ mod tests {
     use super::*;
     use domain::{BestBidAsk, MarketDataStatus, MarketTrade, OrderBookSnapshot, PriceLevel, Side, Symbol};
 
-    fn sample_snapshot() -> MarketSnapshot {
-        let now = now_utc();
-        let recent_trades = vec![
-            MarketTrade {
-                symbol: Symbol::BtcUsdc,
-                trade_id: "t1".to_string(),
-                price: Decimal::from(60_000u32),
-                quantity: Decimal::from_str_exact("0.01").unwrap(),
-                aggressor_side: Side::Buy,
-                event_time: now - time::Duration::seconds(4),
-                received_at: now - time::Duration::seconds(4),
-            },
-            MarketTrade {
-                symbol: Symbol::BtcUsdc,
-                trade_id: "t2".to_string(),
-                price: Decimal::from(60_020u32),
-                quantity: Decimal::from_str_exact("0.02").unwrap(),
-                aggressor_side: Side::Buy,
-                event_time: now - time::Duration::seconds(2),
-                received_at: now - time::Duration::seconds(2),
-            },
-            MarketTrade {
-                symbol: Symbol::BtcUsdc,
-                trade_id: "t3".to_string(),
-                price: Decimal::from(60_015u32),
-                quantity: Decimal::from_str_exact("0.03").unwrap(),
-                aggressor_side: Side::Sell,
-                event_time: now,
-                received_at: now,
-            },
-        ];
+    fn dec(raw: &str) -> Decimal {
+        Decimal::from_str_exact(raw).unwrap()
+    }
+
+    fn trade(id: &str, price: &str, qty: &str, side: Side, at: Timestamp) -> MarketTrade {
+        MarketTrade {
+            symbol: Symbol::BtcUsdc,
+            trade_id: id.to_string(),
+            price: dec(price),
+            quantity: dec(qty),
+            aggressor_side: side,
+            event_time: at,
+            received_at: at,
+        }
+    }
+
+    fn snapshot(
+        observed_at: Timestamp,
+        bid_price: &str,
+        ask_price: &str,
+        trades: Vec<MarketTrade>,
+    ) -> MarketSnapshot {
+        let best_bid_ask = BestBidAsk {
+            symbol: Symbol::BtcUsdc,
+            bid_price: dec(bid_price),
+            bid_quantity: dec("1.0"),
+            ask_price: dec(ask_price),
+            ask_quantity: dec("1.2"),
+            observed_at,
+        };
+
+        let orderbook = OrderBookSnapshot {
+            symbol: Symbol::BtcUsdc,
+            bids: vec![PriceLevel {
+                price: dec(bid_price),
+                quantity: dec("1.0"),
+            }],
+            asks: vec![PriceLevel {
+                price: dec(ask_price),
+                quantity: dec("1.2"),
+            }],
+            last_update_id: 1,
+            exchange_time: Some(observed_at),
+            observed_at,
+        };
+
+        let last_trade = trades.last().cloned();
+        let last_trade_update_at = trades.last().map(|trade| trade.received_at);
 
         MarketSnapshot {
             symbol: Symbol::BtcUsdc,
-            best_bid_ask: Some(BestBidAsk {
-                symbol: Symbol::BtcUsdc,
-                bid_price: Decimal::from(60_010u32),
-                bid_quantity: Decimal::from_str_exact("0.5").unwrap(),
-                ask_price: Decimal::from(60_020u32),
-                ask_quantity: Decimal::from_str_exact("0.4").unwrap(),
-                observed_at: now,
-            }),
-            orderbook: Some(OrderBookSnapshot {
-                symbol: Symbol::BtcUsdc,
-                bids: vec![PriceLevel {
-                    price: Decimal::from(60_010u32),
-                    quantity: Decimal::from_str_exact("0.5").unwrap(),
-                }],
-                asks: vec![PriceLevel {
-                    price: Decimal::from(60_020u32),
-                    quantity: Decimal::from_str_exact("0.4").unwrap(),
-                }],
-                last_update_id: 1,
-                exchange_time: Some(now),
-                observed_at: now,
-            }),
-            last_trade: recent_trades.last().cloned(),
-            recent_trades,
+            best_bid_ask: Some(best_bid_ask),
+            orderbook: Some(orderbook),
+            last_trade,
+            recent_trades: trades,
             status: MarketDataStatus {
                 is_stale: false,
                 needs_resync: false,
-                last_orderbook_update_at: Some(now),
-                last_trade_update_at: Some(now),
+                last_orderbook_update_at: Some(observed_at),
+                last_trade_update_at,
                 last_event_latency_ms: Some(5),
                 book_age_ms: Some(1),
-                trade_flow_rate: Decimal::from_str_exact("0.006").unwrap(),
+                trade_flow_rate: Decimal::ZERO,
                 book_crossed: false,
                 ws_reconnect_counter: 0,
             },
         }
     }
 
-    #[tokio::test]
-    async fn computes_non_stubbed_microstructure_features() {
-        let engine = RollingFeatureEngine::default();
-        let snapshot = sample_snapshot();
-
-        let features = engine.compute(&snapshot).await.unwrap();
-        assert!(features.vwap > Decimal::ZERO);
-        assert!(features.top_of_book_depth_quote > Decimal::ZERO);
-        assert!(features.trade_rate_per_sec > Decimal::ZERO);
-        assert!(features.tick_rate_per_sec > Decimal::ZERO);
+    fn assert_close(actual: Decimal, expected: Decimal, tolerance: Decimal) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff <= tolerance,
+            "expected {actual} to be within {tolerance} of {expected}, diff={diff}"
+        );
     }
 
     #[tokio::test]
-    async fn rolling_history_drives_spread_stats_and_momentum() {
+    async fn realized_volatility_uses_recent_trade_window_before_book_history_is_warm() {
         let engine = RollingFeatureEngine::default();
-        let snapshot = sample_snapshot();
-        let _ = engine.compute(&snapshot).await.unwrap();
+        let base = now_utc() - time::Duration::seconds(5);
+        let trades = vec![
+            trade("t1", "100.00", "1.0", Side::Buy, base - time::Duration::seconds(4)),
+            trade("t2", "100.30", "1.0", Side::Buy, base - time::Duration::seconds(3)),
+            trade("t3", "100.10", "1.0", Side::Sell, base - time::Duration::seconds(2)),
+            trade("t4", "100.60", "1.0", Side::Buy, base),
+        ];
 
-        let mut moved = snapshot.clone();
-        moved.best_bid_ask.as_mut().unwrap().bid_price += Decimal::from(20u32);
-        moved.best_bid_ask.as_mut().unwrap().ask_price += Decimal::from(20u32);
+        let features = engine
+            .compute(&snapshot(base, "100.55", "100.65", trades))
+            .await
+            .unwrap();
 
-        let features = engine.compute(&moved).await.unwrap();
-        assert!(features.spread_mean_bps >= Decimal::ZERO);
-        assert!(features.momentum_1s_bps >= Decimal::ZERO);
+        assert!(features.realized_volatility_bps > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn computes_vwap_and_vwap_distance_from_trade_window() {
+        let engine = RollingFeatureEngine::default();
+        let now = now_utc();
+        let trades = vec![
+            trade("t1", "100.00", "1.0", Side::Buy, now - time::Duration::seconds(4)),
+            trade("t2", "101.00", "3.0", Side::Sell, now - time::Duration::seconds(1)),
+        ];
+
+        let features = engine
+            .compute(&snapshot(now, "100.75", "100.85", trades))
+            .await
+            .unwrap();
+
+        assert_close(features.vwap, dec("100.75"), dec("0.0001"));
+        assert_close(features.vwap_distance_bps, dec("4.9627791563"), dec("0.01"));
+    }
+
+    #[tokio::test]
+    async fn computes_local_momentum_on_multiple_short_horizons() {
+        let engine = RollingFeatureEngine::default();
+        let base = now_utc() - time::Duration::seconds(20);
+
+        let snapshots = vec![
+            (base, "99.95", "100.05"),
+            (base + time::Duration::seconds(10), "100.95", "101.05"),
+            (base + time::Duration::seconds(15), "101.95", "102.05"),
+            (base + time::Duration::seconds(19), "102.95", "103.05"),
+            (base + time::Duration::seconds(20), "103.95", "104.05"),
+        ];
+
+        let mut final_features = None;
+        for (at, bid, ask) in snapshots {
+            final_features = Some(engine.compute(&snapshot(at, bid, ask, Vec::new())).await.unwrap());
+        }
+
+        let features = final_features.unwrap();
+        assert!(features.momentum_1s_bps > Decimal::ZERO);
+        assert!(features.momentum_5s_bps > features.momentum_1s_bps);
+        assert!(features.momentum_15s_bps > features.momentum_5s_bps);
+        assert!(features.local_momentum_bps > features.momentum_1s_bps);
+    }
+
+    #[tokio::test]
+    async fn computes_spread_mean_std_and_zscore_from_rolling_window() {
+        let engine = RollingFeatureEngine::default();
+        let base = now_utc() - time::Duration::seconds(3);
+
+        let _ = engine
+            .compute(&snapshot(base, "99.95", "100.05", Vec::new()))
+            .await
+            .unwrap();
+        let _ = engine
+            .compute(&snapshot(base + time::Duration::seconds(1), "99.90", "100.10", Vec::new()))
+            .await
+            .unwrap();
+        let features = engine
+            .compute(&snapshot(
+                base + time::Duration::seconds(2),
+                "99.85",
+                "100.15",
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        assert_close(features.spread_mean_bps, dec("20"), dec("0.05"));
+        assert_close(features.spread_std_bps, dec("8.1649658093"), dec("0.05"));
+        assert_close(features.spread_zscore, dec("1.2247448714"), dec("0.05"));
+    }
+
+    #[tokio::test]
+    async fn computes_trade_flow_imbalance_from_signed_quote_flow() {
+        let engine = RollingFeatureEngine::default();
+        let now = now_utc();
+        let trades = vec![
+            trade("t1", "100.00", "2.0", Side::Buy, now - time::Duration::seconds(3)),
+            trade("t2", "100.00", "1.0", Side::Buy, now - time::Duration::seconds(2)),
+            trade("t3", "100.00", "1.0", Side::Sell, now - time::Duration::seconds(1)),
+        ];
+
+        let features = engine
+            .compute(&snapshot(now, "99.95", "100.05", trades))
+            .await
+            .unwrap();
+
+        assert_close(features.trade_flow_imbalance, dec("0.5"), dec("0.0001"));
+    }
+
+    #[tokio::test]
+    async fn computes_trade_rate_and_tick_rate_from_effective_window() {
+        let engine = RollingFeatureEngine::default();
+        let now = now_utc();
+        let trades = vec![
+            trade("t1", "100.00", "1.0", Side::Buy, now - time::Duration::seconds(4)),
+            trade("t2", "100.00", "1.0", Side::Buy, now - time::Duration::seconds(3)),
+            trade("t3", "101.00", "1.0", Side::Sell, now - time::Duration::seconds(1)),
+            trade("t4", "102.00", "1.0", Side::Buy, now),
+        ];
+
+        let features = engine
+            .compute(&snapshot(now, "101.95", "102.05", trades))
+            .await
+            .unwrap();
+
+        assert_close(features.trade_rate_per_sec, dec("1.0"), dec("0.0001"));
+        assert_close(features.tick_rate_per_sec, dec("0.5"), dec("0.0001"));
     }
 }
