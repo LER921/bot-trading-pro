@@ -85,6 +85,7 @@ where
 {
     pub fn new(config: AppConfig, gateway: G) -> Result<Self> {
         let symbols = config.enabled_symbols();
+        let risk_limits = config.risk_limits();
         let budgets = config
             .pairs
             .pairs
@@ -94,6 +95,10 @@ where
                 symbol: pair.symbol,
                 max_quote_notional: pair.max_quote_notional,
                 reserved_quote_notional: Decimal::ZERO,
+                soft_inventory_base: pair.soft_inventory_base,
+                max_inventory_base: pair.max_inventory_base,
+                neutralization_clip_fraction: risk_limits.inventory.neutralization_clip_fraction,
+                reduce_only_trigger_ratio: risk_limits.inventory.reduce_only_trigger_ratio,
             })
             .collect::<Vec<_>>();
 
@@ -105,7 +110,7 @@ where
         };
 
         Ok(Self {
-            risk_manager: StrictRiskManager::new(config.risk_limits()),
+            risk_manager: StrictRiskManager::new(risk_limits),
             execution: BinanceExecutionEngine::new(gateway.clone(), symbols.clone()),
             portfolio: InMemoryPortfolioService::new(budgets),
             config,
@@ -651,14 +656,14 @@ where
     }
 
     async fn apply_bootstrap_state(&mut self, bootstrap: &BinanceBootstrapState) -> Result<()> {
+        for fill in &bootstrap.fills {
+            self.apply_fill_if_new(fill.clone()).await?;
+        }
+
         self.health_tracker.record_account_snapshot(bootstrap.account.updated_at);
         self.portfolio
             .apply_account_snapshot(bootstrap.account.clone())
             .await?;
-
-        for fill in &bootstrap.fills {
-            self.apply_fill_if_new(fill.clone()).await?;
-        }
 
         self.execution
             .sync_open_orders(bootstrap.open_orders.clone())
@@ -935,6 +940,10 @@ mod tests {
     }
 
     fn sample_account() -> AccountSnapshot {
+        sample_account_with_positions(Decimal::ZERO, Decimal::ZERO)
+    }
+
+    fn sample_account_with_positions(btc_free: Decimal, eth_free: Decimal) -> AccountSnapshot {
         AccountSnapshot {
             balances: vec![
                 Balance {
@@ -944,12 +953,12 @@ mod tests {
                 },
                 Balance {
                     asset: "BTC".to_string(),
-                    free: Decimal::ZERO,
+                    free: btc_free,
                     locked: Decimal::ZERO,
                 },
                 Balance {
                     asset: "ETH".to_string(),
-                    free: Decimal::ZERO,
+                    free: eth_free,
                     locked: Decimal::ZERO,
                 },
             ],
@@ -1110,6 +1119,50 @@ mod tests {
         runtime.bootstrap().await.unwrap();
 
         assert_eq!(runtime.state(), RuntimeState::Trading);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_recent_fills_do_not_double_count_inventory() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway
+            .seed_account(sample_account_with_positions(
+                Decimal::from_str_exact("0.005").unwrap(),
+                Decimal::ZERO,
+            ))
+            .await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+        gateway
+            .seed_fills(
+                Symbol::BtcUsdc,
+                vec![FillEvent {
+                    trade_id: "bootstrap-fill-1".to_string(),
+                    order_id: "42".to_string(),
+                    symbol: Symbol::BtcUsdc,
+                    side: Side::Buy,
+                    price: Decimal::from(60_000u32),
+                    quantity: Decimal::from_str_exact("0.005").unwrap(),
+                    fee: Decimal::from_str_exact("0.01").unwrap(),
+                    fee_asset: "USDC".to_string(),
+                    fee_quote: Some(Decimal::from_str_exact("0.01").unwrap()),
+                    liquidity_side: domain::LiquiditySide::Taker,
+                    event_time: now_utc(),
+                }],
+            )
+            .await;
+
+        let mut runtime = TraderRuntime::new(sample_config(false), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+
+        let inventory = runtime.portfolio.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(inventory.base_position, Decimal::from_str_exact("0.005").unwrap());
+        assert_eq!(inventory.average_entry_price, Some(Decimal::from(60_000u32)));
+        assert_eq!(inventory.quote_position, Decimal::from(-300i32));
+        assert!(runtime.seen_fills.contains(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "bootstrap-fill-1".to_string(),
+        }));
     }
 
     #[tokio::test]

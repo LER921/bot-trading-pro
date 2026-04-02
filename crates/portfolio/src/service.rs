@@ -121,34 +121,10 @@ impl PortfolioService for InMemoryPortfolioService {
             base_position: Decimal::ZERO,
             quote_position: Decimal::ZERO,
             mark_price: Some(fill.price),
-            average_entry_price: Some(fill.price),
+            average_entry_price: None,
             updated_at: fill.event_time,
         });
-
-        match fill.side {
-            Side::Buy => {
-                let previous_base = entry.base_position.max(Decimal::ZERO);
-                let new_base = previous_base + fill.quantity;
-                entry.average_entry_price = if new_base.is_zero() {
-                    None
-                } else {
-                    let previous_cost = previous_base * entry.average_entry_price.unwrap_or(fill.price);
-                    Some((previous_cost + fill.quantity * fill.price) / new_base)
-                };
-                entry.base_position += fill.quantity;
-                entry.quote_position -= fill.quantity * fill.price;
-            }
-            Side::Sell => {
-                entry.base_position -= fill.quantity;
-                entry.quote_position += fill.quantity * fill.price;
-                if entry.base_position <= Decimal::ZERO {
-                    entry.average_entry_price = None;
-                }
-            }
-        }
-
-        entry.mark_price = Some(fill.price);
-        entry.updated_at = fill.event_time;
+        apply_fill_to_inventory(entry, &fill);
         Ok(())
     }
 
@@ -179,7 +155,24 @@ impl PortfolioService for InMemoryPortfolioService {
         let inventory = self.inventory(symbol).await;
         let mut budget = self.budgets.read().await.get(&symbol).cloned()?;
         if let Some(inventory) = inventory {
-            budget.reserved_quote_notional = inventory.quote_position.abs();
+            let reference_price = inventory
+                .mark_price
+                .or(inventory.average_entry_price)
+                .unwrap_or(Decimal::ZERO);
+            let tracked_quote_notional = inventory.quote_position.abs();
+            let base_exposure_quote = inventory.base_position.abs() * reference_price;
+            let raw_reserved_quote = tracked_quote_notional.max(base_exposure_quote);
+            let soft_limit_quote = budget.soft_inventory_base * reference_price;
+            let reduce_only_limit_quote =
+                budget.max_inventory_base * budget.reduce_only_trigger_ratio * reference_price;
+
+            budget.reserved_quote_notional = reserve_quote_notional(
+                raw_reserved_quote,
+                soft_limit_quote,
+                reduce_only_limit_quote,
+                budget.max_quote_notional,
+                budget.neutralization_clip_fraction,
+            );
         }
         Some(budget)
     }
@@ -195,14 +188,10 @@ impl InMemoryPortfolioService {
             .balance("ETH")
             .map(|balance| balance.total())
             .unwrap_or(Decimal::ZERO);
-        let usdc_balance = snapshot
-            .balance("USDC")
-            .map(|balance| balance.total())
-            .unwrap_or(Decimal::ZERO);
 
         let mut inventory = self.inventory.write().await;
-        sync_inventory(&mut inventory, Symbol::BtcUsdc, btc_balance, usdc_balance, updated_at);
-        sync_inventory(&mut inventory, Symbol::EthUsdc, eth_balance, usdc_balance, updated_at);
+        sync_inventory(&mut inventory, Symbol::BtcUsdc, btc_balance, updated_at);
+        sync_inventory(&mut inventory, Symbol::EthUsdc, eth_balance, updated_at);
     }
 }
 
@@ -215,19 +204,305 @@ fn sync_inventory(
     inventory: &mut HashMap<Symbol, InventorySnapshot>,
     symbol: Symbol,
     base_position: Decimal,
-    quote_position: Decimal,
     updated_at: common::Timestamp,
 ) {
     let entry = inventory.entry(symbol).or_insert(InventorySnapshot {
         symbol,
         base_position: Decimal::ZERO,
-        quote_position,
+        quote_position: Decimal::ZERO,
         mark_price: None,
         average_entry_price: None,
         updated_at,
     });
 
+    let previous_base = entry.base_position;
+    let previous_average_entry = entry.average_entry_price;
     entry.base_position = base_position;
-    entry.quote_position = quote_position;
+    entry.quote_position = match previous_average_entry {
+        Some(average_entry_price) if same_nonzero_direction(previous_base, base_position) => {
+            signed_quote_position(base_position, average_entry_price)
+        }
+        _ => Decimal::ZERO,
+    };
+    entry.average_entry_price = match previous_average_entry {
+        Some(average_entry_price) if same_nonzero_direction(previous_base, base_position) => {
+            Some(average_entry_price)
+        }
+        _ => None,
+    };
+    if entry.base_position.is_zero() {
+        entry.quote_position = Decimal::ZERO;
+        entry.average_entry_price = None;
+    }
     entry.updated_at = updated_at;
+}
+
+fn apply_fill_to_inventory(entry: &mut InventorySnapshot, fill: &FillEvent) {
+    let previous_base = entry.base_position;
+    let signed_quantity = signed_fill_quantity(fill.side, fill.quantity);
+    let next_base = previous_base + signed_quantity;
+    let previous_average_entry = entry.average_entry_price;
+
+    entry.base_position = next_base;
+    entry.average_entry_price = match previous_average_entry {
+        Some(average_entry_price) if same_nonzero_direction(previous_base, signed_quantity) => {
+            let previous_abs = previous_base.abs();
+            let next_abs = next_base.abs();
+            if next_abs.is_zero() {
+                None
+            } else {
+                let weighted_cost =
+                    previous_abs * average_entry_price + fill.quantity * fill.price;
+                Some(weighted_cost / next_abs)
+            }
+        }
+        Some(average_entry_price) if same_nonzero_direction(previous_base, next_base) => {
+            Some(average_entry_price)
+        }
+        _ if next_base.is_zero() => None,
+        _ => Some(fill.price),
+    };
+    entry.quote_position = match entry.average_entry_price {
+        Some(average_entry_price) => signed_quote_position(next_base, average_entry_price),
+        None => Decimal::ZERO,
+    };
+    entry.mark_price = Some(fill.price);
+    entry.updated_at = fill.event_time;
+}
+
+fn signed_fill_quantity(side: Side, quantity: Decimal) -> Decimal {
+    match side {
+        Side::Buy => quantity,
+        Side::Sell => -quantity,
+    }
+}
+
+fn signed_quote_position(base_position: Decimal, average_entry_price: Decimal) -> Decimal {
+    -base_position * average_entry_price
+}
+
+fn same_nonzero_direction(left: Decimal, right: Decimal) -> bool {
+    direction(left) != 0 && direction(left) == direction(right)
+}
+
+fn direction(value: Decimal) -> i8 {
+    if value > Decimal::ZERO {
+        1
+    } else if value < Decimal::ZERO {
+        -1
+    } else {
+        0
+    }
+}
+
+fn reserve_quote_notional(
+    raw_reserved_quote: Decimal,
+    soft_limit_quote: Decimal,
+    reduce_only_limit_quote: Decimal,
+    max_quote_notional: Decimal,
+    neutralization_clip_fraction: Decimal,
+) -> Decimal {
+    if raw_reserved_quote <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    let max_quote_notional = max_quote_notional.max(Decimal::ZERO);
+    let clipped_fraction = neutralization_clip_fraction
+        .max(Decimal::ZERO)
+        .min(Decimal::ONE);
+    if max_quote_notional.is_zero() {
+        return raw_reserved_quote;
+    }
+
+    if reduce_only_limit_quote > Decimal::ZERO && raw_reserved_quote >= reduce_only_limit_quote {
+        return max_quote_notional;
+    }
+
+    if soft_limit_quote > Decimal::ZERO && raw_reserved_quote > soft_limit_quote {
+        return (raw_reserved_quote
+            + (raw_reserved_quote - soft_limit_quote) * clipped_fraction)
+            .min(max_quote_notional);
+    }
+
+    raw_reserved_quote.min(max_quote_notional)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dec(raw: &str) -> Decimal {
+        Decimal::from_str_exact(raw).unwrap()
+    }
+
+    fn sample_budget() -> SymbolBudget {
+        SymbolBudget {
+            symbol: Symbol::BtcUsdc,
+            max_quote_notional: dec("500"),
+            reserved_quote_notional: Decimal::ZERO,
+            soft_inventory_base: dec("0.020"),
+            max_inventory_base: dec("0.050"),
+            neutralization_clip_fraction: dec("0.20"),
+            reduce_only_trigger_ratio: dec("0.90"),
+        }
+    }
+
+    fn sample_fill(side: Side, quantity: &str, price: &str, event_offset_secs: i64) -> FillEvent {
+        FillEvent {
+            trade_id: format!("{side:?}-{quantity}-{price}-{event_offset_secs}"),
+            order_id: "order-1".to_string(),
+            symbol: Symbol::BtcUsdc,
+            side,
+            price: dec(price),
+            quantity: dec(quantity),
+            fee: Decimal::ZERO,
+            fee_asset: "USDC".to_string(),
+            fee_quote: Some(Decimal::ZERO),
+            liquidity_side: domain::LiquiditySide::Maker,
+            event_time: now_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fill_sequence_keeps_position_coherent_through_add_reduce_and_reverse() {
+        let service = InMemoryPortfolioService::default();
+        service
+            .apply_fill(sample_fill(Side::Buy, "1.0", "100", 0))
+            .await
+            .unwrap();
+        service
+            .apply_fill(sample_fill(Side::Buy, "1.0", "110", 1))
+            .await
+            .unwrap();
+        service
+            .apply_fill(sample_fill(Side::Sell, "1.5", "120", 2))
+            .await
+            .unwrap();
+        service
+            .apply_fill(sample_fill(Side::Sell, "1.0", "90", 3))
+            .await
+            .unwrap();
+
+        let inventory = service.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(inventory.base_position, dec("-0.5"));
+        assert_eq!(inventory.average_entry_price, Some(dec("90")));
+        assert_eq!(inventory.quote_position, dec("45.0"));
+        assert_eq!(inventory.mark_price, Some(dec("90")));
+    }
+
+    #[tokio::test]
+    async fn reduction_and_flatten_reset_inventory_cleanly() {
+        let service = InMemoryPortfolioService::default();
+        service
+            .apply_fill(sample_fill(Side::Buy, "1.0", "100", 0))
+            .await
+            .unwrap();
+        service
+            .apply_fill(sample_fill(Side::Sell, "0.4", "101", 1))
+            .await
+            .unwrap();
+
+        let reduced = service.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(reduced.base_position, dec("0.6"));
+        assert_eq!(reduced.average_entry_price, Some(dec("100")));
+        assert_eq!(reduced.quote_position, dec("-60.0"));
+
+        service
+            .apply_fill(sample_fill(Side::Sell, "0.6", "102", 2))
+            .await
+            .unwrap();
+
+        let flattened = service.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(flattened.base_position, Decimal::ZERO);
+        assert_eq!(flattened.quote_position, Decimal::ZERO);
+        assert_eq!(flattened.average_entry_price, None);
+    }
+
+    #[tokio::test]
+    async fn soft_inventory_zone_adds_neutralization_pressure_to_budget() {
+        let service = InMemoryPortfolioService::new([sample_budget()]);
+        service
+            .apply_fill(sample_fill(Side::Buy, "0.030", "10000", 0))
+            .await
+            .unwrap();
+        service
+            .apply_mark_price(Symbol::BtcUsdc, dec("10000"))
+            .await
+            .unwrap();
+
+        let budget = service.budget(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(budget.reserved_quote_notional, dec("320.00000"));
+        assert!(budget.reserved_quote_notional > dec("300"));
+        assert!(budget.reserved_quote_notional < budget.max_quote_notional);
+    }
+
+    #[tokio::test]
+    async fn near_max_inventory_clamps_budget_to_hard_limit() {
+        let service = InMemoryPortfolioService::new([sample_budget()]);
+        service
+            .apply_fill(sample_fill(Side::Buy, "0.046", "10000", 0))
+            .await
+            .unwrap();
+        service
+            .apply_mark_price(Symbol::BtcUsdc, dec("10000"))
+            .await
+            .unwrap();
+
+        let budget = service.budget(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(budget.reserved_quote_notional, budget.max_quote_notional);
+    }
+
+    #[tokio::test]
+    async fn account_snapshot_reconciles_flattened_inventory_without_stale_entry_price() {
+        let service = InMemoryPortfolioService::new([sample_budget()]);
+        service
+            .apply_fill(sample_fill(Side::Buy, "0.010", "10000", 0))
+            .await
+            .unwrap();
+
+        service
+            .apply_account_snapshot(AccountSnapshot {
+                balances: vec![
+                    Balance {
+                        asset: "BTC".to_string(),
+                        free: Decimal::ZERO,
+                        locked: Decimal::ZERO,
+                    },
+                    Balance {
+                        asset: "USDC".to_string(),
+                        free: dec("6900"),
+                        locked: Decimal::ZERO,
+                    },
+                ],
+                updated_at: now_utc(),
+            })
+            .await
+            .unwrap();
+
+        let flattened = service.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(flattened.base_position, Decimal::ZERO);
+        assert_eq!(flattened.quote_position, Decimal::ZERO);
+        assert_eq!(flattened.average_entry_price, None);
+
+        service
+            .apply_fill(sample_fill(Side::Buy, "0.005", "10020", 1))
+            .await
+            .unwrap();
+        service
+            .apply_account_position(
+                vec![Balance {
+                    asset: "BTC".to_string(),
+                    free: dec("0.005"),
+                    locked: Decimal::ZERO,
+                }],
+                now_utc(),
+            )
+            .await
+            .unwrap();
+
+        let reopened = service.inventory(Symbol::BtcUsdc).await.unwrap();
+        assert_eq!(reopened.base_position, dec("0.005"));
+        assert_eq!(reopened.average_entry_price, Some(dec("10020")));
+        assert_eq!(reopened.quote_position, dec("-50.100"));
+    }
 }

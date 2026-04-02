@@ -1,10 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use common::{Decimal, ids::new_client_order_id, now_utc};
 use common::retry::{RetryPolicy, retry_async};
+use common::{Decimal, ids::new_client_order_id, now_utc};
 use domain::{
     ExecutionReport, ExecutionStats, OpenOrder, OrderRequest, OrderStatus, OrderType, RiskDecision,
-    RiskMode, Symbol, TradeIntent,
+    RiskMode, Symbol, TimeInForce, TradeIntent,
 };
 use exchange_binance_spot::{BinanceExecutionEvent, BinanceSpotGateway};
 use std::collections::{HashMap, HashSet};
@@ -27,6 +27,112 @@ pub trait ExecutionEngine: Send + Sync {
 #[derive(Debug, Clone)]
 struct TrackedOrder {
     request: OrderRequest,
+    exchange_order_id: Option<String>,
+    status: OrderStatus,
+    filled_quantity: Decimal,
+    updated_at: common::Timestamp,
+}
+
+impl TrackedOrder {
+    fn from_request(request: OrderRequest, report: &ExecutionReport) -> Self {
+        Self {
+            request,
+            exchange_order_id: report.exchange_order_id.clone(),
+            status: report.status,
+            filled_quantity: report.filled_quantity,
+            updated_at: report.event_time,
+        }
+    }
+
+    fn from_open_order(order: &OpenOrder) -> Self {
+        Self {
+            request: OrderRequest {
+                client_order_id: order.client_order_id.clone(),
+                symbol: order.symbol,
+                side: order.side,
+                order_type: if order.price.is_some() {
+                    OrderType::Limit
+                } else {
+                    OrderType::Market
+                },
+                price: order.price,
+                quantity: order.original_quantity,
+                time_in_force: Some(TimeInForce::Gtc),
+                post_only: false,
+                reduce_only: order.reduce_only,
+                source_intent_id: format!("reconciled-{}", order.client_order_id),
+            },
+            exchange_order_id: order.exchange_order_id.clone(),
+            status: order.status,
+            filled_quantity: order.executed_quantity,
+            updated_at: order.updated_at,
+        }
+    }
+
+    fn merge_open_order(&mut self, order: &OpenOrder) {
+        self.request.symbol = order.symbol;
+        self.request.side = order.side;
+        self.request.price = order.price.or(self.request.price);
+        self.request.quantity = order.original_quantity;
+        self.request.reduce_only = order.reduce_only;
+        self.exchange_order_id = order.exchange_order_id.clone();
+        self.status = order.status;
+        self.filled_quantity = order.executed_quantity;
+        self.updated_at = order.updated_at;
+    }
+
+    fn merge_event_fields(&mut self, event: &BinanceExecutionEvent) {
+        self.request.symbol = event.report.symbol;
+        self.request.side = event.side;
+        self.request.order_type = event.order_type;
+        self.request.price = event.price.or(self.request.price);
+        if self.request.quantity < event.original_quantity {
+            self.request.quantity = event.original_quantity;
+        }
+        if self.request.time_in_force.is_none() {
+            self.request.time_in_force = event.time_in_force;
+        }
+        self.request.post_only = matches!(event.order_type, OrderType::LimitMaker);
+    }
+
+    fn update_from_report(&mut self, report: &ExecutionReport) -> bool {
+        let progressed = self.status != report.status
+            || self.filled_quantity != report.filled_quantity
+            || self.exchange_order_id != report.exchange_order_id;
+        self.exchange_order_id = report.exchange_order_id.clone();
+        self.status = report.status;
+        self.filled_quantity = report.filled_quantity;
+        self.updated_at = report.event_time;
+        progressed
+    }
+
+    fn to_open_order(&self) -> Option<OpenOrder> {
+        self.status.is_open().then(|| OpenOrder {
+            client_order_id: self.request.client_order_id.clone(),
+            exchange_order_id: self.exchange_order_id.clone(),
+            symbol: self.request.symbol,
+            side: self.request.side,
+            price: self.request.price,
+            original_quantity: self.request.quantity,
+            executed_quantity: self.filled_quantity,
+            status: self.status,
+            reduce_only: self.request.reduce_only,
+            updated_at: self.updated_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCancelKind {
+    Manual,
+    Stale,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StaleOrderEvaluation {
+    cancel_candidate: bool,
+    keep_worthy: bool,
+    hard_stale: bool,
 }
 
 #[derive(Debug, Default)]
@@ -49,6 +155,7 @@ struct ExecutionState {
     open_orders: HashMap<String, OpenOrder>,
     processed_intents: HashSet<String>,
     tracked_orders: HashMap<String, TrackedOrder>,
+    pending_cancel_reports: HashMap<String, PendingCancelKind>,
     aggregate: ExecutionAggregate,
 }
 
@@ -95,15 +202,27 @@ where
             return Ok(None);
         };
 
+        let request = build_order_request(intent);
         {
-            let state = self.state.read().await;
+            let mut state = self.state.write().await;
             if state.processed_intents.contains(&intent.intent_id) {
                 warn!(intent_id = intent.intent_id, "duplicate intent skipped by execution engine");
                 return Ok(None);
             }
+
+            if let Some(existing_client_order_id) = find_equivalent_open_order(&state, &request) {
+                state.processed_intents.insert(intent.intent_id.clone());
+                info!(
+                    symbol = %request.symbol,
+                    client_order_id = request.client_order_id,
+                    existing_client_order_id,
+                    source_intent_id = request.source_intent_id,
+                    "execution skipped because an equivalent live order is already working"
+                );
+                return Ok(None);
+            }
         }
 
-        let request = build_order_request(intent);
         let request_for_retry = request.clone();
         let gateway = self.gateway.clone();
         info!(
@@ -125,23 +244,7 @@ where
         state.processed_intents.insert(intent.intent_id.clone());
         state.aggregate.total_submitted = state.aggregate.total_submitted.saturating_add(1);
         update_aggregate_from_report(&mut state.aggregate, &report);
-
-        if report.status.is_open() {
-            if let Some(open_order) = report.to_open_order(&request) {
-                state
-                    .open_orders
-                    .insert(open_order.client_order_id.clone(), open_order);
-            }
-            state.tracked_orders.insert(
-                report.client_order_id.clone(),
-                TrackedOrder {
-                    request,
-                },
-            );
-        } else {
-            state.open_orders.remove(&report.client_order_id);
-            state.tracked_orders.remove(&report.client_order_id);
-        }
+        upsert_state_from_request_report(&mut state, request, &report);
 
         info!(
             status = ?report.status,
@@ -158,26 +261,18 @@ where
             Some(symbol) => {
                 self.gateway.cancel_all_orders(symbol).await?;
                 let mut state = self.state.write().await;
-                let count = state
-                    .open_orders
-                    .values()
-                    .filter(|order| order.symbol == symbol)
-                    .count() as u64;
-                state.open_orders.retain(|_, order| order.symbol != symbol);
-                state.tracked_orders.retain(|_, order| order.request.symbol != symbol);
-                state.aggregate.total_canceled += count;
-                count
+                mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Manual)
             }
             None => {
                 for &symbol in &self.symbols {
                     self.gateway.cancel_all_orders(symbol).await?;
                 }
                 let mut state = self.state.write().await;
-                let count = state.open_orders.len() as u64;
-                state.open_orders.clear();
-                state.tracked_orders.clear();
-                state.aggregate.total_canceled += count;
-                count
+                let symbols = self.symbols.clone();
+                symbols
+                    .into_iter()
+                    .map(|symbol| mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Manual))
+                    .sum()
             }
         };
 
@@ -189,48 +284,26 @@ where
         let now = now_utc();
         let stale_symbols = {
             let state = self.state.read().await;
-            state
-                .open_orders
-                .values()
-                .filter(|order| {
-                    let age_ms = (now - order.updated_at).whole_milliseconds() as i64;
-                    if age_ms > max_age_ms {
-                        return true;
-                    }
+            let mut evaluations_by_symbol: HashMap<Symbol, Vec<StaleOrderEvaluation>> = HashMap::new();
 
-                    let Some(order_price) = order.price else {
-                        return false;
-                    };
-                    let Some(mid_price) = mid_prices.get(&order.symbol).copied() else {
-                        return false;
-                    };
-                    let distance_bps = if mid_price.is_zero() {
-                        Decimal::ZERO
-                    } else {
-                        ((order_price - mid_price).abs() / mid_price) * Decimal::from(10_000u32)
-                    };
-                    distance_bps > Decimal::from(12u32)
-                })
-                .map(|order| order.symbol)
-                .collect::<HashSet<_>>()
+            for order in state.open_orders.values() {
+                let evaluation =
+                    evaluate_stale_order(order, max_age_ms, now, mid_prices.get(&order.symbol).copied());
+                evaluations_by_symbol.entry(order.symbol).or_default().push(evaluation);
+            }
+
+            evaluations_by_symbol
+                .into_iter()
+                .filter_map(|(symbol, evaluations)| should_cancel_symbol(&evaluations).then_some(symbol))
+                .collect::<Vec<_>>()
         };
 
         let mut canceled = 0usize;
         for symbol in stale_symbols {
             self.gateway.cancel_all_orders(symbol).await?;
             let mut state = self.state.write().await;
-            let count = state
-                .open_orders
-                .values()
-                .filter(|order| order.symbol == symbol)
-                .count();
-            if count > 0 {
-                canceled += count;
-                state.aggregate.total_canceled += count as u64;
-                state.aggregate.total_stale_cancels += count as u64;
-            }
-            state.open_orders.retain(|_, order| order.symbol != symbol);
-            state.tracked_orders.retain(|_, order| order.request.symbol != symbol);
+            let count = mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Stale);
+            canceled += count;
         }
 
         Ok(canceled)
@@ -247,62 +320,79 @@ where
 
     async fn sync_open_orders(&self, open_orders: Vec<OpenOrder>) -> Result<Vec<OpenOrder>> {
         let mut state = self.state.write().await;
-        state.open_orders = open_orders
-            .iter()
-            .cloned()
-            .map(|order| (order.client_order_id.clone(), order))
-            .collect();
-        let open_ids = state.open_orders.keys().cloned().collect::<HashSet<_>>();
-        state
-            .tracked_orders
-            .retain(|client_order_id, _| open_ids.contains(client_order_id));
+        let mut previous_tracked = std::mem::take(&mut state.tracked_orders);
+        let mut next_open_orders = HashMap::new();
+        let mut next_tracked = HashMap::new();
+
+        for order in open_orders {
+            let mut tracked = previous_tracked
+                .remove(&order.client_order_id)
+                .unwrap_or_else(|| TrackedOrder::from_open_order(&order));
+            tracked.merge_open_order(&order);
+
+            if let Some(kind) = state.pending_cancel_reports.remove(&order.client_order_id) {
+                undo_pending_cancel(&mut state.aggregate, kind);
+            }
+
+            if let Some(open_order) = tracked.to_open_order() {
+                next_open_orders.insert(open_order.client_order_id.clone(), open_order);
+            }
+            next_tracked.insert(order.client_order_id.clone(), tracked);
+        }
+
+        state.open_orders = next_open_orders;
+        state.tracked_orders = next_tracked;
 
         info!(open_orders = state.open_orders.len(), "execution reconciliation completed");
         Ok(state.open_orders.values().cloned().collect())
     }
 
     async fn apply_execution_event(&self, event: &BinanceExecutionEvent) -> Result<()> {
+        let client_order_id = event.report.client_order_id.clone();
         let mut state = self.state.write().await;
-        update_aggregate_from_report(&mut state.aggregate, &event.report);
 
-        if event.report.status.is_open() {
-            state.open_orders.insert(
-                event.report.client_order_id.clone(),
-                OpenOrder {
-                    client_order_id: event.report.client_order_id.clone(),
-                    exchange_order_id: event.report.exchange_order_id.clone(),
-                    symbol: event.report.symbol,
-                    side: event.side,
-                    price: event.price,
-                    original_quantity: event.original_quantity,
-                    executed_quantity: event.cumulative_filled_quantity,
-                    status: event.report.status,
-                    reduce_only: false,
-                    updated_at: event.transaction_time,
-                },
-            );
-            state.tracked_orders.entry(event.report.client_order_id.clone()).or_insert(
-                TrackedOrder {
-                    request: OrderRequest {
-                        client_order_id: event.report.client_order_id.clone(),
-                        symbol: event.report.symbol,
-                        side: event.side,
-                        order_type: event.order_type,
-                        price: event.price,
-                        quantity: event.original_quantity,
-                        time_in_force: event.time_in_force,
-                        post_only: matches!(event.order_type, OrderType::LimitMaker),
-                        reduce_only: false,
-                        source_intent_id: "user-stream".to_string(),
-                    },
-                },
-            );
+        let report_progressed = if let Some(tracked) = state.tracked_orders.get_mut(&client_order_id) {
+            tracked.merge_event_fields(event);
+            tracked.update_from_report(&event.report)
         } else {
-            if matches!(event.report.status, OrderStatus::Canceled) {
+            true
+        };
+
+        let pending_cancel_kind = state.pending_cancel_reports.remove(&client_order_id);
+        if report_progressed {
+            update_aggregate_from_report(&mut state.aggregate, &event.report);
+            if matches!(event.report.status, OrderStatus::Canceled) && pending_cancel_kind.is_none() {
                 state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(1);
             }
-            state.open_orders.remove(&event.report.client_order_id);
-            state.tracked_orders.remove(&event.report.client_order_id);
+        }
+
+        match event.report.status {
+            status if status.is_open() => {
+                if let Some(kind) = pending_cancel_kind {
+                    undo_pending_cancel(&mut state.aggregate, kind);
+                }
+
+                let tracked = state.tracked_orders.entry(client_order_id.clone()).or_insert_with(|| {
+                    TrackedOrder::from_request(build_request_from_event(event), &event.report)
+                });
+                tracked.merge_event_fields(event);
+                tracked.update_from_report(&event.report);
+
+                if let Some(open_order) = tracked.to_open_order() {
+                    state.open_orders.insert(client_order_id.clone(), open_order);
+                }
+            }
+            OrderStatus::Canceled => {
+                state.open_orders.remove(&client_order_id);
+                state.tracked_orders.remove(&client_order_id);
+            }
+            _ => {
+                if let Some(kind) = pending_cancel_kind {
+                    undo_pending_cancel(&mut state.aggregate, kind);
+                }
+                state.open_orders.remove(&client_order_id);
+                state.tracked_orders.remove(&client_order_id);
+            }
         }
 
         info!(
@@ -350,6 +440,21 @@ fn build_order_request(intent: &TradeIntent) -> OrderRequest {
     }
 }
 
+fn build_request_from_event(event: &BinanceExecutionEvent) -> OrderRequest {
+    OrderRequest {
+        client_order_id: event.report.client_order_id.clone(),
+        symbol: event.report.symbol,
+        side: event.side,
+        order_type: event.order_type,
+        price: event.price,
+        quantity: event.original_quantity,
+        time_in_force: event.time_in_force,
+        post_only: matches!(event.order_type, OrderType::LimitMaker),
+        reduce_only: false,
+        source_intent_id: "user-stream".to_string(),
+    }
+}
+
 fn enrich_report(mut report: ExecutionReport, request: &OrderRequest, intent_created_at: common::Timestamp) -> ExecutionReport {
     report.requested_price = request.price;
     report.fill_ratio = if request.quantity.is_zero() {
@@ -365,6 +470,165 @@ fn enrich_report(mut report: ExecutionReport, request: &OrderRequest, intent_cre
     };
     report.decision_latency_ms = Some((report.event_time - intent_created_at).whole_milliseconds() as i64);
     report
+}
+
+fn upsert_state_from_request_report(
+    state: &mut ExecutionState,
+    request: OrderRequest,
+    report: &ExecutionReport,
+) {
+    if report.status.is_open() {
+        let tracked = TrackedOrder::from_request(request, report);
+        if let Some(open_order) = tracked.to_open_order() {
+            state
+                .open_orders
+                .insert(open_order.client_order_id.clone(), open_order);
+        }
+        state
+            .tracked_orders
+            .insert(report.client_order_id.clone(), tracked);
+    } else {
+        state.open_orders.remove(&report.client_order_id);
+        state.tracked_orders.remove(&report.client_order_id);
+    }
+}
+
+fn find_equivalent_open_order(state: &ExecutionState, request: &OrderRequest) -> Option<String> {
+    state
+        .tracked_orders
+        .iter()
+        .find(|(_, tracked)| tracked.status.is_open() && equivalent_request(&tracked.request, request))
+        .map(|(client_order_id, _)| client_order_id.clone())
+}
+
+fn equivalent_request(left: &OrderRequest, right: &OrderRequest) -> bool {
+    left.symbol == right.symbol
+        && left.side == right.side
+        && left.order_type == right.order_type
+        && left.post_only == right.post_only
+        && left.reduce_only == right.reduce_only
+        && price_distance_bps(left.price, right.price) <= dec("1.0")
+        && quantity_distance_ratio(left.quantity, right.quantity) <= dec("0.15")
+}
+
+fn quantity_distance_ratio(left: Decimal, right: Decimal) -> Decimal {
+    if right.is_zero() {
+        if left.is_zero() {
+            Decimal::ZERO
+        } else {
+            Decimal::ONE
+        }
+    } else {
+        ((left - right).abs() / right).abs()
+    }
+}
+
+fn price_distance_bps(left: Option<Decimal>, right: Option<Decimal>) -> Decimal {
+    match (left, right) {
+        (Some(left), Some(right)) if right > Decimal::ZERO => {
+            ((left - right).abs() / right) * Decimal::from(10_000u32)
+        }
+        (None, None) => Decimal::ZERO,
+        _ => Decimal::from(10_000u32),
+    }
+}
+
+fn evaluate_stale_order(
+    order: &OpenOrder,
+    max_age_ms: i64,
+    now: common::Timestamp,
+    mid_price: Option<Decimal>,
+) -> StaleOrderEvaluation {
+    let age_ms = (now - order.updated_at).whole_milliseconds() as i64;
+    let fill_ratio = if order.original_quantity.is_zero() {
+        Decimal::ZERO
+    } else {
+        order.executed_quantity / order.original_quantity
+    };
+    let keep_distance_bps = if fill_ratio > Decimal::ZERO {
+        dec("8.0")
+    } else {
+        dec("6.0")
+    };
+    let hard_distance_bps = if fill_ratio > Decimal::ZERO {
+        dec("24.0")
+    } else {
+        dec("18.0")
+    };
+
+    let distance_bps = match (order.price, mid_price) {
+        (Some(order_price), Some(mid_price)) if mid_price > Decimal::ZERO => {
+            ((order_price - mid_price).abs() / mid_price) * Decimal::from(10_000u32)
+        }
+        _ => Decimal::ZERO,
+    };
+
+    let hard_stale = age_ms > max_age_ms.saturating_mul(3) || distance_bps > hard_distance_bps;
+    let cancel_candidate = hard_stale || (age_ms > max_age_ms && distance_bps > dec("4.0"));
+    let keep_worthy = age_ms <= max_age_ms && distance_bps <= keep_distance_bps;
+
+    StaleOrderEvaluation {
+        cancel_candidate,
+        keep_worthy,
+        hard_stale,
+    }
+}
+
+fn should_cancel_symbol(evaluations: &[StaleOrderEvaluation]) -> bool {
+    if evaluations.is_empty() {
+        return false;
+    }
+
+    let any_hard_stale = evaluations.iter().any(|evaluation| evaluation.hard_stale);
+    let any_keep_worthy = evaluations.iter().any(|evaluation| evaluation.keep_worthy);
+    let all_problematic = evaluations
+        .iter()
+        .all(|evaluation| evaluation.cancel_candidate || !evaluation.keep_worthy);
+
+    any_hard_stale && all_problematic && !any_keep_worthy
+}
+
+fn mark_symbol_canceled(
+    state: &mut ExecutionState,
+    symbol: Symbol,
+    cancel_kind: PendingCancelKind,
+) -> usize {
+    let client_order_ids = state
+        .open_orders
+        .values()
+        .filter(|order| order.symbol == symbol)
+        .map(|order| order.client_order_id.clone())
+        .collect::<Vec<_>>();
+
+    let count = client_order_ids.len();
+    if count == 0 {
+        return 0;
+    }
+
+    for client_order_id in &client_order_ids {
+        state
+            .pending_cancel_reports
+            .insert(client_order_id.clone(), cancel_kind);
+    }
+
+    state.open_orders.retain(|_, order| order.symbol != symbol);
+    state.tracked_orders.retain(|client_order_id, tracked| {
+        tracked.request.symbol != symbol && !client_order_ids.contains(client_order_id)
+    });
+    state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(count as u64);
+    if matches!(cancel_kind, PendingCancelKind::Stale) {
+        state.aggregate.total_stale_cancels =
+            state.aggregate.total_stale_cancels.saturating_add(count as u64);
+    }
+
+    count
+}
+
+fn undo_pending_cancel(aggregate: &mut ExecutionAggregate, cancel_kind: PendingCancelKind) {
+    aggregate.total_canceled = aggregate.total_canceled.saturating_sub(1);
+    if matches!(cancel_kind, PendingCancelKind::Stale) {
+        aggregate.total_stale_cancels = aggregate.total_stale_cancels.saturating_sub(1);
+    }
 }
 
 fn update_aggregate_from_report(aggregate: &mut ExecutionAggregate, report: &ExecutionReport) {
@@ -429,7 +693,7 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         exchange_order_id: None,
         symbol: request.symbol,
         status: OrderStatus::Rejected,
-        filled_quantity: common::Decimal::ZERO,
+        filled_quantity: Decimal::ZERO,
         average_fill_price: None,
         fill_ratio: Decimal::ZERO,
         requested_price: request.price,
@@ -437,5 +701,451 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         decision_latency_ms: None,
         message: Some("execution rejection".to_string()),
         event_time: now_utc(),
+    }
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use domain::{
+        AccountSnapshot, Balance, FillEvent, MarketTrade, PriceLevel, RiskAction, Side,
+        StrategyKind,
+    };
+    use exchange_binance_spot::{
+        BinanceBootstrapState, BinanceMarketEvent, BinanceSpotGateway, BinanceUserStreamEvent,
+        MarketStreamHandle, UserStreamHandle,
+    };
+    use tokio::sync::{mpsc, watch};
+
+    #[derive(Debug)]
+    struct TestGatewayState {
+        clock_time: common::Timestamp,
+        placed_orders: Vec<OrderRequest>,
+        canceled_symbols: Vec<Symbol>,
+        fetched_open_orders: HashMap<Symbol, Vec<OpenOrder>>,
+    }
+
+    impl Default for TestGatewayState {
+        fn default() -> Self {
+            Self {
+                clock_time: now_utc(),
+                placed_orders: Vec::new(),
+                canceled_symbols: Vec::new(),
+                fetched_open_orders: HashMap::new(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct TestGateway {
+        state: Arc<RwLock<TestGatewayState>>,
+    }
+
+    impl TestGateway {
+        fn new() -> Self {
+            Self {
+                state: Arc::new(RwLock::new(TestGatewayState::default())),
+            }
+        }
+
+        async fn placed_orders(&self) -> Vec<OrderRequest> {
+            self.state.read().await.placed_orders.clone()
+        }
+
+        async fn canceled_symbols(&self) -> Vec<Symbol> {
+            self.state.read().await.canceled_symbols.clone()
+        }
+    }
+
+    #[async_trait]
+    impl BinanceSpotGateway for TestGateway {
+        async fn sync_clock(&self) -> Result<common::Timestamp> {
+            Ok(self.state.read().await.clock_time)
+        }
+
+        async fn ping_rest(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn fetch_account_snapshot(&self) -> Result<AccountSnapshot> {
+            Ok(AccountSnapshot {
+                balances: vec![Balance {
+                    asset: "USDC".to_string(),
+                    free: dec("1000"),
+                    locked: Decimal::ZERO,
+                }],
+                updated_at: now_utc(),
+            })
+        }
+
+        async fn fetch_open_orders(&self, symbol: Symbol) -> Result<Vec<OpenOrder>> {
+            Ok(self
+                .state
+                .read()
+                .await
+                .fetched_open_orders
+                .get(&symbol)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn fetch_recent_fills(&self, _symbol: Symbol, _limit: usize) -> Result<Vec<FillEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn fetch_orderbook_snapshot(&self, symbol: Symbol, _depth: usize) -> Result<domain::OrderBookSnapshot> {
+            Ok(domain::OrderBookSnapshot {
+                symbol,
+                bids: vec![PriceLevel {
+                    price: dec("100"),
+                    quantity: dec("1"),
+                }],
+                asks: vec![PriceLevel {
+                    price: dec("100.02"),
+                    quantity: dec("1"),
+                }],
+                last_update_id: 1,
+                exchange_time: Some(now_utc()),
+                observed_at: now_utc(),
+            })
+        }
+
+        async fn fetch_recent_trades(&self, symbol: Symbol, _limit: usize) -> Result<Vec<MarketTrade>> {
+            Ok(vec![MarketTrade {
+                symbol,
+                trade_id: "trade-1".to_string(),
+                price: dec("100"),
+                quantity: dec("0.1"),
+                aggressor_side: Side::Buy,
+                event_time: now_utc(),
+                received_at: now_utc(),
+            }])
+        }
+
+        async fn fetch_bootstrap_state(&self, symbols: &[Symbol]) -> Result<BinanceBootstrapState> {
+            let mut open_orders = Vec::new();
+            for &symbol in symbols {
+                open_orders.extend(self.fetch_open_orders(symbol).await?);
+            }
+
+            Ok(BinanceBootstrapState {
+                account: self.fetch_account_snapshot().await?,
+                open_orders,
+                fills: Vec::new(),
+                fetched_at: now_utc(),
+            })
+        }
+
+        async fn poll_market_events(&self, _symbols: &[Symbol]) -> Result<Vec<BinanceMarketEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn poll_account_events(&self, _symbols: &[Symbol]) -> Result<Vec<BinanceUserStreamEvent>> {
+            Ok(Vec::new())
+        }
+
+        async fn place_order(&self, request: OrderRequest) -> Result<ExecutionReport> {
+            let mut state = self.state.write().await;
+            state.placed_orders.push(request.clone());
+            let status = if matches!(request.order_type, OrderType::Market) {
+                OrderStatus::Filled
+            } else {
+                OrderStatus::New
+            };
+
+            Ok(ExecutionReport {
+                client_order_id: request.client_order_id.clone(),
+                exchange_order_id: Some(format!("mock-{}", state.placed_orders.len())),
+                symbol: request.symbol,
+                status,
+                filled_quantity: if matches!(status, OrderStatus::Filled) {
+                    request.quantity
+                } else {
+                    Decimal::ZERO
+                },
+                average_fill_price: request.price,
+                fill_ratio: Decimal::ZERO,
+                requested_price: request.price,
+                slippage_bps: None,
+                decision_latency_ms: Some(0),
+                message: Some("mock accepted".to_string()),
+                event_time: state.clock_time,
+            })
+        }
+
+        async fn cancel_all_orders(&self, symbol: Symbol) -> Result<()> {
+            let mut state = self.state.write().await;
+            state.canceled_symbols.push(symbol);
+            state.fetched_open_orders.remove(&symbol);
+            Ok(())
+        }
+
+        async fn open_market_stream(&self, _symbols: &[Symbol]) -> Result<MarketStreamHandle> {
+            let (_event_tx, event_rx) = mpsc::channel(1);
+            let (_status_tx, status_rx) = mpsc::channel(1);
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            Ok(MarketStreamHandle {
+                events: event_rx,
+                status: status_rx,
+                shutdown: shutdown_tx,
+            })
+        }
+
+        async fn open_user_stream(&self) -> Result<UserStreamHandle> {
+            let (_event_tx, event_rx) = mpsc::channel(1);
+            let (_status_tx, status_rx) = mpsc::channel(1);
+            let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+            Ok(UserStreamHandle {
+                events: event_rx,
+                status: status_rx,
+                shutdown: shutdown_tx,
+            })
+        }
+    }
+
+    fn sample_intent(intent_id: &str, symbol: Symbol, side: Side, price: Decimal, quantity: Decimal) -> TradeIntent {
+        TradeIntent {
+            intent_id: intent_id.to_string(),
+            symbol,
+            strategy: StrategyKind::MarketMaking,
+            side,
+            quantity,
+            limit_price: Some(price),
+            max_slippage_bps: dec("2"),
+            post_only: true,
+            reduce_only: false,
+            time_in_force: Some(TimeInForce::Gtc),
+            expected_edge_bps: dec("3"),
+            expected_fee_bps: dec("0.75"),
+            expected_slippage_bps: Decimal::ZERO,
+            edge_after_cost_bps: dec("2"),
+            reason: "test intent".to_string(),
+            created_at: now_utc(),
+            expires_at: None,
+        }
+    }
+
+    fn sample_decision(intent: TradeIntent) -> RiskDecision {
+        RiskDecision {
+            action: RiskAction::Approve,
+            original_intent: intent.clone(),
+            approved_intent: Some(intent),
+            reason: "approved".to_string(),
+            resulting_mode: RiskMode::Normal,
+            decided_at: now_utc(),
+        }
+    }
+
+    fn sample_open_order(
+        client_order_id: &str,
+        symbol: Symbol,
+        side: Side,
+        price: Decimal,
+        age_ms: i64,
+    ) -> OpenOrder {
+        OpenOrder {
+            client_order_id: client_order_id.to_string(),
+            exchange_order_id: Some(format!("ex-{client_order_id}")),
+            symbol,
+            side,
+            price: Some(price),
+            original_quantity: dec("0.01"),
+            executed_quantity: Decimal::ZERO,
+            status: OrderStatus::New,
+            reduce_only: false,
+            updated_at: timestamp_minus_ms(age_ms),
+        }
+    }
+
+    fn execution_event_from_request(
+        request: &OrderRequest,
+        status: OrderStatus,
+        cumulative_filled_quantity: Decimal,
+    ) -> BinanceExecutionEvent {
+        let price = request.price.unwrap_or(dec("100"));
+        BinanceExecutionEvent {
+            report: ExecutionReport {
+                client_order_id: request.client_order_id.clone(),
+                exchange_order_id: Some("exchange-1".to_string()),
+                symbol: request.symbol,
+                status,
+                filled_quantity: cumulative_filled_quantity,
+                average_fill_price: Some(price),
+                fill_ratio: if request.quantity.is_zero() {
+                    Decimal::ZERO
+                } else {
+                    cumulative_filled_quantity / request.quantity
+                },
+                requested_price: request.price,
+                slippage_bps: None,
+                decision_latency_ms: Some(1),
+                message: Some("event".to_string()),
+                event_time: now_utc(),
+            },
+            side: request.side,
+            order_type: request.order_type,
+            time_in_force: request.time_in_force,
+            original_quantity: request.quantity,
+            price: request.price,
+            cumulative_filled_quantity,
+            cumulative_quote_quantity: cumulative_filled_quantity * price,
+            last_executed_quantity: cumulative_filled_quantity,
+            last_executed_price: Some(price),
+            reject_reason: None,
+            is_working: status.is_open(),
+            is_maker: matches!(request.order_type, OrderType::LimitMaker),
+            order_created_at: Some(now_utc()),
+            transaction_time: now_utc(),
+            fill: None,
+            fill_recovery: None,
+        }
+    }
+
+    fn timestamp_minus_ms(age_ms: i64) -> common::Timestamp {
+        common::Timestamp::from_unix_timestamp_nanos(
+            now_utc().unix_timestamp_nanos() - (age_ms as i128 * 1_000_000),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_off_market_order_is_canceled() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        engine
+            .sync_open_orders(vec![sample_open_order(
+                "btc-stale",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("90"),
+                6_000,
+            )])
+            .await
+            .unwrap();
+
+        let canceled = engine
+            .cancel_stale_orders(5_000, &HashMap::from([(Symbol::BtcUsdc, dec("100"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(canceled, 1);
+        assert_eq!(gateway.canceled_symbols().await, vec![Symbol::BtcUsdc]);
+        assert!(engine.open_orders().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_valid_order_is_not_canceled() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        engine
+            .sync_open_orders(vec![sample_open_order(
+                "btc-keep",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("99.98"),
+                1_000,
+            )])
+            .await
+            .unwrap();
+
+        let canceled = engine
+            .cancel_stale_orders(5_000, &HashMap::from([(Symbol::BtcUsdc, dec("100"))]))
+            .await
+            .unwrap();
+
+        assert_eq!(canceled, 0);
+        assert!(gateway.canceled_symbols().await.is_empty());
+        assert_eq!(engine.open_orders().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_orders_only_cancel_fully_problematic_symbol() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc, Symbol::EthUsdc]);
+
+        engine
+            .sync_open_orders(vec![
+                sample_open_order("btc-stale", Symbol::BtcUsdc, Side::Buy, dec("88"), 7_000),
+                sample_open_order("btc-keep", Symbol::BtcUsdc, Side::Sell, dec("100.03"), 900),
+                sample_open_order("eth-stale", Symbol::EthUsdc, Side::Buy, dec("1500"), 7_000),
+            ])
+            .await
+            .unwrap();
+
+        let canceled = engine
+            .cancel_stale_orders(
+                5_000,
+                &HashMap::from([(Symbol::BtcUsdc, dec("100")), (Symbol::EthUsdc, dec("2000"))]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(canceled, 1);
+        assert_eq!(gateway.canceled_symbols().await, vec![Symbol::EthUsdc]);
+        let remaining = engine.open_orders().await;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|order| order.symbol == Symbol::BtcUsdc));
+    }
+
+    #[tokio::test]
+    async fn tracking_stays_coherent_after_report_cancel_and_fill() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        let first_intent = sample_intent("intent-1", Symbol::BtcUsdc, Side::Buy, dec("100"), dec("0.010"));
+        let first_report = engine.execute(sample_decision(first_intent)).await.unwrap().unwrap();
+        let first_request = gateway.placed_orders().await[0].clone();
+
+        let partial_event =
+            execution_event_from_request(&first_request, OrderStatus::PartiallyFilled, dec("0.004"));
+        engine.apply_execution_event(&partial_event).await.unwrap();
+
+        let open_orders = engine.open_orders().await;
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].executed_quantity, dec("0.004"));
+
+        let cancel_event =
+            execution_event_from_request(&first_request, OrderStatus::Canceled, dec("0.004"));
+        engine.apply_execution_event(&cancel_event).await.unwrap();
+
+        assert!(engine.open_orders().await.is_empty());
+        {
+            let state = engine.state.read().await;
+            assert!(!state.tracked_orders.contains_key(&first_report.client_order_id));
+        }
+
+        let second_intent = sample_intent("intent-2", Symbol::BtcUsdc, Side::Sell, dec("100.05"), dec("0.010"));
+        let second_report = engine.execute(sample_decision(second_intent)).await.unwrap().unwrap();
+        let second_request = gateway.placed_orders().await[1].clone();
+        let fill_event = execution_event_from_request(&second_request, OrderStatus::Filled, dec("0.010"));
+        engine.apply_execution_event(&fill_event).await.unwrap();
+
+        assert!(engine.open_orders().await.is_empty());
+        let state = engine.state.read().await;
+        assert!(!state.tracked_orders.contains_key(&second_report.client_order_id));
+    }
+
+    #[tokio::test]
+    async fn normal_execution_places_order_and_skips_equivalent_duplicate() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        let first_intent = sample_intent("intent-1", Symbol::BtcUsdc, Side::Buy, dec("100"), dec("0.010"));
+        let first_report = engine.execute(sample_decision(first_intent)).await.unwrap();
+        assert!(first_report.is_some());
+
+        let duplicate_intent = sample_intent("intent-2", Symbol::BtcUsdc, Side::Buy, dec("100.005"), dec("0.0105"));
+        let second_report = engine.execute(sample_decision(duplicate_intent)).await.unwrap();
+
+        assert!(second_report.is_none());
+        assert_eq!(gateway.placed_orders().await.len(), 1);
+        assert_eq!(engine.open_orders().await.len(), 1);
     }
 }

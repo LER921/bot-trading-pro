@@ -44,6 +44,10 @@ pub struct SymbolBudget {
     pub symbol: Symbol,
     pub max_quote_notional: Decimal,
     pub reserved_quote_notional: Decimal,
+    pub soft_inventory_base: Decimal,
+    pub max_inventory_base: Decimal,
+    pub neutralization_clip_fraction: Decimal,
+    pub reduce_only_trigger_ratio: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
