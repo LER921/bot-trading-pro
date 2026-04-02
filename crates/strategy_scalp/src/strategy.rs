@@ -33,6 +33,30 @@ pub struct ScalpingStrategy {
     pub config: ScalpingConfig,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EntryAnalysis {
+    entry_score: Decimal,
+    momentum_signal_bps: Decimal,
+    orderbook_signal: Decimal,
+    bullish_pressure: Decimal,
+    toxicity_pressure: Decimal,
+    extension_penalty: Decimal,
+    expected_edge_bps: Decimal,
+    edge_after_cost_bps: Decimal,
+    signal_quality: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExitAnalysis {
+    pnl_bps: Decimal,
+    tp_bps: Decimal,
+    stop_bps: Decimal,
+    invalidation_pressure: Decimal,
+    take_profit_ready: bool,
+    capital_protection: bool,
+    exit_quantity: Decimal,
+}
+
 impl ScalpingStrategy {
     pub fn evaluate(&self, context: &StrategyContext) -> StrategyOutcome {
         let Some(best) = &context.best_bid_ask else {
@@ -43,15 +67,21 @@ impl ScalpingStrategy {
             return standby("scalping blocked by toxicity");
         }
 
-        let quote_size = (context.soft_inventory_base * self.config.quote_size_fraction)
-            .max(Decimal::from_str_exact("0.0001").unwrap());
+        if context.features.liquidity_score <= Decimal::ZERO
+            || context.features.top_of_book_depth_quote <= Decimal::ZERO
+        {
+            return standby("scalping blocked by weak liquidity");
+        }
+
         let max_position = context.max_inventory_base * self.config.max_position_fraction;
+        let base_quote_size = (context.soft_inventory_base * self.config.quote_size_fraction).max(dec("0.0001"));
         let entry_cost_bps = self.config.taker_fee_bps + self.config.slippage_buffer_bps;
-        let entry_score = long_entry_score(context);
         let expires_at = Some(now_utc() + time::Duration::seconds(self.config.quote_ttl_secs));
 
         if context.inventory.base_position > Decimal::ZERO {
-            if let Some(exit) = self.exit_intent(context, best.bid_price, quote_size, entry_cost_bps, expires_at) {
+            if let Some(exit) =
+                self.exit_intent(context, best.bid_price, base_quote_size, max_position, entry_cost_bps, expires_at)
+            {
                 return StrategyOutcome {
                     intents: vec![exit],
                     standby_reason: None,
@@ -67,16 +97,38 @@ impl ScalpingStrategy {
             return standby("scalping blocked by position cap");
         }
 
-        if entry_score < self.config.min_entry_score
-            || context.features.local_momentum_bps < self.config.min_momentum_bps
-        {
+        let entry = analyze_long_entry(context, entry_cost_bps, &self.config);
+        if entry.momentum_signal_bps < self.config.min_momentum_bps {
+            return standby("scalping entry blocked by weak short momentum");
+        }
+
+        if context.features.trade_flow_imbalance <= dec("0.05") || entry.orderbook_signal <= dec("-0.05") {
+            return standby("scalping entry blocked by weak directional confirmation");
+        }
+
+        if entry.extension_penalty >= dec("0.75") {
+            return standby("scalping entry blocked by overextension");
+        }
+
+        if entry.entry_score < self.config.min_entry_score || entry.bullish_pressure < dec("0.20") {
             return standby("scalping entry score too weak");
         }
 
-        let expected_edge_bps = context.features.local_momentum_bps.max(context.features.vwap_distance_bps.abs());
-        let edge_after_cost_bps = expected_edge_bps - entry_cost_bps;
-        if edge_after_cost_bps <= Decimal::ZERO {
-            return standby("scalping edge is not positive after costs");
+        if entry.edge_after_cost_bps < dec("1.00") {
+            return standby("scalping edge is not positive enough after costs");
+        }
+
+        let quantity = entry_size(
+            context,
+            base_quote_size,
+            max_position,
+            entry.signal_quality,
+            entry.toxicity_pressure,
+            entry.edge_after_cost_bps,
+        );
+
+        if quantity <= Decimal::ZERO {
+            return standby("scalping size collapsed after inventory and signal filters");
         }
 
         StrategyOutcome {
@@ -85,22 +137,26 @@ impl ScalpingStrategy {
                 symbol: context.symbol,
                 strategy: StrategyKind::Scalping,
                 side: Side::Buy,
-                quantity: quote_size.min(max_position - context.inventory.base_position),
+                quantity,
                 limit_price: Some(best.ask_price),
                 max_slippage_bps: self.config.slippage_buffer_bps,
                 post_only: false,
                 reduce_only: false,
                 time_in_force: Some(TimeInForce::Ioc),
-                expected_edge_bps,
+                expected_edge_bps: entry.expected_edge_bps,
                 expected_fee_bps: self.config.taker_fee_bps,
                 expected_slippage_bps: self.config.slippage_buffer_bps,
-                edge_after_cost_bps,
+                edge_after_cost_bps: entry.edge_after_cost_bps,
                 reason: format!(
-                    "scalp long entry: score={} mom1={} mom5={} flow={}",
-                    entry_score,
-                    context.features.momentum_1s_bps,
-                    context.features.momentum_5s_bps,
-                    context.features.trade_flow_imbalance
+                    "scalp long entry: score={} pressure={} mom={} flow={} book={} vwap_dist={} tox={} size={}",
+                    entry.entry_score,
+                    entry.bullish_pressure,
+                    entry.momentum_signal_bps,
+                    context.features.trade_flow_imbalance,
+                    entry.orderbook_signal,
+                    context.features.vwap_distance_bps,
+                    context.features.toxicity_score,
+                    quantity,
                 ),
                 created_at: now_utc(),
                 expires_at,
@@ -113,71 +169,452 @@ impl ScalpingStrategy {
         &self,
         context: &StrategyContext,
         exit_price: Decimal,
-        quote_size: Decimal,
+        base_quote_size: Decimal,
+        max_position: Decimal,
         entry_cost_bps: Decimal,
         expires_at: Option<common::Timestamp>,
     ) -> Option<TradeIntent> {
         let average_entry = context.inventory.average_entry_price?;
-        let pnl_bps = if average_entry.is_zero() {
-            Decimal::ZERO
-        } else {
-            ((exit_price - average_entry) / average_entry) * Decimal::from(10_000u32)
-        };
-        let tp_bps = context.features.realized_volatility_bps.max(Decimal::from(4u32));
-        let sl_bps = (context.features.realized_volatility_bps / Decimal::from(2u32)).max(Decimal::from(3u32));
-        let momentum_failed = context.features.momentum_1s_bps < Decimal::ZERO
-            && context.features.trade_flow_imbalance < Decimal::ZERO;
-
-        if pnl_bps < -sl_bps && !momentum_failed {
+        if average_entry <= Decimal::ZERO {
             return None;
         }
 
-        if pnl_bps >= tp_bps || pnl_bps <= -sl_bps || momentum_failed {
-            let expected_edge_bps = pnl_bps.abs();
-            return Some(TradeIntent {
-                intent_id: format!("scalp-exit-{}", new_id()),
-                symbol: context.symbol,
-                strategy: StrategyKind::Scalping,
-                side: Side::Sell,
-                quantity: quote_size.min(context.inventory.base_position),
-                limit_price: Some(exit_price),
-                max_slippage_bps: self.config.slippage_buffer_bps,
-                post_only: false,
-                reduce_only: true,
-                time_in_force: Some(TimeInForce::Ioc),
-                expected_edge_bps,
-                expected_fee_bps: self.config.taker_fee_bps,
-                expected_slippage_bps: self.config.slippage_buffer_bps,
-                edge_after_cost_bps: expected_edge_bps - entry_cost_bps,
-                reason: format!(
-                    "scalp exit: pnl_bps={} tp_bps={} sl_bps={} momentum_failed={}",
-                    pnl_bps, tp_bps, sl_bps, momentum_failed
-                ),
-                created_at: now_utc(),
-                expires_at,
-            });
+        let exit = analyze_exit(context, base_quote_size, max_position, average_entry, exit_price);
+        if !(exit.capital_protection || exit.take_profit_ready || exit.invalidation_pressure >= dec("0.60")) {
+            return None;
         }
 
-        None
+        let reason = if exit.capital_protection {
+            format!(
+                "scalp exit protect: pnl_bps={} stop_bps={} invalidation={} flow={} mom1={} regime={:?}",
+                exit.pnl_bps,
+                exit.stop_bps,
+                exit.invalidation_pressure,
+                context.features.trade_flow_imbalance,
+                context.features.momentum_1s_bps,
+                context.regime.state
+            )
+        } else if exit.take_profit_ready {
+            format!(
+                "scalp exit take-profit: pnl_bps={} tp_bps={} invalidation={} vwap_dist={} flow={}",
+                exit.pnl_bps,
+                exit.tp_bps,
+                exit.invalidation_pressure,
+                context.features.vwap_distance_bps,
+                context.features.trade_flow_imbalance
+            )
+        } else {
+            format!(
+                "scalp exit invalidation: pnl_bps={} invalidation={} flow={} book={} mom1={}",
+                exit.pnl_bps,
+                exit.invalidation_pressure,
+                context.features.trade_flow_imbalance,
+                orderbook_signal(context),
+                context.features.momentum_1s_bps
+            )
+        };
+
+        Some(TradeIntent {
+            intent_id: format!("scalp-exit-{}", new_id()),
+            symbol: context.symbol,
+            strategy: StrategyKind::Scalping,
+            side: Side::Sell,
+            quantity: exit.exit_quantity.min(context.inventory.base_position),
+            limit_price: Some(exit_price),
+            max_slippage_bps: self.config.slippage_buffer_bps,
+            post_only: false,
+            reduce_only: true,
+            time_in_force: Some(TimeInForce::Ioc),
+            expected_edge_bps: exit.pnl_bps.abs().max(exit.tp_bps / dec("2.0")),
+            expected_fee_bps: self.config.taker_fee_bps,
+            expected_slippage_bps: self.config.slippage_buffer_bps,
+            edge_after_cost_bps: exit.pnl_bps.abs() - entry_cost_bps,
+            reason,
+            created_at: now_utc(),
+            expires_at,
+        })
     }
 }
 
-fn long_entry_score(context: &StrategyContext) -> Decimal {
-    let momentum = context.features.momentum_1s_bps.max(Decimal::ZERO)
-        + context.features.momentum_5s_bps.max(Decimal::ZERO);
-    let trade_flow = context.features.trade_flow_imbalance.max(Decimal::ZERO) * Decimal::from(10u32);
-    let breakout = context.features.vwap_distance_bps.max(Decimal::ZERO);
-    let liquidity = if context.features.liquidity_score > Decimal::ZERO {
-        Decimal::from(2u32)
+fn analyze_long_entry(context: &StrategyContext, entry_cost_bps: Decimal, config: &ScalpingConfig) -> EntryAnalysis {
+    let momentum_signal_bps = short_momentum_signal_bps(context);
+    let orderbook_signal = orderbook_signal(context);
+    let bullish_pressure = bullish_pressure(context, momentum_signal_bps, orderbook_signal);
+    let toxicity_pressure = normalized_score(context.features.toxicity_score, dec("0.20"), config.max_toxicity_score);
+    let extension_penalty = positive_extension_penalty(context.features.vwap_distance_bps);
+    let momentum_component = normalized_score(momentum_signal_bps, config.min_momentum_bps, dec("14"));
+    let flow_component = normalized_score(context.features.trade_flow_imbalance, dec("0.05"), dec("0.35"));
+    let book_component = normalized_score(orderbook_signal, dec("0.02"), dec("0.25"));
+    let vwap_alignment = vwap_alignment_score(context.features.vwap_distance_bps);
+    let liquidity_component = normalized_score(context.features.liquidity_score, dec("1500"), dec("7000"));
+    let regime_component = match context.regime.state {
+        RegimeState::TrendUp => Decimal::ONE,
+        RegimeState::Range => dec("0.60"),
+        _ => Decimal::ZERO,
+    };
+
+    let entry_score = momentum_component * dec("3.2")
+        + flow_component * dec("2.7")
+        + book_component * dec("1.6")
+        + vwap_alignment * dec("1.0")
+        + liquidity_component * dec("1.5")
+        + regime_component * dec("1.5")
+        - toxicity_pressure * dec("1.0")
+        - extension_penalty * dec("1.25");
+
+    let raw_alpha_bps = momentum_signal_bps * dec("0.45")
+        + context.features.trade_flow_imbalance.max(Decimal::ZERO) * dec("12")
+        + orderbook_signal.max(Decimal::ZERO) * dec("8")
+        + vwap_alignment * dec("2.0")
+        + regime_component * dec("0.8");
+    let fragility_penalty_bps = toxicity_pressure * dec("2.5") + extension_penalty * dec("2.0");
+    let expected_edge_bps = (raw_alpha_bps - fragility_penalty_bps).max(Decimal::ZERO);
+    let edge_after_cost_bps = expected_edge_bps - entry_cost_bps;
+    let signal_quality = clamp_unit((entry_score - config.min_entry_score + dec("1.0")) / dec("4.0"));
+
+    EntryAnalysis {
+        entry_score,
+        momentum_signal_bps,
+        orderbook_signal,
+        bullish_pressure,
+        toxicity_pressure,
+        extension_penalty,
+        expected_edge_bps,
+        edge_after_cost_bps,
+        signal_quality,
+    }
+}
+
+fn analyze_exit(
+    context: &StrategyContext,
+    base_quote_size: Decimal,
+    max_position: Decimal,
+    average_entry: Decimal,
+    exit_price: Decimal,
+) -> ExitAnalysis {
+    let pnl_bps = ((exit_price - average_entry) / average_entry) * Decimal::from(10_000u32);
+    let momentum_signal_bps = short_momentum_signal_bps(context);
+    let orderbook_signal = orderbook_signal(context);
+    let negative_momentum = clamp_unit((-momentum_signal_bps / dec("10")).max(Decimal::ZERO));
+    let negative_flow = clamp_unit(((-context.features.trade_flow_imbalance) / dec("0.25")).max(Decimal::ZERO));
+    let negative_book = clamp_unit(((-orderbook_signal) / dec("0.20")).max(Decimal::ZERO));
+    let toxicity_pressure = normalized_score(context.features.toxicity_score, dec("0.35"), dec("0.85"));
+    let regime_exit = if matches!(context.regime.state, RegimeState::TrendDown) {
+        dec("0.80")
     } else {
         Decimal::ZERO
     };
-    (momentum / Decimal::from(2u32)) + trade_flow + breakout + liquidity
+    let invalidation_pressure = clamp_unit(
+        negative_momentum * dec("0.35")
+            + negative_flow * dec("0.25")
+            + negative_book * dec("0.20")
+            + toxicity_pressure * dec("0.10")
+            + regime_exit * dec("0.10"),
+    );
+    let tp_bps = context.features.realized_volatility_bps.max(dec("4.0"));
+    let stop_bps = (context.features.realized_volatility_bps * dec("0.60")).max(dec("3.0"));
+    let take_profit_ready = pnl_bps >= tp_bps
+        && (invalidation_pressure >= dec("0.25")
+            || context.features.vwap_distance_bps >= dec("6.0")
+            || context.features.momentum_1s_bps <= dec("1.0"));
+    let capital_protection = pnl_bps <= -stop_bps
+        || invalidation_pressure >= dec("0.80")
+        || context.features.toxicity_score >= dec("0.80");
+
+    let full_exit = capital_protection || invalidation_pressure >= dec("0.70");
+    let partial_exit_size = (base_quote_size * dec("1.20"))
+        .max(context.inventory.base_position * dec("0.50"))
+        .min(max_position.max(base_quote_size));
+    let exit_quantity = if full_exit {
+        context.inventory.base_position
+    } else {
+        partial_exit_size.min(context.inventory.base_position)
+    };
+
+    ExitAnalysis {
+        pnl_bps,
+        tp_bps,
+        stop_bps,
+        invalidation_pressure,
+        take_profit_ready,
+        capital_protection,
+        exit_quantity,
+    }
+}
+
+fn entry_size(
+    context: &StrategyContext,
+    base_quote_size: Decimal,
+    max_position: Decimal,
+    signal_quality: Decimal,
+    toxicity_pressure: Decimal,
+    edge_after_cost_bps: Decimal,
+) -> Decimal {
+    let inventory_usage = if max_position <= Decimal::ZERO {
+        Decimal::ONE
+    } else {
+        clamp_unit((context.inventory.base_position / max_position).max(Decimal::ZERO))
+    };
+    let regime_factor = match context.regime.state {
+        RegimeState::TrendUp => Decimal::ONE,
+        RegimeState::Range => dec("0.70"),
+        _ => Decimal::ZERO,
+    };
+    let toxicity_factor = (Decimal::ONE - toxicity_pressure * dec("0.70")).max(dec("0.30"));
+    let inventory_factor = (Decimal::ONE - inventory_usage * dec("0.75")).max(dec("0.20"));
+    let edge_factor = clamp_unit(edge_after_cost_bps / dec("6.0")).max(dec("0.30"));
+    let scaled = base_quote_size * regime_factor * signal_quality.max(dec("0.35")) * toxicity_factor * inventory_factor * edge_factor;
+    scaled
+        .max(dec("0.0001"))
+        .min((max_position - context.inventory.base_position).max(Decimal::ZERO))
+}
+
+fn short_momentum_signal_bps(context: &StrategyContext) -> Decimal {
+    (context.features.local_momentum_bps * dec("0.40"))
+        + (context.features.momentum_1s_bps * dec("0.35"))
+        + (context.features.momentum_5s_bps * dec("0.25"))
+}
+
+fn orderbook_signal(context: &StrategyContext) -> Decimal {
+    (context.features.orderbook_imbalance.unwrap_or(Decimal::ZERO) * dec("0.60"))
+        + (context.features.orderbook_imbalance_rolling * dec("0.40"))
+}
+
+fn bullish_pressure(context: &StrategyContext, momentum_signal_bps: Decimal, orderbook_signal: Decimal) -> Decimal {
+    let regime_bias = match context.regime.state {
+        RegimeState::TrendUp => dec("0.15"),
+        RegimeState::Range => dec("0.05"),
+        _ => Decimal::ZERO,
+    };
+    clamp_unit(
+        normalized_score(momentum_signal_bps, dec("3.0"), dec("12.0")) * dec("0.35")
+            + normalized_score(context.features.trade_flow_imbalance, dec("0.05"), dec("0.35")) * dec("0.30")
+            + normalized_score(orderbook_signal, dec("0.02"), dec("0.25")) * dec("0.20")
+            + normalized_score(context.features.vwap_distance_bps, dec("0.0"), dec("6.0")) * dec("0.10")
+            + regime_bias * dec("0.05"),
+    )
+}
+
+fn positive_extension_penalty(vwap_distance_bps: Decimal) -> Decimal {
+    normalized_score(vwap_distance_bps, dec("6.0"), dec("12.0"))
+}
+
+fn vwap_alignment_score(vwap_distance_bps: Decimal) -> Decimal {
+    if vwap_distance_bps < Decimal::ZERO {
+        Decimal::ZERO
+    } else if vwap_distance_bps <= dec("6.0") {
+        clamp_unit(vwap_distance_bps / dec("6.0"))
+    } else {
+        clamp_unit(Decimal::ONE - ((vwap_distance_bps - dec("6.0")) / dec("6.0")))
+    }
+}
+
+fn normalized_score(value: Decimal, low: Decimal, high: Decimal) -> Decimal {
+    if high <= low {
+        return Decimal::ZERO;
+    }
+    if value <= low {
+        Decimal::ZERO
+    } else if value >= high {
+        Decimal::ONE
+    } else {
+        clamp_unit((value - low) / (high - low))
+    }
+}
+
+fn clamp_unit(value: Decimal) -> Decimal {
+    if value <= Decimal::ZERO {
+        Decimal::ZERO
+    } else if value >= Decimal::ONE {
+        Decimal::ONE
+    } else {
+        value
+    }
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
 }
 
 fn standby(reason: &str) -> StrategyOutcome {
     StrategyOutcome {
         intents: Vec::new(),
         standby_reason: Some(reason.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use domain::{
+        BestBidAsk, FeatureSnapshot, InventorySnapshot, RegimeDecision, RiskMode, RuntimeState,
+        Symbol, VolatilityRegime,
+    };
+
+    fn sample_context() -> StrategyContext {
+        StrategyContext {
+            symbol: Symbol::BtcUsdc,
+            best_bid_ask: Some(BestBidAsk {
+                symbol: Symbol::BtcUsdc,
+                bid_price: dec("100.00"),
+                bid_quantity: dec("2.0"),
+                ask_price: dec("100.02"),
+                ask_quantity: dec("2.0"),
+                observed_at: now_utc(),
+            }),
+            features: FeatureSnapshot {
+                symbol: Symbol::BtcUsdc,
+                microprice: Some(dec("100.03")),
+                top_of_book_depth_quote: dec("6000"),
+                orderbook_imbalance: Some(dec("0.18")),
+                orderbook_imbalance_rolling: dec("0.12"),
+                realized_volatility_bps: dec("5.0"),
+                vwap: dec("99.98"),
+                vwap_distance_bps: dec("3.5"),
+                spread_bps: dec("2.0"),
+                spread_mean_bps: dec("1.6"),
+                spread_std_bps: dec("0.2"),
+                spread_zscore: dec("0.30"),
+                trade_flow_imbalance: dec("0.22"),
+                trade_flow_rate: dec("1.5"),
+                trade_rate_per_sec: dec("2.0"),
+                tick_rate_per_sec: dec("3.0"),
+                tape_speed: dec("2.5"),
+                momentum_1s_bps: dec("7.0"),
+                momentum_5s_bps: dec("5.0"),
+                momentum_15s_bps: dec("3.0"),
+                local_momentum_bps: dec("8.0"),
+                liquidity_score: dec("7000"),
+                toxicity_score: dec("0.20"),
+                volatility_regime: VolatilityRegime::Medium,
+                computed_at: now_utc(),
+            },
+            regime: RegimeDecision {
+                symbol: Symbol::BtcUsdc,
+                state: RegimeState::TrendUp,
+                confidence: dec("0.80"),
+                reason: "trend up".to_string(),
+                decided_at: now_utc(),
+            },
+            inventory: InventorySnapshot {
+                symbol: Symbol::BtcUsdc,
+                base_position: Decimal::ZERO,
+                quote_position: dec("1000"),
+                mark_price: Some(dec("100.01")),
+                average_entry_price: None,
+                updated_at: now_utc(),
+            },
+            soft_inventory_base: dec("0.020"),
+            max_inventory_base: dec("0.050"),
+            runtime_state: RuntimeState::Trading,
+            risk_mode: RiskMode::Normal,
+        }
+    }
+
+    fn buy_quantity(outcome: &StrategyOutcome) -> Option<Decimal> {
+        outcome
+            .intents
+            .iter()
+            .find(|intent| intent.side == Side::Buy)
+            .map(|intent| intent.quantity)
+    }
+
+    #[test]
+    fn favorable_context_produces_valid_entry() {
+        let outcome = ScalpingStrategy::default().evaluate(&sample_context());
+
+        assert_eq!(outcome.intents.len(), 1);
+        let intent = &outcome.intents[0];
+        assert_eq!(intent.side, Side::Buy);
+        assert!(intent.quantity > Decimal::ZERO);
+        assert!(intent.edge_after_cost_bps >= dec("1.0"));
+    }
+
+    #[test]
+    fn excessive_toxicity_blocks_scalping() {
+        let mut context = sample_context();
+        context.features.toxicity_score = dec("0.90");
+
+        let outcome = ScalpingStrategy::default().evaluate(&context);
+
+        assert!(outcome.intents.is_empty());
+        assert_eq!(outcome.standby_reason.as_deref(), Some("scalping blocked by toxicity"));
+    }
+
+    #[test]
+    fn weak_signal_produces_no_entry() {
+        let mut context = sample_context();
+        context.features.local_momentum_bps = dec("2.0");
+        context.features.momentum_1s_bps = dec("1.0");
+        context.features.momentum_5s_bps = dec("1.0");
+        context.features.trade_flow_imbalance = dec("0.03");
+        context.features.orderbook_imbalance = Some(dec("0.01"));
+        context.features.orderbook_imbalance_rolling = dec("0.00");
+
+        let outcome = ScalpingStrategy::default().evaluate(&context);
+
+        assert!(outcome.intents.is_empty());
+        assert!(outcome.standby_reason.is_some());
+    }
+
+    #[test]
+    fn clear_invalidation_triggers_reduce_only_exit() {
+        let mut context = sample_context();
+        context.inventory.base_position = dec("0.015");
+        context.inventory.average_entry_price = Some(dec("100.10"));
+        context.features.local_momentum_bps = dec("-8.0");
+        context.features.momentum_1s_bps = dec("-9.0");
+        context.features.momentum_5s_bps = dec("-6.0");
+        context.features.trade_flow_imbalance = dec("-0.25");
+        context.features.orderbook_imbalance = Some(dec("-0.22"));
+        context.features.orderbook_imbalance_rolling = dec("-0.18");
+        context.features.toxicity_score = dec("0.55");
+        context.regime.state = RegimeState::TrendDown;
+
+        let outcome = ScalpingStrategy::default().evaluate(&context);
+
+        assert_eq!(outcome.intents.len(), 1);
+        let intent = &outcome.intents[0];
+        assert_eq!(intent.side, Side::Sell);
+        assert!(intent.reduce_only);
+        assert_eq!(intent.quantity, context.inventory.base_position);
+    }
+
+    #[test]
+    fn weaker_but_valid_context_reduces_size_without_blocking() {
+        let strategy = ScalpingStrategy::default();
+        let healthy = strategy.evaluate(&sample_context());
+        let healthy_qty = buy_quantity(&healthy).unwrap();
+
+        let mut weaker = sample_context();
+        weaker.features.local_momentum_bps = dec("7.5");
+        weaker.features.momentum_1s_bps = dec("6.8");
+        weaker.features.momentum_5s_bps = dec("5.5");
+        weaker.features.trade_flow_imbalance = dec("0.20");
+        weaker.features.orderbook_imbalance = Some(dec("0.15"));
+        weaker.features.orderbook_imbalance_rolling = dec("0.12");
+        weaker.features.toxicity_score = dec("0.50");
+        weaker.inventory.base_position = dec("0.010");
+
+        let weaker_outcome = strategy.evaluate(&weaker);
+        let weaker_qty = buy_quantity(&weaker_outcome).unwrap();
+
+        assert!(weaker_qty > Decimal::ZERO);
+        assert!(weaker_qty < healthy_qty);
+    }
+
+    #[test]
+    fn insufficient_edge_after_costs_blocks_entry() {
+        let mut strategy = ScalpingStrategy::default();
+        strategy.config.taker_fee_bps = dec("6.0");
+        strategy.config.slippage_buffer_bps = dec("3.0");
+
+        let outcome = strategy.evaluate(&sample_context());
+
+        assert!(outcome.intents.is_empty());
+        assert_eq!(
+            outcome.standby_reason.as_deref(),
+            Some("scalping edge is not positive enough after costs")
+        );
     }
 }
