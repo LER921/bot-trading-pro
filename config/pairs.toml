@@ -1,0 +1,13 @@
+[[pairs]]
+symbol = "BTCUSDC"
+enabled = true
+max_quote_notional = "3450"
+max_inventory_base = "0.030"
+soft_inventory_base = "0.020"
+
+[[pairs]]
+symbol = "ETHUSDC"
+enabled = true
+max_quote_notional = "3450"
+max_inventory_base = "0.700"
+soft_inventory_base = "0.450"

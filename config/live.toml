@@ -1,0 +1,4 @@
+trading_enabled = false
+start_in_paused_mode = true
+allow_market_orders = false
+cancel_all_on_risk_off = true

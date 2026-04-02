@@ -1,0 +1,13 @@
+[runtime]
+environment = "live"
+state_dir = "var/state"
+event_log_dir = "var/log"
+bootstrap_cancel_open_orders = true
+
+[binance]
+rest_base_url = "https://api.binance.com"
+market_ws_url = "wss://stream.binance.com:9443/stream"
+user_ws_url = "wss://stream.binance.com:9443/ws"
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+recv_window_ms = 5000

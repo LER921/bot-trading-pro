@@ -1,0 +1,16 @@
+[package]
+name = "dashboardd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+config_loader = { path = "../../crates/config_loader" }
+control_plane = { path = "../../crates/control_plane" }
+domain = { path = "../../crates/domain" }
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

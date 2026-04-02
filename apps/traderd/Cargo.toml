@@ -1,0 +1,27 @@
+[package]
+name = "traderd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+common = { path = "../../crates/common" }
+config_loader = { path = "../../crates/config_loader" }
+control_plane = { path = "../../crates/control_plane" }
+domain = { path = "../../crates/domain" }
+accounting = { path = "../../crates/accounting" }
+execution = { path = "../../crates/execution" }
+exchange_binance_spot = { path = "../../crates/exchange_binance_spot" }
+features = { path = "../../crates/features" }
+market_data = { path = "../../crates/market_data" }
+portfolio = { path = "../../crates/portfolio" }
+regime = { path = "../../crates/regime" }
+risk = { path = "../../crates/risk" }
+storage = { path = "../../crates/storage" }
+strategy_coordinator = { path = "../../crates/strategy_coordinator" }
+telemetry = { path = "../../crates/telemetry" }
+tokio.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,10 @@
+/target
+/.env
+/.idea
+/.vscode
+/var
+/data
+*.db
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
