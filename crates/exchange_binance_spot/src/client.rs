@@ -32,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const STREAM_CHANNEL_CAPACITY: usize = 2048;
 const USER_STREAM_RECV_WINDOW_MS: u64 = 5_000;
+const FEE_QUOTE_CACHE_TTL_SECS: i64 = 5;
 
 #[async_trait]
 pub trait BinanceSpotGateway: Send + Sync {
@@ -79,6 +80,13 @@ pub struct BinanceSpotClient {
     pub recv_window_ms: u64,
     credentials: BinanceCredentials,
     http_client: HttpClient,
+    fee_quote_conversion_cache: Arc<RwLock<HashMap<String, FeeQuoteConversionCacheEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeeQuoteConversionCacheEntry {
+    price: Decimal,
+    observed_at: Timestamp,
 }
 
 impl BinanceSpotClient {
@@ -102,6 +110,7 @@ impl BinanceSpotClient {
             recv_window_ms,
             credentials,
             http_client: HttpClient::builder().default_headers(headers).build()?,
+            fee_quote_conversion_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -137,6 +146,108 @@ impl BinanceSpotClient {
             }
         })
         .to_string())
+    }
+
+    async fn quote_conversion_price(&self, base_asset: &str, quote_asset: &str) -> Result<Decimal> {
+        if base_asset.eq_ignore_ascii_case(quote_asset) {
+            return Ok(Decimal::ONE);
+        }
+
+        let symbol = format!(
+            "{}{}",
+            base_asset.to_ascii_uppercase(),
+            quote_asset.to_ascii_uppercase()
+        );
+        if let Some(cached_price) = self.cached_quote_conversion_price(&symbol).await {
+            return Ok(cached_price);
+        }
+
+        let response: BinanceTickerPriceResponse = self
+            .get_public("/api/v3/ticker/price", &[("symbol", symbol.clone())])
+            .await?;
+        let price = parse_decimal(&response.price)?;
+
+        self.fee_quote_conversion_cache.write().await.insert(
+            symbol,
+            FeeQuoteConversionCacheEntry {
+                price,
+                observed_at: now_utc(),
+            },
+        );
+
+        Ok(price)
+    }
+
+    async fn cached_quote_conversion_price(&self, symbol: &str) -> Option<Decimal> {
+        let cache = self.fee_quote_conversion_cache.read().await;
+        let entry = cache.get(symbol)?;
+        let age = now_utc() - entry.observed_at;
+        (age <= time::Duration::seconds(FEE_QUOTE_CACHE_TTL_SECS)).then_some(entry.price)
+    }
+
+    async fn enrich_fill_fee_quote(&self, mut fill: FillEvent) -> Result<FillEvent> {
+        if fill.fee_quote.is_some() {
+            return Ok(fill);
+        }
+
+        if let Some(fee_quote) = inferred_fee_quote(fill.symbol, &fill.fee_asset, fill.fee, fill.price) {
+            fill.fee_quote = Some(fee_quote);
+            return Ok(fill);
+        }
+
+        let conversion_price = self
+            .quote_conversion_price(&fill.fee_asset, quote_asset_for_symbol(fill.symbol))
+            .await?;
+        fill.fee_quote = Some(fill.fee * conversion_price);
+        Ok(fill)
+    }
+
+    async fn enrich_fills_fee_quote(&self, fills: Vec<FillEvent>) -> Result<Vec<FillEvent>> {
+        let mut enriched = Vec::with_capacity(fills.len());
+        for fill in fills {
+            enriched.push(self.enrich_fill_fee_quote(fill).await?);
+        }
+        Ok(enriched)
+    }
+
+    async fn enrich_user_stream_event(&self, event: BinanceUserStreamEvent) -> Result<BinanceUserStreamEvent> {
+        match event {
+            BinanceUserStreamEvent::Execution(mut execution) => {
+                if let Some(fill) = execution.fill.take() {
+                    execution.fill = Some(self.enrich_fill_fee_quote(fill).await?);
+                }
+                Ok(BinanceUserStreamEvent::Execution(execution))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn mark_fill_recovery_after_enrichment_failure(
+        &self,
+        event: BinanceUserStreamEvent,
+        error: &anyhow::Error,
+    ) -> BinanceUserStreamEvent {
+        match event {
+            BinanceUserStreamEvent::Execution(mut execution) => {
+                if let Some(fill) = execution.fill.take() {
+                    let detail = format!("fill queued for REST recovery after fee quote enrichment failure: {error}");
+                    execution.report.message = Some(match execution.report.message.take() {
+                        Some(existing) if !existing.is_empty() => format!("{existing}; {detail}"),
+                        _ => detail.clone(),
+                    });
+                    execution.fill_recovery = Some(crate::BinanceFillRecoveryRequest {
+                        symbol: fill.symbol,
+                        trade_id: fill.trade_id,
+                        order_id: fill.order_id,
+                        fee_asset: fill.fee_asset,
+                        event_time: fill.event_time,
+                        reason: detail,
+                    });
+                }
+                BinanceUserStreamEvent::Execution(execution)
+            }
+            other => other,
+        }
     }
 
     fn combined_market_stream_url(&self, symbols: &[Symbol]) -> String {
@@ -277,10 +388,11 @@ impl BinanceSpotGateway for BinanceSpotClient {
             )
             .await?;
 
-        response
+        let fills = response
             .into_iter()
             .map(|trade| parse_my_trade_response(symbol, trade))
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+        self.enrich_fills_fee_quote(fills).await
     }
 
     async fn fetch_orderbook_snapshot(&self, symbol: Symbol, depth: usize) -> Result<OrderBookSnapshot> {
@@ -503,6 +615,11 @@ struct BinanceTradeResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct BinanceTickerPriceResponse {
+    price: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct BinanceOrderResponse {
     symbol: String,
     #[serde(rename = "orderId")]
@@ -722,6 +839,13 @@ async fn run_user_stream_task(
                             match maybe_message {
                                 Some(Ok(Message::Text(text))) => match parse_user_stream_message(&text) {
                                     Ok(Some(event)) => {
+                                        let event = match client.enrich_user_stream_event(event.clone()).await {
+                                            Ok(event) => event,
+                                            Err(error) => {
+                                                warn!(?error, "failed to enrich user event fill fee quote; queueing fill for REST recovery");
+                                                client.mark_fill_recovery_after_enrichment_failure(event, &error)
+                                            }
+                                        };
                                         if event_tx.send(event).await.is_err() {
                                             return;
                                         }
@@ -830,15 +954,19 @@ fn parse_open_order_response(response: BinanceOpenOrderResponse) -> Result<OpenO
 }
 
 fn parse_my_trade_response(symbol: Symbol, trade: BinanceMyTradeResponse) -> Result<FillEvent> {
+    let price = parse_decimal(&trade.price)?;
+    let fee = parse_decimal(&trade.commission)?;
+    let fee_asset = trade.commission_asset;
     Ok(FillEvent {
         trade_id: trade.id.to_string(),
         order_id: trade.order_id.to_string(),
         symbol,
         side: if trade.is_buyer { Side::Buy } else { Side::Sell },
-        price: parse_decimal(&trade.price)?,
+        price,
         quantity: parse_decimal(&trade.qty)?,
-        fee: parse_decimal(&trade.commission)?,
-        fee_asset: trade.commission_asset,
+        fee,
+        fee_quote: inferred_fee_quote(symbol, &fee_asset, fee, price),
+        fee_asset,
         liquidity_side: if trade.is_maker {
             LiquiditySide::Maker
         } else {
@@ -953,19 +1081,23 @@ fn parse_execution_report_event(event: &Value) -> Result<BinanceUserStreamEvent>
     let last_executed_price = optional_decimal(required_str(event, "L")?)?;
     let trade_id = event.get("t").and_then(Value::as_i64).unwrap_or(-1);
     let fill = if last_executed_quantity > Decimal::ZERO && trade_id >= 0 {
+        let fee = parse_decimal(required_str(event, "n")?)?;
+        let fee_asset = event
+            .get("N")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN")
+            .to_string();
+        let price = last_executed_price.unwrap_or(Decimal::ZERO);
         Some(FillEvent {
             trade_id: trade_id.to_string(),
             order_id: required_u64(event, "i")?.to_string(),
             symbol,
             side: parse_side(required_str(event, "S")?)?,
-            price: last_executed_price.unwrap_or(Decimal::ZERO),
+            price,
             quantity: last_executed_quantity,
-            fee: parse_decimal(required_str(event, "n")?)?,
-            fee_asset: event
-                .get("N")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN")
-                .to_string(),
+            fee,
+            fee_quote: inferred_fee_quote(symbol, &fee_asset, fee, price),
+            fee_asset,
             liquidity_side: if required_bool(event, "m")? {
                 LiquiditySide::Maker
             } else {
@@ -1032,6 +1164,7 @@ fn parse_execution_report_event(event: &Value) -> Result<BinanceUserStreamEvent>
             .transpose()?,
         transaction_time: millis_timestamp(required_i64(event, "T")?)?,
         fill,
+        fill_recovery: None,
     }))
 }
 
@@ -1215,6 +1348,31 @@ fn event_type<'a>(event: &'a Value) -> Result<&'a str> {
         .get("e")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing event type"))
+}
+
+fn inferred_fee_quote(symbol: Symbol, fee_asset: &str, fee: Decimal, fill_price: Decimal) -> Option<Decimal> {
+    if fee.is_zero() {
+        Some(Decimal::ZERO)
+    } else if fee_asset.eq_ignore_ascii_case(quote_asset_for_symbol(symbol)) {
+        Some(fee)
+    } else if fee_asset.eq_ignore_ascii_case(base_asset_for_symbol(symbol)) {
+        Some(fee * fill_price)
+    } else {
+        None
+    }
+}
+
+fn base_asset_for_symbol(symbol: Symbol) -> &'static str {
+    match symbol {
+        Symbol::BtcUsdc => "BTC",
+        Symbol::EthUsdc => "ETH",
+    }
+}
+
+fn quote_asset_for_symbol(symbol: Symbol) -> &'static str {
+    match symbol {
+        Symbol::BtcUsdc | Symbol::EthUsdc => "USDC",
+    }
 }
 
 fn parse_decimal(raw: &str) -> Result<Decimal> {
@@ -1631,6 +1789,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    
+    fn sample_client() -> BinanceSpotClient {
+        BinanceSpotClient::new(
+            "http://127.0.0.1:1",
+            "ws://127.0.0.1:1/market",
+            "ws://127.0.0.1:1/user",
+            5_000,
+            BinanceCredentials {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn execution_report_event_raw(fee_asset: &str) -> String {
+        format!(
+            r#"{{
+            "subscriptionId":0,
+            "event":{{
+                "e":"executionReport",
+                "E":1710000000100,
+                "s":"BTCUSDC",
+                "c":"bot-1",
+                "S":"BUY",
+                "o":"LIMIT",
+                "f":"GTC",
+                "q":"0.010",
+                "p":"60000.00",
+                "x":"TRADE",
+                "X":"PARTIALLY_FILLED",
+                "r":"NONE",
+                "i":42,
+                "l":"0.003",
+                "z":"0.003",
+                "L":"60000.00",
+                "n":"0.01",
+                "N":"{fee_asset}",
+                "T":1710000000100,
+                "t":7,
+                "w":true,
+                "m":false,
+                "O":1710000000000,
+                "Z":"180.00"
+            }}
+        }}"#
+        )
+    }
 
     #[test]
     fn parses_depth_stream_message() {
@@ -1659,44 +1865,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_execution_report_user_event() {
-        let raw = r#"{
-            "subscriptionId":0,
-            "event":{
-                "e":"executionReport",
-                "E":1710000000100,
-                "s":"BTCUSDC",
-                "c":"bot-1",
-                "S":"BUY",
-                "o":"LIMIT",
-                "f":"GTC",
-                "q":"0.010",
-                "p":"60000.00",
-                "x":"TRADE",
-                "X":"PARTIALLY_FILLED",
-                "r":"NONE",
-                "i":42,
-                "l":"0.003",
-                "z":"0.003",
-                "L":"60000.00",
-                "n":"0.01",
-                "N":"USDC",
-                "T":1710000000100,
-                "t":7,
-                "w":true,
-                "m":false,
-                "O":1710000000000,
-                "Z":"180.00"
-            }
-        }"#;
+    #[tokio::test]
+    async fn naturally_convertible_user_stream_fill_remains_propagated() {
+        let client = sample_client();
+        let raw = execution_report_event_raw("USDC");
 
-        let event = parse_user_stream_message(raw).unwrap().unwrap();
+        let event = parse_user_stream_message(&raw).unwrap().unwrap();
+        let event = client.enrich_user_stream_event(event).await.unwrap();
         match event {
             BinanceUserStreamEvent::Execution(execution) => {
                 assert_eq!(execution.report.client_order_id, "bot-1");
                 assert_eq!(execution.report.status, OrderStatus::PartiallyFilled);
-                assert!(execution.fill.is_some());
+                assert_eq!(
+                    execution.fill.as_ref().and_then(|fill| fill.fee_quote),
+                    Some(Decimal::from_str_exact("0.01").unwrap())
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn third_party_user_stream_fill_with_cached_conversion_is_enriched() {
+        let client = sample_client();
+        client.fee_quote_conversion_cache.write().await.insert(
+            "BNBUSDC".to_string(),
+            FeeQuoteConversionCacheEntry {
+                price: Decimal::from(600u32),
+                observed_at: now_utc(),
+            },
+        );
+        let raw = execution_report_event_raw("BNB");
+
+        let event = parse_user_stream_message(&raw).unwrap().unwrap();
+        let event = client.enrich_user_stream_event(event).await.unwrap();
+        match event {
+            BinanceUserStreamEvent::Execution(execution) => {
+                assert_eq!(
+                    execution.fill.as_ref().and_then(|fill| fill.fee_quote),
+                    Some(Decimal::from(6u32))
+                );
+                assert!(execution.fill_recovery.is_none());
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marks_unenriched_third_party_fill_for_recovery_instead_of_forwarding_it_raw() {
+        let client = sample_client();
+        let raw = execution_report_event_raw("BNB");
+        let event = parse_user_stream_message(&raw).unwrap().unwrap();
+        let error = anyhow!("BNBUSDC price unavailable");
+
+        let stripped = client.mark_fill_recovery_after_enrichment_failure(event, &error);
+
+        match stripped {
+            BinanceUserStreamEvent::Execution(execution) => {
+                assert!(execution.fill.is_none());
+                assert_eq!(execution.report.client_order_id, "bot-1");
+                let recovery = execution.fill_recovery.expect("fill recovery should be queued");
+                assert_eq!(recovery.symbol, Symbol::BtcUsdc);
+                assert_eq!(recovery.trade_id, "7");
+                assert_eq!(recovery.order_id, "42");
+                assert_eq!(recovery.fee_asset, "BNB");
+                assert!(execution
+                    .report
+                    .message
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("fill queued for REST recovery after fee quote enrichment failure"));
             }
             other => panic!("unexpected event: {other:?}"),
         }

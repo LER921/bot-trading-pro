@@ -129,6 +129,7 @@ pub struct FillEvent {
     pub quantity: Decimal,
     pub fee: Decimal,
     pub fee_asset: String,
+    pub fee_quote: Option<Decimal>,
     pub liquidity_side: LiquiditySide,
     pub event_time: Timestamp,
 }

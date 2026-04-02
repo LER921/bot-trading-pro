@@ -9,7 +9,7 @@ use domain::{
 };
 use execution::{BinanceExecutionEngine, ExecutionEngine};
 use exchange_binance_spot::{
-    BinanceBootstrapState, BinanceExecutionEvent, BinanceMarketEvent, BinanceSpotGateway,
+    BinanceBootstrapState, BinanceExecutionEvent, BinanceFillRecoveryRequest, BinanceMarketEvent, BinanceSpotGateway,
     BinanceUserStreamEvent, MarketStreamHandle, StreamKind, StreamStatus, UserStreamHandle,
 };
 use features::{FeatureEngine, SimpleFeatureEngine};
@@ -30,6 +30,29 @@ use tracing::{info, warn};
 const LOOP_INTERVAL_MS: u64 = 1_000;
 const STALE_QUOTE_CANCEL_MS: i64 = 5_000;
 const BOOTSTRAP_TRADE_SEED_LIMIT: usize = 50;
+const FILL_RECOVERY_FETCH_LIMIT: usize = 50;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FillKey {
+    symbol: Symbol,
+    trade_id: String,
+}
+
+impl FillKey {
+    fn from_fill(fill: &domain::FillEvent) -> Self {
+        Self {
+            symbol: fill.symbol,
+            trade_id: fill.trade_id.clone(),
+        }
+    }
+
+    fn from_recovery(recovery: &BinanceFillRecoveryRequest) -> Self {
+        Self {
+            symbol: recovery.symbol,
+            trade_id: recovery.trade_id.clone(),
+        }
+    }
+}
 
 pub struct TraderRuntime<G>
 where
@@ -50,7 +73,8 @@ where
     accounting: InMemoryAccountingService,
     storage: Arc<dyn StorageEngine>,
     telemetry: TracingTelemetry,
-    seen_fills: HashSet<String>,
+    seen_fills: HashSet<FillKey>,
+    pending_fill_recoveries: HashMap<FillKey, BinanceFillRecoveryRequest>,
     market_stream: Option<MarketStreamHandle>,
     user_stream: Option<UserStreamHandle>,
 }
@@ -97,6 +121,7 @@ where
             storage,
             telemetry: TracingTelemetry,
             seen_fills: HashSet::new(),
+            pending_fill_recoveries: HashMap::new(),
             market_stream: None,
             user_stream: None,
         })
@@ -191,6 +216,7 @@ where
         self.refresh_health().await;
         self.ingest_stream_statuses().await?;
         self.ingest_live_events().await?;
+        self.recover_pending_fills().await?;
         self.ensure_market_data_resynced().await?;
 
         let fallback_active = self.should_enable_fallback().await;
@@ -528,11 +554,96 @@ where
         self.handle_execution_report(&execution.report).await?;
 
         if let Some(fill) = execution.fill.clone() {
-            if self.seen_fills.insert(fill.trade_id.clone()) {
-                self.health_tracker.record_fill(fill.event_time);
-                self.portfolio.apply_fill(fill.clone()).await?;
-                self.accounting.record_fill(&fill).await?;
-                self.storage.persist_fill(&fill).await?;
+            self.apply_fill_if_new(fill).await?;
+        }
+
+        if let Some(recovery) = execution.fill_recovery.clone() {
+            warn!(
+                symbol = %recovery.symbol,
+                trade_id = %recovery.trade_id,
+                order_id = %recovery.order_id,
+                fee_asset = %recovery.fee_asset,
+                reason = %recovery.reason,
+                "queued fill for REST recovery"
+            );
+            self.pending_fill_recoveries
+                .insert(FillKey::from_recovery(&recovery), recovery);
+        }
+
+        Ok(())
+    }
+
+    async fn apply_fill_if_new(&mut self, fill: domain::FillEvent) -> Result<bool> {
+        let fill_key = FillKey::from_fill(&fill);
+        if !self.seen_fills.insert(fill_key.clone()) {
+            self.pending_fill_recoveries.remove(&fill_key);
+            return Ok(false);
+        }
+
+        self.pending_fill_recoveries.remove(&fill_key);
+        self.health_tracker.record_fill(fill.event_time);
+        self.portfolio.apply_fill(fill.clone()).await?;
+        self.accounting.record_fill(&fill).await?;
+        self.storage.persist_fill(&fill).await?;
+        Ok(true)
+    }
+
+    async fn recover_pending_fills(&mut self) -> Result<()> {
+        if self.pending_fill_recoveries.is_empty() {
+            return Ok(());
+        }
+
+        let mut recoveries_by_symbol: HashMap<Symbol, Vec<BinanceFillRecoveryRequest>> = HashMap::new();
+        for recovery in self.pending_fill_recoveries.values().cloned() {
+            recoveries_by_symbol
+                .entry(recovery.symbol)
+                .or_default()
+                .push(recovery);
+        }
+
+        for (symbol, recoveries) in recoveries_by_symbol {
+            match self
+                .gateway
+                .fetch_recent_fills(symbol, FILL_RECOVERY_FETCH_LIMIT)
+                .await
+            {
+                Ok(fills) => {
+                    self.health_tracker.record_rest_success(now_utc());
+                    let recovered_by_trade = fills
+                        .into_iter()
+                        .map(|fill| (FillKey::from_fill(&fill), fill))
+                        .collect::<HashMap<_, _>>();
+
+                    for recovery in recoveries {
+                        let fill_key = FillKey::from_recovery(&recovery);
+                        if let Some(fill) = recovered_by_trade.get(&fill_key).cloned() {
+                            self.apply_fill_if_new(fill).await?;
+                            self.pending_fill_recoveries.remove(&fill_key);
+                            info!(
+                                symbol = %recovery.symbol,
+                                trade_id = %recovery.trade_id,
+                                order_id = %recovery.order_id,
+                                "recovered fill via REST reconciliation"
+                            );
+                        } else {
+                            warn!(
+                                symbol = %recovery.symbol,
+                                trade_id = %recovery.trade_id,
+                                order_id = %recovery.order_id,
+                                "pending fill recovery still waiting on REST reconciliation"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.health_tracker.record_rest_failure();
+                    warn!(
+                        ?error,
+                        symbol = %symbol,
+                        pending = recoveries.len(),
+                        "failed to recover pending fills via REST"
+                    );
+                }
             }
         }
 
@@ -546,12 +657,7 @@ where
             .await?;
 
         for fill in &bootstrap.fills {
-            if self.seen_fills.insert(fill.trade_id.clone()) {
-                self.health_tracker.record_fill(fill.event_time);
-                self.portfolio.apply_fill(fill.clone()).await?;
-                self.accounting.record_fill(fill).await?;
-                self.storage.persist_fill(fill).await?;
-            }
+            self.apply_fill_if_new(fill.clone()).await?;
         }
 
         self.execution
@@ -784,13 +890,7 @@ mod tests {
                 cancel_all_on_risk_off: true,
             },
             pairs: PairsConfig {
-                pairs: vec![PairConfig {
-                    symbol: Symbol::BtcUsdc,
-                    enabled: true,
-                    max_quote_notional: Decimal::from(500u32),
-                    max_inventory_base: Decimal::from_str_exact("0.020").unwrap(),
-                    soft_inventory_base: Decimal::from_str_exact("0.010").unwrap(),
-                }],
+                pairs: vec![sample_pair(Symbol::BtcUsdc)],
             },
             risk: RiskConfig {
                 max_daily_loss_usdc: Decimal::from(100u32),
@@ -812,6 +912,28 @@ mod tests {
         }
     }
 
+    fn sample_pair(symbol: Symbol) -> PairConfig {
+        PairConfig {
+            symbol,
+            enabled: true,
+            max_quote_notional: Decimal::from(500u32),
+            max_inventory_base: match symbol {
+                Symbol::BtcUsdc => Decimal::from_str_exact("0.020").unwrap(),
+                Symbol::EthUsdc => Decimal::from_str_exact("0.50").unwrap(),
+            },
+            soft_inventory_base: match symbol {
+                Symbol::BtcUsdc => Decimal::from_str_exact("0.010").unwrap(),
+                Symbol::EthUsdc => Decimal::from_str_exact("0.25").unwrap(),
+            },
+        }
+    }
+
+    fn sample_config_with_pairs(trading_enabled: bool, pairs: Vec<PairConfig>) -> AppConfig {
+        let mut config = sample_config(trading_enabled);
+        config.pairs = PairsConfig { pairs };
+        config
+    }
+
     fn sample_account() -> AccountSnapshot {
         AccountSnapshot {
             balances: vec![
@@ -825,20 +947,35 @@ mod tests {
                     free: Decimal::ZERO,
                     locked: Decimal::ZERO,
                 },
+                Balance {
+                    asset: "ETH".to_string(),
+                    free: Decimal::ZERO,
+                    locked: Decimal::ZERO,
+                },
             ],
             updated_at: now_utc(),
         }
     }
 
     fn sample_book() -> OrderBookSnapshot {
+        sample_book_for(Symbol::BtcUsdc)
+    }
+
+    fn sample_book_for(symbol: Symbol) -> OrderBookSnapshot {
         OrderBookSnapshot {
-            symbol: Symbol::BtcUsdc,
+            symbol,
             bids: vec![PriceLevel {
-                price: Decimal::from(60_000u32),
+                price: match symbol {
+                    Symbol::BtcUsdc => Decimal::from(60_000u32),
+                    Symbol::EthUsdc => Decimal::from(2_000u32),
+                },
                 quantity: Decimal::from_str_exact("0.5").unwrap(),
             }],
             asks: vec![PriceLevel {
-                price: Decimal::from(60_030u32),
+                price: match symbol {
+                    Symbol::BtcUsdc => Decimal::from(60_030u32),
+                    Symbol::EthUsdc => Decimal::from(2_003u32),
+                },
                 quantity: Decimal::from_str_exact("0.4").unwrap(),
             }],
             last_update_id: 1,
@@ -893,16 +1030,38 @@ mod tests {
     }
 
     fn sample_execution_event(status: OrderStatus) -> BinanceExecutionEvent {
+        sample_execution_event_for(Symbol::BtcUsdc, "fill-1", status)
+    }
+
+    fn sample_execution_event_for(
+        symbol: Symbol,
+        trade_id: &str,
+        status: OrderStatus,
+    ) -> BinanceExecutionEvent {
+        let (price, quantity, cumulative_quote, fee_quote) = match symbol {
+            Symbol::BtcUsdc => (
+                Decimal::from(60_000u32),
+                Decimal::from_str_exact("0.005").unwrap(),
+                Decimal::from(300u32),
+                Decimal::from_str_exact("0.01").unwrap(),
+            ),
+            Symbol::EthUsdc => (
+                Decimal::from(2_000u32),
+                Decimal::from_str_exact("0.050").unwrap(),
+                Decimal::from(100u32),
+                Decimal::from_str_exact("0.01").unwrap(),
+            ),
+        };
         BinanceExecutionEvent {
             report: ExecutionReport {
                 client_order_id: "bot-123".to_string(),
                 exchange_order_id: Some("42".to_string()),
-                symbol: Symbol::BtcUsdc,
+                symbol,
                 status,
-                filled_quantity: Decimal::from_str_exact("0.005").unwrap(),
-                average_fill_price: Some(Decimal::from(60_000u32)),
+                filled_quantity: quantity,
+                average_fill_price: Some(price),
                 fill_ratio: Decimal::from_str_exact("0.50").unwrap(),
-                requested_price: Some(Decimal::from(60_000u32)),
+                requested_price: Some(price),
                 slippage_bps: Some(Decimal::ZERO),
                 decision_latency_ms: Some(10),
                 message: None,
@@ -911,29 +1070,31 @@ mod tests {
             side: Side::Buy,
             order_type: OrderType::Limit,
             time_in_force: Some(TimeInForce::Gtc),
-            original_quantity: Decimal::from_str_exact("0.010").unwrap(),
-            price: Some(Decimal::from(60_000u32)),
-            cumulative_filled_quantity: Decimal::from_str_exact("0.005").unwrap(),
-            cumulative_quote_quantity: Decimal::from(300u32),
-            last_executed_quantity: Decimal::from_str_exact("0.005").unwrap(),
-            last_executed_price: Some(Decimal::from(60_000u32)),
+            original_quantity: quantity * Decimal::from(2u32),
+            price: Some(price),
+            cumulative_filled_quantity: quantity,
+            cumulative_quote_quantity: cumulative_quote,
+            last_executed_quantity: quantity,
+            last_executed_price: Some(price),
             reject_reason: None,
             is_working: true,
             is_maker: false,
             order_created_at: Some(now_utc()),
             transaction_time: now_utc(),
             fill: Some(FillEvent {
-                trade_id: "fill-1".to_string(),
+                trade_id: trade_id.to_string(),
                 order_id: "42".to_string(),
-                symbol: Symbol::BtcUsdc,
+                symbol,
                 side: Side::Buy,
-                price: Decimal::from(60_000u32),
-                quantity: Decimal::from_str_exact("0.005").unwrap(),
+                price,
+                quantity,
                 fee: Decimal::from_str_exact("0.01").unwrap(),
                 fee_asset: "USDC".to_string(),
+                fee_quote: Some(fee_quote),
                 liquidity_side: domain::LiquiditySide::Taker,
                 event_time: now_utc(),
             }),
+            fill_recovery: None,
         }
     }
 
@@ -1016,6 +1177,263 @@ mod tests {
         assert_eq!(open_orders.len(), 1);
         assert_eq!(runtime.state(), RuntimeState::Paused);
         assert_eq!(open_orders[0].status, OrderStatus::PartiallyFilled);
+    }
+
+    #[tokio::test]
+    async fn runtime_recovers_pending_fill_via_recent_fills_rest() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(sample_config(false), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+
+        let recovered_fill = FillEvent {
+            trade_id: "fill-1".to_string(),
+            order_id: "42".to_string(),
+            symbol: Symbol::BtcUsdc,
+            side: Side::Buy,
+            price: Decimal::from(60_000u32),
+            quantity: Decimal::from_str_exact("0.005").unwrap(),
+            fee: Decimal::from_str_exact("0.001").unwrap(),
+            fee_asset: "BNB".to_string(),
+            fee_quote: Some(Decimal::from_str_exact("0.6").unwrap()),
+            liquidity_side: domain::LiquiditySide::Taker,
+            event_time: now_utc(),
+        };
+        gateway.seed_fills(Symbol::BtcUsdc, vec![recovered_fill]).await;
+
+        let mut execution = sample_execution_event(OrderStatus::PartiallyFilled);
+        execution.fill = None;
+        execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "fill-1".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "fee quote enrichment failed; recover via REST".to_string(),
+        });
+
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(execution))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        let inventory = runtime.portfolio.inventory(Symbol::BtcUsdc).await.unwrap();
+        let pnl = runtime.accounting.snapshot().await;
+        assert!(inventory.base_position > Decimal::ZERO);
+        assert_eq!(pnl.fees_quote, Decimal::from_str_exact("0.6").unwrap());
+        assert!(!runtime
+            .pending_fill_recoveries
+            .contains_key(&FillKey {
+                symbol: Symbol::BtcUsdc,
+                trade_id: "fill-1".to_string(),
+            }));
+    }
+
+    #[tokio::test]
+    async fn fills_with_same_trade_id_on_different_symbols_are_distinct() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::BtcUsdc)).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::EthUsdc)).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.seed_trades(Symbol::EthUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(
+            sample_config_with_pairs(
+                false,
+                vec![sample_pair(Symbol::BtcUsdc), sample_pair(Symbol::EthUsdc)],
+            ),
+            gateway.clone(),
+        )
+        .unwrap();
+        runtime.bootstrap().await.unwrap();
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(sample_execution_event_for(
+                Symbol::BtcUsdc,
+                "shared-trade-id",
+                OrderStatus::PartiallyFilled,
+            )))
+            .await;
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(sample_execution_event_for(
+                Symbol::EthUsdc,
+                "shared-trade-id",
+                OrderStatus::PartiallyFilled,
+            )))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        let btc_inventory = runtime.portfolio.inventory(Symbol::BtcUsdc).await.unwrap();
+        let eth_inventory = runtime.portfolio.inventory(Symbol::EthUsdc).await.unwrap();
+        let pnl = runtime.accounting.snapshot().await;
+        assert!(btc_inventory.base_position > Decimal::ZERO);
+        assert!(eth_inventory.base_position > Decimal::ZERO);
+        assert_eq!(pnl.fees_quote, Decimal::from_str_exact("0.02").unwrap());
+        assert!(runtime.seen_fills.contains(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "shared-trade-id".to_string(),
+        }));
+        assert!(runtime.seen_fills.contains(&FillKey {
+            symbol: Symbol::EthUsdc,
+            trade_id: "shared-trade-id".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn pending_recoveries_with_same_trade_id_on_different_symbols_do_not_collide() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::BtcUsdc)).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::EthUsdc)).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.seed_trades(Symbol::EthUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(
+            sample_config_with_pairs(
+                false,
+                vec![sample_pair(Symbol::BtcUsdc), sample_pair(Symbol::EthUsdc)],
+            ),
+            gateway.clone(),
+        )
+        .unwrap();
+        runtime.bootstrap().await.unwrap();
+
+        let mut btc_execution =
+            sample_execution_event_for(Symbol::BtcUsdc, "shared-recovery-id", OrderStatus::PartiallyFilled);
+        btc_execution.fill = None;
+        btc_execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "recover btc".to_string(),
+        });
+
+        let mut eth_execution =
+            sample_execution_event_for(Symbol::EthUsdc, "shared-recovery-id", OrderStatus::PartiallyFilled);
+        eth_execution.fill = None;
+        eth_execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::EthUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "recover eth".to_string(),
+        });
+
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(btc_execution))
+            .await;
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(eth_execution))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        assert_eq!(runtime.pending_fill_recoveries.len(), 2);
+        assert!(runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+        }));
+        assert!(runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::EthUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn rest_recovery_resolves_exact_matching_symbol_and_trade_id() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::BtcUsdc)).await;
+        gateway.seed_orderbook(sample_book_for(Symbol::EthUsdc)).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.seed_trades(Symbol::EthUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(
+            sample_config_with_pairs(
+                false,
+                vec![sample_pair(Symbol::BtcUsdc), sample_pair(Symbol::EthUsdc)],
+            ),
+            gateway.clone(),
+        )
+        .unwrap();
+        runtime.bootstrap().await.unwrap();
+
+        gateway
+            .seed_fills(
+                Symbol::BtcUsdc,
+                vec![FillEvent {
+                    trade_id: "shared-recovery-id".to_string(),
+                    order_id: "42".to_string(),
+                    symbol: Symbol::BtcUsdc,
+                    side: Side::Buy,
+                    price: Decimal::from(60_000u32),
+                    quantity: Decimal::from_str_exact("0.005").unwrap(),
+                    fee: Decimal::from_str_exact("0.001").unwrap(),
+                    fee_asset: "BNB".to_string(),
+                    fee_quote: Some(Decimal::from_str_exact("0.6").unwrap()),
+                    liquidity_side: domain::LiquiditySide::Taker,
+                    event_time: now_utc(),
+                }],
+            )
+            .await;
+
+        let mut btc_execution =
+            sample_execution_event_for(Symbol::BtcUsdc, "shared-recovery-id", OrderStatus::PartiallyFilled);
+        btc_execution.fill = None;
+        btc_execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "recover btc".to_string(),
+        });
+
+        let mut eth_execution =
+            sample_execution_event_for(Symbol::EthUsdc, "shared-recovery-id", OrderStatus::PartiallyFilled);
+        eth_execution.fill = None;
+        eth_execution.fill_recovery = Some(BinanceFillRecoveryRequest {
+            symbol: Symbol::EthUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+            order_id: "42".to_string(),
+            fee_asset: "BNB".to_string(),
+            event_time: now_utc(),
+            reason: "recover eth".to_string(),
+        });
+
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(btc_execution))
+            .await;
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::Execution(eth_execution))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        let btc_inventory = runtime.portfolio.inventory(Symbol::BtcUsdc).await.unwrap();
+        let eth_inventory = runtime.portfolio.inventory(Symbol::EthUsdc).await.unwrap();
+        assert!(btc_inventory.base_position > Decimal::ZERO);
+        assert_eq!(eth_inventory.base_position, Decimal::ZERO);
+        assert!(!runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::BtcUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+        }));
+        assert!(runtime.pending_fill_recoveries.contains_key(&FillKey {
+            symbol: Symbol::EthUsdc,
+            trade_id: "shared-recovery-id".to_string(),
+        }));
     }
 
     #[tokio::test]

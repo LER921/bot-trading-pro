@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use common::{Decimal, Timestamp, now_utc};
 use domain::{FillEvent, PnlSnapshot, Symbol, SymbolPnlSnapshot};
@@ -49,8 +49,8 @@ pub struct InMemoryAccountingService {
 #[async_trait]
 impl AccountingService for InMemoryAccountingService {
     async fn record_fill(&self, fill: &FillEvent) -> Result<()> {
+        let fee_quote = fee_to_quote(fill)?;
         let mut state = self.state.write().await;
-        let fee_quote = fee_to_quote(fill);
         let journal_entry = {
             let entry = state.symbols.entry(fill.symbol).or_default();
 
@@ -114,16 +114,24 @@ impl AccountingService for InMemoryAccountingService {
     }
 }
 
-fn fee_to_quote(fill: &FillEvent) -> Decimal {
-    if fill.fee_asset.eq_ignore_ascii_case("USDC") {
-        fill.fee
+fn fee_to_quote(fill: &FillEvent) -> Result<Decimal> {
+    if let Some(fee_quote) = fill.fee_quote {
+        Ok(fee_quote)
+    } else if fill.fee.is_zero() {
+        Ok(Decimal::ZERO)
+    } else if fill.fee_asset.eq_ignore_ascii_case("USDC") {
+        Ok(fill.fee)
     } else if fill
         .fee_asset
         .eq_ignore_ascii_case(base_asset_for_symbol(fill.symbol))
     {
-        fill.fee * fill.price
+        Ok(fill.fee * fill.price)
     } else {
-        Decimal::ZERO
+        Err(anyhow!(
+            "missing fee_quote conversion for fee asset '{}' on {}",
+            fill.fee_asset,
+            fill.symbol
+        ))
     }
 }
 
@@ -224,6 +232,7 @@ mod tests {
             quantity: Decimal::from_str_exact(qty).unwrap(),
             fee: Decimal::from_str_exact("0.01").unwrap(),
             fee_asset: "USDC".to_string(),
+            fee_quote: Some(Decimal::from_str_exact("0.01").unwrap()),
             liquidity_side: LiquiditySide::Maker,
             event_time: now_utc(),
         }
@@ -235,6 +244,54 @@ mod tests {
             trade_id: format!("sell-{price}"),
             ..buy_fill(symbol, price, qty)
         }
+    }
+
+    #[test]
+    fn converts_usdc_fee_to_quote() {
+        let fill = buy_fill(Symbol::BtcUsdc, 60_000, "0.010");
+
+        assert_eq!(
+            fee_to_quote(&fill).unwrap(),
+            Decimal::from_str_exact("0.01").unwrap()
+        );
+    }
+
+    #[test]
+    fn converts_base_asset_fee_to_quote() {
+        let mut fill = buy_fill(Symbol::BtcUsdc, 60_000, "0.010");
+        fill.fee = Decimal::from_str_exact("0.00001").unwrap();
+        fill.fee_asset = "BTC".to_string();
+        fill.fee_quote = None;
+
+        assert_eq!(
+            fee_to_quote(&fill).unwrap(),
+            Decimal::from_str_exact("0.6").unwrap()
+        );
+    }
+
+    #[test]
+    fn converts_explicit_third_party_fee_to_quote() {
+        let mut fill = buy_fill(Symbol::BtcUsdc, 60_000, "0.010");
+        fill.fee = Decimal::from_str_exact("0.001").unwrap();
+        fill.fee_asset = "BNB".to_string();
+        fill.fee_quote = Some(Decimal::from_str_exact("0.6").unwrap());
+
+        assert_eq!(
+            fee_to_quote(&fill).unwrap(),
+            Decimal::from_str_exact("0.6").unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_fee_quote_for_third_party_fee_asset() {
+        let mut fill = buy_fill(Symbol::BtcUsdc, 60_000, "0.010");
+        fill.fee_asset = "BNB".to_string();
+        fill.fee_quote = None;
+
+        let error = fee_to_quote(&fill).expect_err("third-party fee asset without fee_quote should fail");
+        assert!(error
+            .to_string()
+            .contains("missing fee_quote conversion for fee asset 'BNB'"));
     }
 
     #[tokio::test]
@@ -256,5 +313,20 @@ mod tests {
         let final_snapshot = accounting.snapshot().await;
         assert!(final_snapshot.realized_pnl_quote > Decimal::ZERO);
         assert!(final_snapshot.fees_quote > Decimal::ZERO);
+    }
+
+    #[tokio::test]
+    async fn bnb_fee_impacts_snapshot_and_net_pnl() {
+        let accounting = InMemoryAccountingService::default();
+        let mut fill = buy_fill(Symbol::BtcUsdc, 60_000, "0.010");
+        fill.fee = Decimal::from_str_exact("0.001").unwrap();
+        fill.fee_asset = "BNB".to_string();
+        fill.fee_quote = Some(Decimal::from_str_exact("0.6").unwrap());
+
+        accounting.record_fill(&fill).await.unwrap();
+
+        let snapshot = accounting.snapshot().await;
+        assert_eq!(snapshot.fees_quote, Decimal::from_str_exact("0.6").unwrap());
+        assert_eq!(snapshot.net_pnl_quote, Decimal::from_str_exact("-0.6").unwrap());
     }
 }

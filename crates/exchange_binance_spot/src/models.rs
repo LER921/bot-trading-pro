@@ -80,6 +80,16 @@ pub enum BinanceMarketEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinanceFillRecoveryRequest {
+    pub symbol: domain::Symbol,
+    pub trade_id: String,
+    pub order_id: String,
+    pub fee_asset: String,
+    pub event_time: Timestamp,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinanceExecutionEvent {
     pub report: domain::ExecutionReport,
     pub side: domain::Side,
@@ -97,6 +107,7 @@ pub struct BinanceExecutionEvent {
     pub order_created_at: Option<Timestamp>,
     pub transaction_time: Timestamp,
     pub fill: Option<FillEvent>,
+    pub fill_recovery: Option<BinanceFillRecoveryRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

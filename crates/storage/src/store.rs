@@ -160,12 +160,24 @@ impl SqliteStorage {
                         price TEXT NOT NULL,
                         quantity TEXT NOT NULL,
                         fee TEXT NOT NULL,
-                        fee_asset TEXT NOT NULL
+                        fee_asset TEXT NOT NULL,
+                        fee_quote TEXT
                     );
                     "#,
                 )
                 .execute(&self.pool)
                 .await?;
+
+                if let Err(error) = sqlx::query("ALTER TABLE fills ADD COLUMN fee_quote TEXT;")
+                    .execute(&self.pool)
+                    .await
+                {
+                    let is_duplicate_column =
+                        error.to_string().to_ascii_lowercase().contains("duplicate column name: fee_quote");
+                    if !is_duplicate_column {
+                        return Err(error);
+                    }
+                }
 
                 sqlx::query(
                     r#"
@@ -261,7 +273,7 @@ impl StorageEngine for SqliteStorage {
     async fn persist_fill(&self, fill: &FillEvent) -> Result<()> {
         self.ensure_schema().await?;
         sqlx::query(
-            "INSERT INTO fills (event_time, trade_id, order_id, symbol, side, price, quantity, fee, fee_asset) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO fills (event_time, trade_id, order_id, symbol, side, price, quantity, fee, fee_asset, fee_quote) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(fill.event_time.to_string())
         .bind(&fill.trade_id)
@@ -272,6 +284,7 @@ impl StorageEngine for SqliteStorage {
         .bind(fill.quantity.to_string())
         .bind(fill.fee.to_string())
         .bind(&fill.fee_asset)
+        .bind(fill.fee_quote.map(|value| value.to_string()))
         .execute(&self.pool)
         .await?;
         Ok(())

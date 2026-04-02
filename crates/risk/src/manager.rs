@@ -124,32 +124,42 @@ impl StrictRiskManager {
         Some(reduced)
     }
 
-    fn total_exposure_quote(&self, context: &RiskContext) -> Decimal {
-        context.inventory.iter().fold(Decimal::ZERO, |acc, (symbol, inventory)| {
-            let mark = context
-                .mid_prices
-                .get(symbol)
-                .copied()
-                .or(inventory.mark_price)
-                .unwrap_or(Decimal::ZERO);
-            acc + inventory.base_position.abs() * mark
-        })
-    }
-
-    fn symbol_exposure_quote(&self, context: &RiskContext, symbol: Symbol) -> Decimal {
+    fn mark_price_for_symbol(&self, context: &RiskContext, symbol: Symbol) -> Decimal {
         context
-            .inventory
+            .mid_prices
             .get(&symbol)
-            .map(|inventory| {
-                let mark = context
-                    .mid_prices
+            .copied()
+            .or_else(|| {
+                context
+                    .inventory
                     .get(&symbol)
-                    .copied()
-                    .or(inventory.mark_price)
-                    .unwrap_or(Decimal::ZERO);
-                inventory.base_position.abs() * mark
+                    .and_then(|inventory| inventory.mark_price)
             })
             .unwrap_or(Decimal::ZERO)
+    }
+
+    fn projected_symbol_exposure_quote(
+        &self,
+        projected_positions: &HashMap<Symbol, Decimal>,
+        context: &RiskContext,
+        symbol: Symbol,
+    ) -> Decimal {
+        projected_positions
+            .get(&symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+            .abs()
+            * self.mark_price_for_symbol(context, symbol)
+    }
+
+    fn total_projected_exposure_quote(
+        &self,
+        projected_positions: &HashMap<Symbol, Decimal>,
+        context: &RiskContext,
+    ) -> Decimal {
+        projected_positions.iter().fold(Decimal::ZERO, |acc, (symbol, position)| {
+            acc + position.abs() * self.mark_price_for_symbol(context, *symbol)
+        })
     }
 
     fn check_drawdown_guard(&self, context: &RiskContext) -> Option<String> {
@@ -282,25 +292,34 @@ impl RiskManager for StrictRiskManager {
                 continue;
             }
 
-            if self.symbol_exposure_quote(context, intent.symbol) > symbol_limits.max_quote_notional
+            let projected_after = project_inventory_position(current_position, &intent);
+            let mut candidate_positions = projected_positions.clone();
+            candidate_positions.insert(intent.symbol, projected_after);
+
+            if self.projected_symbol_exposure_quote(&candidate_positions, context, intent.symbol)
+                > symbol_limits.max_quote_notional
                 && !self.would_reduce_inventory(current_position, &intent)
             {
                 decisions.push(block(
                     intent,
-                    "symbol exposure already above allowed quote limit",
+                    "projected symbol quote exposure exceeds limit",
                     resulting_mode,
                 ));
                 continue;
             }
 
-            if self.total_exposure_quote(context) > self.limits.max_total_exposure_quote
+            if self.total_projected_exposure_quote(&candidate_positions, context)
+                > self.limits.max_total_exposure_quote
                 && !self.would_reduce_inventory(current_position, &intent)
             {
-                decisions.push(block(intent, "global quote exposure above limit", resulting_mode));
+                decisions.push(block(
+                    intent,
+                    "projected total quote exposure exceeds limit",
+                    resulting_mode,
+                ));
                 continue;
             }
 
-            let projected_after = project_inventory_position(current_position, &intent);
             if projected_after.abs() > symbol_limits.max_inventory_base
                 && !self.would_reduce_inventory(current_position, &intent)
             {
@@ -442,6 +461,17 @@ mod tests {
         }
     }
 
+    fn inventory_snapshot(symbol: Symbol, base_position: Decimal, mark_price: Decimal) -> InventorySnapshot {
+        InventorySnapshot {
+            symbol,
+            base_position,
+            quote_position: Decimal::ZERO,
+            mark_price: Some(mark_price),
+            average_entry_price: Some(mark_price),
+            updated_at: now_utc(),
+        }
+    }
+
     fn sample_context() -> RiskContext {
         let now = now_utc();
         RiskContext {
@@ -506,19 +536,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blocks_when_projected_symbol_exposure_exceeds_limit() {
+        let manager = StrictRiskManager::new(sample_limits());
+        let mut context = sample_context();
+        context.inventory.insert(
+            Symbol::BtcUsdc,
+            inventory_snapshot(
+                Symbol::BtcUsdc,
+                Decimal::from_str_exact("0.010").unwrap(),
+                Decimal::from(60_000u32),
+            ),
+        );
+
+        let mut intent = sample_intent();
+        intent.quantity = Decimal::from_str_exact("0.010").unwrap();
+
+        let decisions = manager.evaluate(vec![intent], &context).await.unwrap();
+
+        assert_eq!(decisions[0].action, RiskAction::Block);
+        assert_eq!(decisions[0].reason, "projected symbol quote exposure exceeds limit");
+    }
+
+    #[tokio::test]
+    async fn blocks_when_projected_total_exposure_exceeds_limit() {
+        let mut limits = sample_limits();
+        limits.max_total_exposure_quote = Decimal::from(1_000u32);
+        limits.per_symbol.push(domain::SymbolRiskLimits {
+            symbol: Symbol::EthUsdc,
+            max_inventory_base: Decimal::from(5u32),
+            soft_inventory_base: Decimal::from(2u32),
+            max_quote_notional: Decimal::from(10_000u32),
+            max_open_orders: 2,
+        });
+
+        let manager = StrictRiskManager::new(limits);
+        let mut context = sample_context();
+        context.mid_prices.insert(Symbol::EthUsdc, Decimal::from(2_000u32));
+        context.inventory.insert(
+            Symbol::BtcUsdc,
+            inventory_snapshot(
+                Symbol::BtcUsdc,
+                Decimal::from_str_exact("0.010").unwrap(),
+                Decimal::from(60_000u32),
+            ),
+        );
+        context.inventory.insert(
+            Symbol::EthUsdc,
+            inventory_snapshot(
+                Symbol::EthUsdc,
+                Decimal::from_str_exact("0.20").unwrap(),
+                Decimal::from(2_000u32),
+            ),
+        );
+
+        let mut intent = sample_intent();
+        intent.symbol = Symbol::EthUsdc;
+        intent.quantity = Decimal::from_str_exact("0.05").unwrap();
+        intent.limit_price = Some(Decimal::from(2_000u32));
+
+        let decisions = manager.evaluate(vec![intent], &context).await.unwrap();
+
+        assert_eq!(decisions[0].action, RiskAction::Block);
+        assert_eq!(decisions[0].reason, "projected total quote exposure exceeds limit");
+    }
+
+    #[tokio::test]
     async fn forces_reduce_only_when_inventory_is_excessive() {
         let manager = StrictRiskManager::new(sample_limits());
         let mut context = sample_context();
         context.inventory.insert(
             Symbol::BtcUsdc,
-            InventorySnapshot {
-                symbol: Symbol::BtcUsdc,
-                base_position: Decimal::from_str_exact("0.095").unwrap(),
-                quote_position: Decimal::ZERO,
-                mark_price: Some(Decimal::from(60_000u32)),
-                average_entry_price: Some(Decimal::from(59_900u32)),
-                updated_at: now_utc(),
-            },
+            inventory_snapshot(
+                Symbol::BtcUsdc,
+                Decimal::from_str_exact("0.095").unwrap(),
+                Decimal::from(60_000u32),
+            ),
         );
 
         let mut intent = sample_intent();
