@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storage::{MemoryStorage, SqliteStorage, StorageEngine};
-use strategy_coordinator::DefaultStrategyCoordinator;
+use strategy_coordinator::{DefaultStrategyCoordinator, StrategySelection};
 use telemetry::{TelemetrySink, TracingTelemetry};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{info, warn};
@@ -322,7 +322,15 @@ where
                 risk_mode: risk_context_health_mode(&health, self.state()),
             };
 
+            let selected_strategy = self.strategy_coordinator.select(&context);
             let outcome = self.strategy_coordinator.evaluate(&context);
+            self.telemetry
+                .emit_strategy_outcome(
+                    strategy_selection_label(selected_strategy),
+                    &context,
+                    &outcome,
+                )
+                .await?;
             let decisions = self.risk_manager.evaluate(outcome.intents, &risk_context).await?;
             for decision in decisions {
                 self.storage.persist_risk_decision(&decision).await?;
@@ -348,8 +356,21 @@ where
             .authorize_operator_command(&request.command, self.state(), &health)
             .await?;
         if !decision.accepted {
+            info!(
+                command = ?request.command,
+                state = ?self.state(),
+                message = decision.message.as_str(),
+                "control-plane request rejected"
+            );
             return Ok(decision);
         }
+
+        info!(
+            command = ?request.command,
+            state = ?self.state(),
+            submitted_by = request.submitted_by.as_str(),
+            "control-plane request accepted"
+        );
 
         match request.command {
             OperatorCommand::Pause => {
@@ -377,15 +398,21 @@ where
                 }
 
                 self.operator_pause_active = false;
-                let ws_degraded = self.is_ws_degraded(&health, self.should_enable_fallback().await);
-                let recovery_required = self.recovery_required(&health).await;
-                if ws_degraded || recovery_required {
+                let ws_degraded_reason =
+                    self.websocket_degradation_reason(&health, self.should_enable_fallback().await);
+                let recovery_reason = self.recovery_reason(&health).await;
+                if ws_degraded_reason.is_some() || recovery_reason.is_some() {
+                    let gating_reason = recovery_reason.unwrap_or_else(|| {
+                        ws_degraded_reason.unwrap_or_else(|| {
+                            "operator resume requested but runtime health is not ready".to_string()
+                        })
+                    });
                     if self.state() != RuntimeState::Reconciling {
                         self.transition(
                             RuntimeState::Reconciling,
                             format!(
-                                "operator resume requested by {}; recovery gate active",
-                                request.submitted_by
+                                "operator resume requested by {}; {}",
+                                request.submitted_by, gating_reason
                             ),
                         )
                         .await?;
@@ -921,18 +948,18 @@ where
         health: &SystemHealth,
         fallback_active: bool,
     ) -> Result<()> {
-        let hard_block = health.market_data.state == HealthState::Stale
-            || health.clock_drift.state == HealthState::Unhealthy
-            || health.rest.state == HealthState::Unhealthy;
-        let ws_degraded = self.is_ws_degraded(health, fallback_active);
-        let recovery_required = self.recovery_required(health).await;
+        let hard_block_reason = self.hard_block_reason(health);
+        let ws_degraded_reason = self.websocket_degradation_reason(health, fallback_active);
+        let recovery_reason = self.recovery_reason(health).await;
+        let recovery_required = recovery_reason.is_some();
+        let ws_degraded = ws_degraded_reason.is_some();
 
         if matches!(self.state(), RuntimeState::Bootstrap | RuntimeState::Shutdown) {
             return Ok(());
         }
 
-        if hard_block {
-            self.transition(RuntimeState::RiskOff, "hard health block triggered")
+        if let Some(reason) = hard_block_reason {
+            self.transition(RuntimeState::RiskOff, reason)
                 .await?;
             return Ok(());
         }
@@ -947,30 +974,47 @@ where
                 RuntimeState::Trading | RuntimeState::Reduced | RuntimeState::Ready
             )
         {
-            self.transition(RuntimeState::Reconciling, "runtime recovery gate active")
-                .await?;
+            if let Some(reason) = recovery_reason {
+                self.transition(RuntimeState::Reconciling, reason).await?;
+            }
             return Ok(());
         }
 
         if matches!(self.state(), RuntimeState::Trading) && ws_degraded {
-            self.transition(RuntimeState::Reduced, "websocket degradation detected")
-                .await?;
+            if let Some(reason) = ws_degraded_reason {
+                self.transition(RuntimeState::Reduced, reason).await?;
+            }
             return Ok(());
         }
 
-        if self.state() == RuntimeState::Reduced && !ws_degraded && !recovery_required {
+        if self.state() == RuntimeState::Reduced
+            && self
+                .websocket_degradation_reason(health, fallback_active)
+                .is_none()
+            && self.recovery_reason(health).await.is_none()
+        {
             self.promote_runtime_after_recovery("live health recovered")
                 .await?;
             return Ok(());
         }
 
-        if self.state() == RuntimeState::Reconciling && !ws_degraded && !recovery_required {
+        if self.state() == RuntimeState::Reconciling
+            && self
+                .websocket_degradation_reason(health, fallback_active)
+                .is_none()
+            && self.recovery_reason(health).await.is_none()
+        {
             self.promote_runtime_after_recovery("runtime recovery completed")
                 .await?;
             return Ok(());
         }
 
-        if self.state() == RuntimeState::Ready && !ws_degraded && !recovery_required {
+        if self.state() == RuntimeState::Ready
+            && self
+                .websocket_degradation_reason(health, fallback_active)
+                .is_none()
+            && self.recovery_reason(health).await.is_none()
+        {
             self.promote_runtime_after_recovery("runtime ready for controlled resume")
                 .await?;
         }
@@ -978,18 +1022,80 @@ where
         Ok(())
     }
 
-    async fn recovery_required(&self, health: &SystemHealth) -> bool {
-        health.market_data.state == HealthState::Degraded
-            || health.clock_drift.state == HealthState::Degraded
-            || health.account_events.state != HealthState::Healthy
-            || !self.pending_fill_recoveries.is_empty()
-            || self.has_market_data_resync_backlog().await
+    async fn recovery_reason(&self, health: &SystemHealth) -> Option<String> {
+        let mut reasons = Vec::new();
+        if health.market_data.state == HealthState::Degraded {
+            reasons.push("market_data=Degraded".to_string());
+        }
+        if health.clock_drift.state == HealthState::Degraded {
+            reasons.push("clock_drift=Degraded".to_string());
+        }
+        if health.account_events.state != HealthState::Healthy {
+            reasons.push(format!("account_events={:?}", health.account_events.state));
+        }
+        if !self.pending_fill_recoveries.is_empty() {
+            reasons.push(format!(
+                "pending_fill_recoveries={}",
+                self.pending_fill_recoveries.len()
+            ));
+        }
+        if self.has_market_data_resync_backlog().await {
+            reasons.push("market_data_resync_backlog=true".to_string());
+        }
+
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(format!("runtime recovery gate active: {}", reasons.join(", ")))
+        }
     }
 
-    fn is_ws_degraded(&self, health: &SystemHealth, fallback_active: bool) -> bool {
-        fallback_active
-            || health.market_ws.state != HealthState::Healthy
-            || health.user_ws.state != HealthState::Healthy
+    fn websocket_degradation_reason(
+        &self,
+        health: &SystemHealth,
+        fallback_active: bool,
+    ) -> Option<String> {
+        let mut reasons = Vec::new();
+        if health.market_ws.state != HealthState::Healthy {
+            reasons.push(format!("market_ws={:?}", health.market_ws.state));
+        }
+        if health.user_ws.state != HealthState::Healthy {
+            reasons.push(format!("user_ws={:?}", health.user_ws.state));
+        }
+        if fallback_active {
+            reasons.push("rest_fallback_active=true".to_string());
+        }
+
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "websocket degradation detected: {}",
+                reasons.join(", ")
+            ))
+        }
+    }
+
+    fn hard_block_reason(&self, health: &SystemHealth) -> Option<String> {
+        let mut reasons = Vec::new();
+        if health.market_data.state == HealthState::Stale {
+            reasons.push("market_data=Stale".to_string());
+        }
+        if health.clock_drift.state == HealthState::Unhealthy {
+            reasons.push(format!("clock_drift_ms={}", health.clock_drift.drift_ms));
+        }
+        if health.rest.state == HealthState::Unhealthy {
+            reasons.push(format!(
+                "rest_consecutive_failures={}",
+                health.rest.consecutive_failures
+            ));
+        }
+
+        if reasons.is_empty() {
+            None
+        } else {
+            Some(format!("hard health block triggered: {}", reasons.join(", ")))
+        }
     }
 
     async fn has_market_data_resync_backlog(&self) -> bool {
@@ -1120,6 +1226,15 @@ fn risk_context_health_mode(health: &SystemHealth, runtime_state: RuntimeState) 
         domain::RiskMode::Paused
     } else {
         domain::RiskMode::Normal
+    }
+}
+
+fn strategy_selection_label(selection: StrategySelection) -> &'static str {
+    match selection {
+        StrategySelection::MarketMaking => "market_making",
+        StrategySelection::Scalping => "scalping",
+        StrategySelection::Standby => "standby",
+        StrategySelection::RiskOff => "risk_off",
     }
 }
 
@@ -1501,6 +1616,10 @@ mod tests {
         assert_eq!(runtime.state(), RuntimeState::Reduced);
         assert!(runtime.health().fallback_active);
         assert_eq!(runtime.health().market_ws.reconnect_count, 1);
+        assert!(runtime
+            .state_snapshot()
+            .reason
+            .contains("market_ws=Degraded"));
     }
 
     #[tokio::test]
@@ -1538,6 +1657,10 @@ mod tests {
             symbol: Symbol::BtcUsdc,
             trade_id: "runtime-recovery-fill".to_string(),
         }));
+        assert!(runtime
+            .state_snapshot()
+            .reason
+            .contains("pending_fill_recoveries=1"));
 
         gateway
             .seed_fills(

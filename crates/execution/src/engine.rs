@@ -140,8 +140,11 @@ struct ExecutionAggregate {
     total_submitted: u64,
     total_rejected: u64,
     total_canceled: u64,
+    total_manual_cancels: u64,
     total_filled_reports: u64,
     total_stale_cancels: u64,
+    total_duplicate_intents: u64,
+    total_equivalent_order_skips: u64,
     fill_ratio_sum: Decimal,
     fill_ratio_samples: u64,
     slippage_bps_sum: Decimal,
@@ -206,12 +209,16 @@ where
         {
             let mut state = self.state.write().await;
             if state.processed_intents.contains(&intent.intent_id) {
+                state.aggregate.total_duplicate_intents =
+                    state.aggregate.total_duplicate_intents.saturating_add(1);
                 warn!(intent_id = intent.intent_id, "duplicate intent skipped by execution engine");
                 return Ok(None);
             }
 
             if let Some(existing_client_order_id) = find_equivalent_open_order(&state, &request) {
                 state.processed_intents.insert(intent.intent_id.clone());
+                state.aggregate.total_equivalent_order_skips =
+                    state.aggregate.total_equivalent_order_skips.saturating_add(1);
                 info!(
                     symbol = %request.symbol,
                     client_order_id = request.client_order_id,
@@ -276,7 +283,7 @@ where
             }
         };
 
-        info!(?symbol, canceled, "cancel-all completed");
+        info!(?symbol, canceled, cancel_kind = "manual", "cancel-all completed");
         Ok(())
     }
 
@@ -303,6 +310,14 @@ where
             self.gateway.cancel_all_orders(symbol).await?;
             let mut state = self.state.write().await;
             let count = mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Stale);
+            if count > 0 {
+                info!(
+                    symbol = %symbol,
+                    canceled = count,
+                    cancel_kind = "stale",
+                    "stale orders canceled after execution-quality evaluation"
+                );
+            }
             canceled += count;
         }
 
@@ -616,9 +631,15 @@ fn mark_symbol_canceled(
         tracked.request.symbol != symbol && !client_order_ids.contains(client_order_id)
     });
     state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(count as u64);
-    if matches!(cancel_kind, PendingCancelKind::Stale) {
-        state.aggregate.total_stale_cancels =
-            state.aggregate.total_stale_cancels.saturating_add(count as u64);
+    match cancel_kind {
+        PendingCancelKind::Manual => {
+            state.aggregate.total_manual_cancels =
+                state.aggregate.total_manual_cancels.saturating_add(count as u64);
+        }
+        PendingCancelKind::Stale => {
+            state.aggregate.total_stale_cancels =
+                state.aggregate.total_stale_cancels.saturating_add(count as u64);
+        }
     }
 
     count
@@ -626,8 +647,13 @@ fn mark_symbol_canceled(
 
 fn undo_pending_cancel(aggregate: &mut ExecutionAggregate, cancel_kind: PendingCancelKind) {
     aggregate.total_canceled = aggregate.total_canceled.saturating_sub(1);
-    if matches!(cancel_kind, PendingCancelKind::Stale) {
-        aggregate.total_stale_cancels = aggregate.total_stale_cancels.saturating_sub(1);
+    match cancel_kind {
+        PendingCancelKind::Manual => {
+            aggregate.total_manual_cancels = aggregate.total_manual_cancels.saturating_sub(1);
+        }
+        PendingCancelKind::Stale => {
+            aggregate.total_stale_cancels = aggregate.total_stale_cancels.saturating_sub(1);
+        }
     }
 }
 
@@ -660,8 +686,11 @@ fn build_stats(aggregate: &ExecutionAggregate) -> ExecutionStats {
         total_submitted: aggregate.total_submitted,
         total_rejected: aggregate.total_rejected,
         total_canceled: aggregate.total_canceled,
+        total_manual_cancels: aggregate.total_manual_cancels,
         total_filled_reports: aggregate.total_filled_reports,
         total_stale_cancels: aggregate.total_stale_cancels,
+        total_duplicate_intents: aggregate.total_duplicate_intents,
+        total_equivalent_order_skips: aggregate.total_equivalent_order_skips,
         reject_rate: if aggregate.total_submitted == 0 {
             Decimal::ZERO
         } else {
@@ -1147,5 +1176,28 @@ mod tests {
         assert!(second_report.is_none());
         assert_eq!(gateway.placed_orders().await.len(), 1);
         assert_eq!(engine.open_orders().await.len(), 1);
+        let stats = engine.stats().await;
+        assert_eq!(stats.total_equivalent_order_skips, 1);
+        assert_eq!(stats.total_duplicate_intents, 0);
+    }
+
+    #[tokio::test]
+    async fn execution_stats_capture_duplicate_intents_and_manual_cancels() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        let first_intent = sample_intent("intent-1", Symbol::BtcUsdc, Side::Buy, dec("100"), dec("0.010"));
+        let first_decision = sample_decision(first_intent.clone());
+        let first_report = engine.execute(first_decision.clone()).await.unwrap();
+        assert!(first_report.is_some());
+
+        let duplicate_report = engine.execute(first_decision).await.unwrap();
+        assert!(duplicate_report.is_none());
+
+        engine.cancel_all(Some(Symbol::BtcUsdc)).await.unwrap();
+
+        let stats = engine.stats().await;
+        assert_eq!(stats.total_duplicate_intents, 1);
+        assert_eq!(stats.total_manual_cancels, 1);
     }
 }
