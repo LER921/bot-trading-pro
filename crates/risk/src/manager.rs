@@ -140,25 +140,43 @@ impl StrictRiskManager {
 
     fn projected_symbol_exposure_quote(
         &self,
-        projected_positions: &HashMap<Symbol, Decimal>,
+        inventory: &HashMap<Symbol, InventorySnapshot>,
+        projected_open_buys: &HashMap<Symbol, Decimal>,
+        projected_open_sells: &HashMap<Symbol, Decimal>,
         context: &RiskContext,
         symbol: Symbol,
     ) -> Decimal {
-        projected_positions
-            .get(&symbol)
-            .copied()
-            .unwrap_or(Decimal::ZERO)
-            .abs()
-            * self.mark_price_for_symbol(context, symbol)
+        worst_case_symbol_inventory(
+            inventory
+                .get(&symbol)
+                .map(|snapshot| snapshot.base_position)
+                .unwrap_or(Decimal::ZERO),
+            projected_open_buys
+                .get(&symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+            projected_open_sells
+                .get(&symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO),
+        ) * self.mark_price_for_symbol(context, symbol)
     }
 
     fn total_projected_exposure_quote(
         &self,
-        projected_positions: &HashMap<Symbol, Decimal>,
+        inventory: &HashMap<Symbol, InventorySnapshot>,
+        projected_open_buys: &HashMap<Symbol, Decimal>,
+        projected_open_sells: &HashMap<Symbol, Decimal>,
         context: &RiskContext,
     ) -> Decimal {
-        projected_positions.iter().fold(Decimal::ZERO, |acc, (symbol, position)| {
-            acc + position.abs() * self.mark_price_for_symbol(context, *symbol)
+        self.limits.per_symbol.iter().fold(Decimal::ZERO, |acc, limits| {
+            acc + self.projected_symbol_exposure_quote(
+                inventory,
+                projected_open_buys,
+                projected_open_sells,
+                context,
+                limits.symbol,
+            )
         })
     }
 
@@ -210,11 +228,8 @@ impl RiskManager for StrictRiskManager {
         let health_block = self.is_health_blocking(&context.health);
         let drawdown_guard = self.check_drawdown_guard(context);
         let reject_rate_guard = self.check_reject_rate_guard(context);
-        let mut projected_positions: HashMap<Symbol, Decimal> = context
-            .inventory
-            .iter()
-            .map(|(symbol, inventory)| (*symbol, inventory.base_position))
-            .collect();
+        let (mut projected_open_buys, mut projected_open_sells) =
+            projected_open_quantities(&context.open_orders);
         let mut projected_open_orders: HashMap<Symbol, usize> = self
             .limits
             .per_symbol
@@ -264,13 +279,9 @@ impl RiskManager for StrictRiskManager {
                 continue;
             }
 
-            let current_position = projected_positions
-                .get(&intent.symbol)
-                .copied()
-                .or_else(|| {
-                    self.inventory_for_symbol(&context.inventory, intent.symbol)
-                        .map(|inventory| inventory.base_position)
-                })
+            let current_position = self
+                .inventory_for_symbol(&context.inventory, intent.symbol)
+                .map(|inventory| inventory.base_position)
                 .unwrap_or(Decimal::ZERO);
 
             if projected_open_orders
@@ -292,11 +303,40 @@ impl RiskManager for StrictRiskManager {
                 continue;
             }
 
-            let projected_after = project_inventory_position(current_position, &intent);
-            let mut candidate_positions = projected_positions.clone();
-            candidate_positions.insert(intent.symbol, projected_after);
+            let mut candidate_open_buys = projected_open_buys.clone();
+            let mut candidate_open_sells = projected_open_sells.clone();
+            match intent.side {
+                domain::Side::Buy => {
+                    *candidate_open_buys.entry(intent.symbol).or_default() += intent.quantity;
+                }
+                domain::Side::Sell => {
+                    *candidate_open_sells.entry(intent.symbol).or_default() += intent.quantity;
+                }
+            }
 
-            if self.projected_symbol_exposure_quote(&candidate_positions, context, intent.symbol)
+            let projected_sell_inventory = projected_inventory_after_sells(
+                current_position,
+                candidate_open_sells
+                    .get(&intent.symbol)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO),
+            );
+            if projected_sell_inventory < Decimal::ZERO {
+                decisions.push(block(
+                    intent,
+                    "projected sell quantity exceeds available base inventory",
+                    resulting_mode,
+                ));
+                continue;
+            }
+
+            if self.projected_symbol_exposure_quote(
+                &context.inventory,
+                &candidate_open_buys,
+                &candidate_open_sells,
+                context,
+                intent.symbol,
+            )
                 > symbol_limits.max_quote_notional
                 && !self.would_reduce_inventory(current_position, &intent)
             {
@@ -308,7 +348,30 @@ impl RiskManager for StrictRiskManager {
                 continue;
             }
 
-            if self.total_projected_exposure_quote(&candidate_positions, context)
+            let projected_symbol_inventory = worst_case_symbol_inventory(
+                current_position,
+                candidate_open_buys
+                    .get(&intent.symbol)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO),
+                candidate_open_sells
+                    .get(&intent.symbol)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO),
+            );
+            if projected_symbol_inventory > symbol_limits.max_inventory_base
+                && !self.would_reduce_inventory(current_position, &intent)
+            {
+                decisions.push(block(intent, "intent would breach max inventory", resulting_mode));
+                continue;
+            }
+
+            if self.total_projected_exposure_quote(
+                &context.inventory,
+                &candidate_open_buys,
+                &candidate_open_sells,
+                context,
+            )
                 > self.limits.max_total_exposure_quote
                 && !self.would_reduce_inventory(current_position, &intent)
             {
@@ -317,13 +380,6 @@ impl RiskManager for StrictRiskManager {
                     "projected total quote exposure exceeds limit",
                     resulting_mode,
                 ));
-                continue;
-            }
-
-            if projected_after.abs() > symbol_limits.max_inventory_base
-                && !self.would_reduce_inventory(current_position, &intent)
-            {
-                decisions.push(block(intent, "intent would breach max inventory", resulting_mode));
                 continue;
             }
 
@@ -339,10 +395,16 @@ impl RiskManager for StrictRiskManager {
                         RiskAction::Approve
                     };
 
-                    projected_positions.insert(
-                        intent.symbol,
-                        project_inventory_position(current_position, &approved_intent),
-                    );
+                    match approved_intent.side {
+                        domain::Side::Buy => {
+                            *projected_open_buys.entry(intent.symbol).or_default() +=
+                                approved_intent.quantity;
+                        }
+                        domain::Side::Sell => {
+                            *projected_open_sells.entry(intent.symbol).or_default() +=
+                                approved_intent.quantity;
+                        }
+                    }
                     *projected_open_orders.entry(intent.symbol).or_default() += 1;
 
                     decisions.push(RiskDecision {
@@ -411,10 +473,50 @@ fn block(intent: TradeIntent, reason: &str, resulting_mode: RiskMode) -> RiskDec
     }
 }
 
-fn project_inventory_position(position: Decimal, intent: &TradeIntent) -> Decimal {
-    match intent.side {
-        domain::Side::Buy => position + intent.quantity,
-        domain::Side::Sell => position - intent.quantity,
+fn projected_open_quantities(
+    open_orders: &[OpenOrder],
+) -> (HashMap<Symbol, Decimal>, HashMap<Symbol, Decimal>) {
+    let mut buys = HashMap::new();
+    let mut sells = HashMap::new();
+
+    for order in open_orders.iter().filter(|order| order.status.is_open()) {
+        let remaining_quantity = remaining_open_quantity(order);
+        if remaining_quantity <= Decimal::ZERO {
+            continue;
+        }
+
+        match order.side {
+            domain::Side::Buy => {
+                *buys.entry(order.symbol).or_default() += remaining_quantity;
+            }
+            domain::Side::Sell => {
+                *sells.entry(order.symbol).or_default() += remaining_quantity;
+            }
+        }
+    }
+
+    (buys, sells)
+}
+
+fn remaining_open_quantity(order: &OpenOrder) -> Decimal {
+    (order.original_quantity - order.executed_quantity).max(Decimal::ZERO)
+}
+
+fn projected_inventory_after_sells(position: Decimal, pending_sells: Decimal) -> Decimal {
+    position - pending_sells
+}
+
+fn worst_case_symbol_inventory(
+    position: Decimal,
+    pending_buys: Decimal,
+    pending_sells: Decimal,
+) -> Decimal {
+    let upper = (position + pending_buys).abs();
+    let lower = (position - pending_sells).abs();
+    if upper >= lower {
+        upper
+    } else {
+        lower
     }
 }
 
@@ -512,6 +614,21 @@ mod tests {
             reason: "test".to_string(),
             created_at: now_utc(),
             expires_at: None,
+        }
+    }
+
+    fn sample_open_order(side: domain::Side, quantity: &str) -> OpenOrder {
+        OpenOrder {
+            client_order_id: format!("open-{side:?}-{quantity}"),
+            exchange_order_id: Some("exchange-1".to_string()),
+            symbol: Symbol::BtcUsdc,
+            side,
+            price: Some(Decimal::from(60_000u32)),
+            original_quantity: Decimal::from_str_exact(quantity).unwrap(),
+            executed_quantity: Decimal::ZERO,
+            status: domain::OrderStatus::New,
+            reduce_only: false,
+            updated_at: now_utc(),
         }
     }
 
@@ -633,5 +750,52 @@ mod tests {
 
         let decisions = manager.evaluate(vec![sample_intent()], &context).await.unwrap();
         assert_eq!(decisions[0].action, RiskAction::Block);
+    }
+
+    #[tokio::test]
+    async fn blocks_when_existing_open_buys_already_consume_inventory_headroom() {
+        let mut limits = sample_limits();
+        limits.per_symbol[0].max_inventory_base = Decimal::from_str_exact("0.015").unwrap();
+        limits.per_symbol[0].max_quote_notional = Decimal::from(2_000u32);
+        let manager = StrictRiskManager::new(limits);
+        let mut context = sample_context();
+        context.open_orders.push(sample_open_order(domain::Side::Buy, "0.010"));
+
+        let mut intent = sample_intent();
+        intent.quantity = Decimal::from_str_exact("0.010").unwrap();
+
+        let decisions = manager.evaluate(vec![intent], &context).await.unwrap();
+
+        assert_eq!(decisions[0].action, RiskAction::Block);
+        assert_eq!(decisions[0].reason, "intent would breach max inventory");
+    }
+
+    #[tokio::test]
+    async fn blocks_sell_that_would_exceed_base_left_after_existing_asks() {
+        let manager = StrictRiskManager::new(sample_limits());
+        let mut context = sample_context();
+        context.inventory.insert(
+            Symbol::BtcUsdc,
+            inventory_snapshot(
+                Symbol::BtcUsdc,
+                Decimal::from_str_exact("0.010").unwrap(),
+                Decimal::from(60_000u32),
+            ),
+        );
+        context
+            .open_orders
+            .push(sample_open_order(domain::Side::Sell, "0.010"));
+
+        let mut intent = sample_intent();
+        intent.side = domain::Side::Sell;
+        intent.quantity = Decimal::from_str_exact("0.001").unwrap();
+
+        let decisions = manager.evaluate(vec![intent], &context).await.unwrap();
+
+        assert_eq!(decisions[0].action, RiskAction::Block);
+        assert_eq!(
+            decisions[0].reason,
+            "projected sell quantity exceeds available base inventory"
+        );
     }
 }
