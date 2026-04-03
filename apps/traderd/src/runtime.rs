@@ -1,12 +1,13 @@
 use crate::{HealthTracker, RuntimeStateMachine};
 use accounting::{AccountingService, InMemoryAccountingService};
 use anyhow::{bail, Context, Result};
-use common::{Decimal, now_utc};
+use common::{Decimal, Timestamp, now_utc};
 use config_loader::AppConfig;
 use domain::{
-    ControlPlaneDecision, ControlPlaneRequest, ExecutionReport, ExitStage, HealthState,
-    IntentRole, InventorySnapshot, MarketSnapshot, OpenOrder, OperatorCommand,
-    PositionExitEvent, RuntimeState, StrategyContext, Symbol, SymbolBudget, SystemHealth,
+    ControlPlaneDecision, ControlPlaneRequest, ExecutionReport, ExitStage, FillMarkoutRecord,
+    FillQualitySnapshot, HealthState, IntentRole, InventorySnapshot, MarketSnapshot, OpenOrder,
+    OperatorCommand, PositionExitEvent, RuntimeState, StrategyContext, Symbol, SymbolBudget,
+    SystemHealth,
 };
 use execution::{BinanceExecutionEngine, ExecutionEngine};
 use exchange_binance_spot::{
@@ -18,7 +19,7 @@ use market_data::{InMemoryMarketDataService, MarketDataService};
 use portfolio::{InMemoryPortfolioService, PortfolioService};
 use regime::{ExecutionRegimeDetector, RegimeDetector};
 use risk::{RiskContext, RiskManager, StrictRiskManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,7 +44,33 @@ struct ExitMetadata {
     intent_role: Option<IntentRole>,
     exit_stage: Option<ExitStage>,
     exit_reason: Option<String>,
+    edge_after_cost_bps: Option<Decimal>,
+    expected_realized_edge_bps: Option<Decimal>,
+    adverse_selection_penalty_bps: Option<Decimal>,
+    setup_type: Option<String>,
+    size_tier: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct PendingFillMarkout {
+    fill: domain::FillEvent,
+    intent_role: Option<IntentRole>,
+    setup_type: Option<String>,
+    size_tier: Option<String>,
+    edge_after_cost_bps: Option<Decimal>,
+    expected_realized_edge_bps: Option<Decimal>,
+    adverse_selection_penalty_bps: Option<Decimal>,
+    markout_500ms_bps: Option<Decimal>,
+    markout_1s_bps: Option<Decimal>,
+    markout_3s_bps: Option<Decimal>,
+    markout_5s_bps: Option<Decimal>,
+}
+
+const MARKOUT_500MS: i64 = 500;
+const MARKOUT_1S: i64 = 1_000;
+const MARKOUT_3S: i64 = 3_000;
+const MARKOUT_5S: i64 = 5_000;
+const MAX_FILL_MARKOUT_HISTORY: usize = 256;
 
 impl FillKey {
     fn from_fill(fill: &domain::FillEvent) -> Self {
@@ -59,6 +86,66 @@ impl FillKey {
             trade_id: recovery.trade_id.clone(),
         }
     }
+}
+
+impl PendingFillMarkout {
+    fn into_record(self, recorded_at: Timestamp) -> FillMarkoutRecord {
+        let markout_500ms_bps = self.markout_500ms_bps.unwrap_or_default();
+        let markout_1s_bps = self.markout_1s_bps.unwrap_or(markout_500ms_bps);
+        let markout_3s_bps = self.markout_3s_bps.unwrap_or(markout_1s_bps);
+        let markout_5s_bps = self.markout_5s_bps.unwrap_or(markout_3s_bps);
+        let weighted_markout = markout_500ms_bps * dec("0.35")
+            + markout_1s_bps * dec("0.25")
+            + markout_3s_bps * dec("0.20")
+            + markout_5s_bps * dec("0.20");
+        let expected_realized_edge_bps = self.expected_realized_edge_bps.unwrap_or_default();
+        let adverse_selection_hit =
+            markout_500ms_bps <= dec("-0.30") || markout_1s_bps <= dec("-0.35");
+        let positive_markout = weighted_markout > Decimal::ZERO;
+        let fill_quality_score = weighted_markout
+            - self.adverse_selection_penalty_bps.unwrap_or_default() * dec("0.20")
+            + if positive_markout { dec("0.10") } else { -dec("0.10") }
+            - if adverse_selection_hit { dec("0.25") } else { Decimal::ZERO }
+            + expected_realized_edge_bps * dec("0.15");
+
+        FillMarkoutRecord {
+            trade_id: self.fill.trade_id,
+            order_id: self.fill.order_id,
+            symbol: self.fill.symbol,
+            side: self.fill.side,
+            intent_role: self.intent_role,
+            setup_type: self.setup_type,
+            size_tier: self.size_tier,
+            edge_after_cost_bps: self.edge_after_cost_bps,
+            expected_realized_edge_bps: self.expected_realized_edge_bps,
+            adverse_selection_penalty_bps: self.adverse_selection_penalty_bps,
+            fill_price: self.fill.price,
+            quantity: self.fill.quantity,
+            markout_500ms_bps,
+            markout_1s_bps,
+            markout_3s_bps,
+            markout_5s_bps,
+            positive_markout,
+            adverse_selection_hit,
+            fill_quality_score,
+            recorded_at,
+        }
+    }
+}
+
+fn markout_bps(fill: &domain::FillEvent, mid_price: Decimal) -> Decimal {
+    if fill.price <= Decimal::ZERO || mid_price <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+
+    match fill.side {
+        domain::Side::Buy => ((mid_price - fill.price) / fill.price) * Decimal::from(10_000u32),
+        domain::Side::Sell => ((fill.price - mid_price) / fill.price) * Decimal::from(10_000u32),
+    }
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
 }
 
 pub struct TraderRuntime<G>
@@ -82,6 +169,8 @@ where
     telemetry: TracingTelemetry,
     seen_fills: HashSet<FillKey>,
     pending_fill_recoveries: HashMap<FillKey, BinanceFillRecoveryRequest>,
+    pending_fill_markouts: HashMap<FillKey, PendingFillMarkout>,
+    fill_quality_history: HashMap<Symbol, VecDeque<FillMarkoutRecord>>,
     exit_metadata_by_exchange_order_id: HashMap<String, ExitMetadata>,
     operator_pause_active: bool,
     consecutive_cycle_failures: u32,
@@ -142,6 +231,8 @@ where
             telemetry: TracingTelemetry,
             seen_fills: HashSet::new(),
             pending_fill_recoveries: HashMap::new(),
+            pending_fill_markouts: HashMap::new(),
+            fill_quality_history: HashMap::new(),
             exit_metadata_by_exchange_order_id: HashMap::new(),
             operator_pause_active,
             consecutive_cycle_failures: 0,
@@ -282,6 +373,7 @@ where
                 .await?;
             self.portfolio.apply_mark_price(symbol, mark_price).await?;
         }
+        self.resolve_pending_fill_markouts(&mid_prices).await?;
         let inventory_map = self.collect_inventory().await;
         let budgets = self.collect_budgets().await;
         let inventory_snapshots = inventory_map.values().cloned().collect::<Vec<_>>();
@@ -347,6 +439,7 @@ where
                 symbol,
                 best_bid_ask: snapshot.best_bid_ask.clone(),
                 features: feature_snapshot,
+                fill_quality: self.fill_quality_snapshot(symbol),
                 regime,
                 inventory,
                 soft_inventory_base: pair.soft_inventory_base,
@@ -831,6 +924,7 @@ where
             .unwrap_or_else(|| empty_inventory(fill.symbol));
         self.maybe_persist_position_exit_event(&before_inventory, &after_inventory, &fill)
             .await?;
+        self.register_fill_markout(fill_key, fill);
         Ok(true)
     }
 
@@ -1221,12 +1315,156 @@ where
                     intent_role: report.intent_role,
                     exit_stage: report.exit_stage,
                     exit_reason: report.exit_reason.clone().or_else(|| report.message.clone()),
+                    edge_after_cost_bps: report.edge_after_cost_bps,
+                    expected_realized_edge_bps: report.expected_realized_edge_bps,
+                    adverse_selection_penalty_bps: report.adverse_selection_penalty_bps,
+                    setup_type: report.setup_type.clone(),
+                    size_tier: report.size_tier.clone(),
                 },
             );
         }
         self.storage.persist_execution_report(report).await?;
         self.telemetry.emit_execution_report(report).await?;
         Ok(())
+    }
+
+    fn register_fill_markout(&mut self, fill_key: FillKey, fill: domain::FillEvent) {
+        let Some(metadata) = self.exit_metadata_by_exchange_order_id.get(&fill.order_id).cloned() else {
+            return;
+        };
+
+        self.pending_fill_markouts.insert(
+            fill_key,
+            PendingFillMarkout {
+                fill,
+                intent_role: metadata.intent_role,
+                setup_type: metadata.setup_type,
+                size_tier: metadata.size_tier,
+                edge_after_cost_bps: metadata.edge_after_cost_bps,
+                expected_realized_edge_bps: metadata.expected_realized_edge_bps,
+                adverse_selection_penalty_bps: metadata.adverse_selection_penalty_bps,
+                markout_500ms_bps: None,
+                markout_1s_bps: None,
+                markout_3s_bps: None,
+                markout_5s_bps: None,
+            },
+        );
+    }
+
+    async fn resolve_pending_fill_markouts(
+        &mut self,
+        mid_prices: &HashMap<Symbol, Decimal>,
+    ) -> Result<()> {
+        if self.pending_fill_markouts.is_empty() {
+            return Ok(());
+        }
+
+        let observed_at = now_utc();
+        let mut completed = Vec::new();
+        for (key, pending) in self.pending_fill_markouts.iter_mut() {
+            let Some(mid_price) = mid_prices.get(&pending.fill.symbol).copied() else {
+                continue;
+            };
+            if mid_price <= Decimal::ZERO || pending.fill.price <= Decimal::ZERO {
+                continue;
+            }
+
+            let elapsed_ms = (observed_at - pending.fill.event_time).whole_milliseconds() as i64;
+            if pending.markout_500ms_bps.is_none() && elapsed_ms >= MARKOUT_500MS {
+                pending.markout_500ms_bps = Some(markout_bps(&pending.fill, mid_price));
+            }
+            if pending.markout_1s_bps.is_none() && elapsed_ms >= MARKOUT_1S {
+                pending.markout_1s_bps = Some(markout_bps(&pending.fill, mid_price));
+            }
+            if pending.markout_3s_bps.is_none() && elapsed_ms >= MARKOUT_3S {
+                pending.markout_3s_bps = Some(markout_bps(&pending.fill, mid_price));
+            }
+            if pending.markout_5s_bps.is_none() && elapsed_ms >= MARKOUT_5S {
+                pending.markout_5s_bps = Some(markout_bps(&pending.fill, mid_price));
+            }
+
+            if pending.markout_5s_bps.is_some() {
+                completed.push(key.clone());
+            }
+        }
+
+        for key in completed {
+            let Some(pending) = self.pending_fill_markouts.remove(&key) else {
+                continue;
+            };
+            let record = pending.into_record(observed_at);
+            self.storage.persist_fill_markout(&record).await?;
+            self.fill_quality_history
+                .entry(record.symbol)
+                .or_default()
+                .push_back(record);
+            if let Some(history) = self.fill_quality_history.get_mut(&key.symbol) {
+                while history.len() > MAX_FILL_MARKOUT_HISTORY {
+                    history.pop_front();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fill_quality_snapshot(&self, symbol: Symbol) -> FillQualitySnapshot {
+        let Some(history) = self.fill_quality_history.get(&symbol) else {
+            return FillQualitySnapshot::default();
+        };
+
+        let records = history
+            .iter()
+            .filter(|record| matches!(record.intent_role, Some(IntentRole::AddRisk)))
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return FillQualitySnapshot::default();
+        }
+
+        let sample_count = Decimal::from(records.len() as u64);
+        let avg_markout_500ms_bps = records
+            .iter()
+            .fold(Decimal::ZERO, |acc, record| acc + record.markout_500ms_bps)
+            / sample_count;
+        let avg_markout_1s_bps = records
+            .iter()
+            .fold(Decimal::ZERO, |acc, record| acc + record.markout_1s_bps)
+            / sample_count;
+        let avg_markout_3s_bps = records
+            .iter()
+            .fold(Decimal::ZERO, |acc, record| acc + record.markout_3s_bps)
+            / sample_count;
+        let avg_markout_5s_bps = records
+            .iter()
+            .fold(Decimal::ZERO, |acc, record| acc + record.markout_5s_bps)
+            / sample_count;
+        let positive_markout_rate = Decimal::from(
+            records
+                .iter()
+                .filter(|record| record.positive_markout)
+                .count() as u64,
+        ) / sample_count;
+        let adverse_selection_rate = Decimal::from(
+            records
+                .iter()
+                .filter(|record| record.adverse_selection_hit)
+                .count() as u64,
+        ) / sample_count;
+        let fill_quality_score = records
+            .iter()
+            .fold(Decimal::ZERO, |acc, record| acc + record.fill_quality_score)
+            / sample_count;
+
+        FillQualitySnapshot {
+            avg_markout_500ms_bps,
+            avg_markout_1s_bps,
+            avg_markout_3s_bps,
+            avg_markout_5s_bps,
+            positive_markout_rate,
+            adverse_selection_rate,
+            fill_quality_score,
+            samples: records.len() as u64,
+        }
     }
 
     async fn maybe_persist_position_exit_event(
@@ -1683,6 +1921,8 @@ mod tests {
                 edge_after_cost_bps: Some(Decimal::from_str_exact("1.25").unwrap()),
                 expected_realized_edge_bps: Some(Decimal::from_str_exact("0.78").unwrap()),
                 adverse_selection_penalty_bps: Some(Decimal::from_str_exact("0.22").unwrap()),
+                setup_type: Some("passive_long_favorable".to_string()),
+                size_tier: Some("normal_size".to_string()),
                 intent_role: Some(IntentRole::AddRisk),
                 exit_stage: None,
                 exit_reason: None,

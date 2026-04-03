@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use async_trait::async_trait;
 use common::Decimal;
 use domain::{
-    AccountSnapshot, ExecutionReport, ExecutionStats, FillEvent, InventorySnapshot, PnlSnapshot,
-    PositionExitEvent, RiskDecision, RuntimeTransition, StrategyContext, StrategyOutcome,
-    SymbolBudget, SystemHealth,
+    AccountSnapshot, ExecutionReport, ExecutionStats, FillEvent, FillMarkoutRecord,
+    InventorySnapshot, PnlSnapshot, PositionExitEvent, RiskDecision, RuntimeTransition,
+    StrategyContext, StrategyOutcome, SymbolBudget, SystemHealth,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
@@ -23,6 +23,7 @@ pub trait StorageEngine: Send + Sync {
     async fn persist_execution_report(&self, report: &ExecutionReport) -> Result<()>;
     async fn persist_execution_stats(&self, stats: &ExecutionStats) -> Result<()>;
     async fn persist_fill(&self, fill: &FillEvent) -> Result<()>;
+    async fn persist_fill_markout(&self, record: &FillMarkoutRecord) -> Result<()>;
     async fn persist_inventory_snapshots(
         &self,
         inventory: &[InventorySnapshot],
@@ -99,6 +100,14 @@ impl StorageEngine for MemoryStorage {
             .write()
             .await
             .push(format!("fill {} {}", fill.symbol, fill.trade_id));
+        Ok(())
+    }
+
+    async fn persist_fill_markout(&self, record: &FillMarkoutRecord) -> Result<()> {
+        self.events.write().await.push(format!(
+            "fill-markout {} {} {}",
+            record.symbol, record.trade_id, record.fill_quality_score
+        ));
         Ok(())
     }
 
@@ -276,6 +285,8 @@ impl SqliteStorage {
                         edge_after_cost_bps TEXT,
                         expected_realized_edge_bps TEXT,
                         adverse_selection_penalty_bps TEXT,
+                        setup_type TEXT,
+                        size_tier TEXT,
                         intent_role TEXT,
                         exit_stage TEXT,
                         exit_reason TEXT
@@ -334,6 +345,10 @@ impl SqliteStorage {
                     "TEXT",
                 )
                 .await?;
+                add_column_if_missing(&self.pool, "execution_reports", "setup_type", "TEXT")
+                    .await?;
+                add_column_if_missing(&self.pool, "execution_reports", "size_tier", "TEXT")
+                    .await?;
                 add_column_if_missing(
                     &self.pool,
                     "execution_reports",
@@ -510,6 +525,36 @@ impl SqliteStorage {
                 .execute(&self.pool)
                 .await?;
                 add_column_if_missing(&self.pool, "fills", "fee_quote", "TEXT").await?;
+
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS fill_markouts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        recorded_at TEXT NOT NULL,
+                        trade_id TEXT NOT NULL,
+                        order_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        intent_role TEXT,
+                        setup_type TEXT,
+                        size_tier TEXT,
+                        edge_after_cost_bps TEXT,
+                        expected_realized_edge_bps TEXT,
+                        adverse_selection_penalty_bps TEXT,
+                        fill_price TEXT NOT NULL,
+                        quantity TEXT NOT NULL,
+                        markout_500ms_bps TEXT NOT NULL,
+                        markout_1s_bps TEXT NOT NULL,
+                        markout_3s_bps TEXT NOT NULL,
+                        markout_5s_bps TEXT NOT NULL,
+                        positive_markout INTEGER NOT NULL,
+                        adverse_selection_hit INTEGER NOT NULL,
+                        fill_quality_score TEXT NOT NULL
+                    );
+                    "#,
+                )
+                .execute(&self.pool)
+                .await?;
 
                 sqlx::query(
                     r#"
@@ -911,8 +956,8 @@ impl StorageEngine for SqliteStorage {
                 slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                 submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
                 edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
-                intent_role, exit_stage, exit_reason, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                setup_type, size_tier, intent_role, exit_stage, exit_reason, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(report.event_time.to_string())
@@ -933,6 +978,8 @@ impl StorageEngine for SqliteStorage {
         .bind(report.edge_after_cost_bps.map(|value| value.to_string()))
         .bind(report.expected_realized_edge_bps.map(|value| value.to_string()))
         .bind(report.adverse_selection_penalty_bps.map(|value| value.to_string()))
+        .bind(&report.setup_type)
+        .bind(&report.size_tier)
         .bind(report.intent_role.map(|value| format!("{value:?}")))
         .bind(report.exit_stage.map(|value| format!("{value:?}")))
         .bind(&report.exit_reason)
@@ -1007,6 +1054,44 @@ impl StorageEngine for SqliteStorage {
         .bind(fill.fee.to_string())
         .bind(&fill.fee_asset)
         .bind(fill.fee_quote.map(|value| value.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn persist_fill_markout(&self, record: &FillMarkoutRecord) -> Result<()> {
+        self.ensure_schema().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO fill_markouts (
+                recorded_at, trade_id, order_id, symbol, side, intent_role,
+                setup_type, size_tier, edge_after_cost_bps, expected_realized_edge_bps,
+                adverse_selection_penalty_bps, fill_price, quantity,
+                markout_500ms_bps, markout_1s_bps, markout_3s_bps, markout_5s_bps,
+                positive_markout, adverse_selection_hit, fill_quality_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(record.recorded_at.to_string())
+        .bind(&record.trade_id)
+        .bind(&record.order_id)
+        .bind(record.symbol.as_str())
+        .bind(format!("{:?}", record.side))
+        .bind(record.intent_role.map(|value| format!("{value:?}")))
+        .bind(&record.setup_type)
+        .bind(&record.size_tier)
+        .bind(record.edge_after_cost_bps.map(|value| value.to_string()))
+        .bind(record.expected_realized_edge_bps.map(|value| value.to_string()))
+        .bind(record.adverse_selection_penalty_bps.map(|value| value.to_string()))
+        .bind(record.fill_price.to_string())
+        .bind(record.quantity.to_string())
+        .bind(record.markout_500ms_bps.to_string())
+        .bind(record.markout_1s_bps.to_string())
+        .bind(record.markout_3s_bps.to_string())
+        .bind(record.markout_5s_bps.to_string())
+        .bind(if record.positive_markout { 1_i64 } else { 0_i64 })
+        .bind(if record.adverse_selection_hit { 1_i64 } else { 0_i64 })
+        .bind(record.fill_quality_score.to_string())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1220,8 +1305,7 @@ impl StorageEngine for SqliteStorage {
             .map(|intent| intent.reason.clone())
             .unwrap_or_else(|| standby_reason.clone());
 
-        sqlx::query(
-            r#"
+        let strategy_outcomes_insert = r#"
             INSERT INTO strategy_outcomes (
                 observed_at, symbol, strategy, status, standby_reason, entry_block_reason, intent_count,
                 best_edge_after_cost_bps, best_expected_realized_edge_bps, reduce_only_intents, sample_reason,
@@ -1233,9 +1317,11 @@ impl StorageEngine for SqliteStorage {
                 timeout_exit_intents, reversal_exit_intents, inventory_pressure_exit_intents,
                 adverse_exit_intents, profit_capture_exit_intents, adverse_selection_hits, oldest_inventory_age_ms,
                 stale_inventory_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#;
+        validate_insert_bind_count("strategy_outcomes", strategy_outcomes_insert, 37)?;
+
+        sqlx::query(strategy_outcomes_insert)
         .bind(context.features.computed_at.to_string())
         .bind(context.symbol.as_str())
         .bind(strategy)
@@ -1331,6 +1417,20 @@ impl StorageEngine for SqliteStorage {
     }
 }
 
+fn validate_insert_bind_count(table: &str, statement: &str, expected_columns: usize) -> Result<()> {
+    let placeholders = statement.matches('?').count();
+    debug_assert_eq!(
+        expected_columns,
+        placeholders,
+        "{table} insert placeholder mismatch"
+    );
+    ensure!(
+        placeholders == expected_columns,
+        "{table} insert placeholder mismatch: {placeholders} values for {expected_columns} columns"
+    );
+    Ok(())
+}
+
 async fn add_column_if_missing(
     pool: &Pool<Sqlite>,
     table: &str,
@@ -1368,8 +1468,9 @@ mod tests {
     use super::*;
     use common::{Decimal, now_utc};
     use domain::{
-        AccountSnapshot, Balance, ExecutionReport, ExitStage, IntentRole, OrderStatus,
-        PositionExitEvent, RuntimeState, RuntimeTransition, Symbol, SymbolPnlSnapshot,
+        AccountSnapshot, Balance, ExecutionReport, ExitStage, FillMarkoutRecord, IntentRole,
+        OrderStatus, PositionExitEvent, RuntimeState, RuntimeTransition, Side, Symbol,
+        SymbolPnlSnapshot,
     };
     use tokio::fs;
 
@@ -1407,6 +1508,8 @@ mod tests {
                 edge_after_cost_bps: Some(Decimal::from_str_exact("1.10").unwrap()),
                 expected_realized_edge_bps: Some(Decimal::from_str_exact("0.72").unwrap()),
                 adverse_selection_penalty_bps: Some(Decimal::from_str_exact("0.18").unwrap()),
+                setup_type: Some("passive_long_favorable".to_string()),
+                size_tier: Some("normal_size".to_string()),
                 intent_role: Some(IntentRole::AddRisk),
                 exit_stage: None,
                 exit_reason: None,
@@ -1512,5 +1615,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.count_rows("position_exit_events").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_storage_persists_fill_markouts() {
+        let temp_dir = std::env::temp_dir().join("bot_trading_pro_storage_test_fill_markouts");
+        let _ = fs::remove_dir_all(&temp_dir).await;
+        let storage = SqliteStorage::new(temp_dir.join("bot.db")).unwrap();
+
+        storage
+            .persist_fill_markout(&FillMarkoutRecord {
+                trade_id: "t-1".to_string(),
+                order_id: "o-1".to_string(),
+                symbol: Symbol::BtcUsdc,
+                side: Side::Buy,
+                intent_role: Some(IntentRole::AddRisk),
+                setup_type: Some("passive_long_favorable".to_string()),
+                size_tier: Some("normal_size".to_string()),
+                edge_after_cost_bps: Some(dec("0.90")),
+                expected_realized_edge_bps: Some(dec("0.55")),
+                adverse_selection_penalty_bps: Some(dec("0.18")),
+                fill_price: dec("66690"),
+                quantity: dec("0.002"),
+                markout_500ms_bps: dec("0.25"),
+                markout_1s_bps: dec("0.20"),
+                markout_3s_bps: dec("0.10"),
+                markout_5s_bps: dec("0.05"),
+                positive_markout: true,
+                adverse_selection_hit: false,
+                fill_quality_score: dec("0.32"),
+                recorded_at: now_utc(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.count_rows("fill_markouts").await.unwrap(), 1);
     }
 }

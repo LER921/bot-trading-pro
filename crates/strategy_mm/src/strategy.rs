@@ -626,6 +626,8 @@ fn build_intent(
         edge_after_cost_bps,
         expected_realized_edge_bps,
         adverse_selection_penalty_bps,
+        setup_type: Some(intent_setup_type(side, role, &reason)),
+        size_tier: Some(intent_size_tier(context, quantity)),
         reason,
         created_at: now_utc(),
         expires_at,
@@ -794,6 +796,34 @@ fn standby(reason: &str) -> StrategyOutcome {
         entry_block_reason: None,
         best_expected_realized_edge_bps: None,
         adverse_selection_hits: 0,
+    }
+}
+
+fn intent_setup_type(side: Side, role: IntentRole, reason: &str) -> String {
+    match role {
+        IntentRole::AddRisk if reason.contains("probing") => "probe_entry".to_string(),
+        IntentRole::AddRisk if matches!(side, Side::Buy) => "passive_long_favorable".to_string(),
+        IntentRole::PassiveProfitTake => "passive_profit_take".to_string(),
+        IntentRole::ReduceRisk => "inventory_reduce".to_string(),
+        IntentRole::DefensiveExit => "defensive_exit".to_string(),
+        IntentRole::ForcedUnwind => "forced_unwind".to_string(),
+        IntentRole::EmergencyExit => "emergency_exit".to_string(),
+        _ => "passive_quote".to_string(),
+    }
+}
+
+fn intent_size_tier(context: &StrategyContext, quantity: Decimal) -> String {
+    if quantity <= Decimal::ZERO || context.soft_inventory_base <= Decimal::ZERO {
+        return "zero_size".to_string();
+    }
+
+    let ratio = quantity / context.soft_inventory_base;
+    if ratio <= dec("0.30") {
+        "probe_size".to_string()
+    } else if ratio <= dec("0.75") {
+        "normal_size".to_string()
+    } else {
+        "strong_signal_size".to_string()
     }
 }
 
@@ -1105,9 +1135,11 @@ mod tests {
                 local_momentum_bps: dec("0.40"),
                 liquidity_score: dec("7000"),
                 toxicity_score: dec("0.20"),
+                microstructure: MicrostructureSnapshot::default(),
                 volatility_regime: VolatilityRegime::Low,
                 computed_at: now_utc(),
             },
+            fill_quality: FillQualitySnapshot::default(),
             regime: RegimeDecision {
                 symbol: Symbol::BtcUsdc,
                 state: RegimeState::Range,

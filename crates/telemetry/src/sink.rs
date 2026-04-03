@@ -2,8 +2,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use common::Decimal;
 use domain::{
-    ExecutionReport, ExecutionStats, FeatureSnapshot, HealthState, PnlSnapshot, RegimeDecision,
-    RiskAction, RiskDecision, RuntimeSnapshot, StrategyContext, StrategyOutcome, SystemHealth,
+    ExecutionReport, ExecutionStats, FeatureSnapshot, HealthState, PnlSnapshot,
+    RegimeDecision, RiskAction, RiskDecision, RuntimeSnapshot, StrategyContext,
+    StrategyOutcome, SystemHealth,
 };
 
 #[async_trait]
@@ -116,6 +117,15 @@ impl TelemetrySink for TracingTelemetry {
             orderbook_imbalance = ?features.orderbook_imbalance,
             vwap_distance_bps = %features.vwap_distance_bps,
             toxicity_score = %features.toxicity_score,
+            flow_microstructure = %format!(
+                "f250={} f500={} f1s={} drift500={} drift1s={} instab={}",
+                features.microstructure.flow.trade_flow_imbalance_250ms,
+                features.microstructure.flow.trade_flow_imbalance_500ms,
+                features.microstructure.flow.trade_flow_imbalance_1s,
+                features.microstructure.book.micro_mid_drift_500ms_bps,
+                features.microstructure.book.micro_mid_drift_1s_bps,
+                features.microstructure.book.book_instability_score
+            ),
             volatility_regime = ?features.volatility_regime,
             "features"
         );
@@ -140,6 +150,20 @@ impl TelemetrySink for TracingTelemetry {
         outcome: &StrategyOutcome,
     ) -> Result<()> {
         let diagnostic = strategy_outcome_diagnostic(strategy, outcome);
+        let selected_setups = join_fields(
+            &outcome
+                .intents
+                .iter()
+                .filter_map(|intent| intent.setup_type.as_deref())
+                .collect::<Vec<_>>(),
+        );
+        let size_tiers = join_fields(
+            &outcome
+                .intents
+                .iter()
+                .filter_map(|intent| intent.size_tier.as_deref())
+                .collect::<Vec<_>>(),
+        );
         tracing::info!(
             symbol = %context.symbol,
             strategy = strategy,
@@ -158,6 +182,12 @@ impl TelemetrySink for TracingTelemetry {
             local_momentum_bps = %context.features.local_momentum_bps,
             trade_flow_imbalance = %context.features.trade_flow_imbalance,
             orderbook_imbalance = ?context.features.orderbook_imbalance,
+            fill_quality_score = %context.fill_quality.fill_quality_score,
+            adverse_selection_rate = %context.fill_quality.adverse_selection_rate,
+            best_expected_realized_edge_bps = ?outcome.best_expected_realized_edge_bps,
+            entry_block_reason = ?outcome.entry_block_reason,
+            selected_setups = selected_setups,
+            size_tiers = size_tiers,
             "strategy outcome"
         );
         Ok(())
@@ -209,6 +239,10 @@ impl TelemetrySink for TracingTelemetry {
             submit_to_first_report_ms = ?report.submit_to_first_report_ms,
             submit_to_fill_ms = ?report.submit_to_fill_ms,
             exchange_order_age_ms = ?report.exchange_order_age_ms,
+            expected_realized_edge_bps = ?report.expected_realized_edge_bps,
+            adverse_selection_penalty_bps = ?report.adverse_selection_penalty_bps,
+            setup_type = ?report.setup_type,
+            size_tier = ?report.size_tier,
             message = report.message.as_deref().unwrap_or(""),
             "execution report"
         );
@@ -579,9 +613,11 @@ mod tests {
                 local_momentum_bps: dec("5.0"),
                 liquidity_score: dec("5000"),
                 toxicity_score: dec("0.20"),
+                microstructure: MicrostructureSnapshot::default(),
                 volatility_regime: VolatilityRegime::Low,
                 computed_at: now_utc(),
             },
+            fill_quality: FillQualitySnapshot::default(),
             regime: RegimeDecision {
                 symbol: Symbol::BtcUsdc,
                 state: RegimeState::Range,
@@ -629,6 +665,10 @@ mod tests {
             expected_fee_bps: dec("0.75"),
             expected_slippage_bps: dec("0.25"),
             edge_after_cost_bps: dec("2.0"),
+            expected_realized_edge_bps: dec("1.8"),
+            adverse_selection_penalty_bps: dec("0.2"),
+            setup_type: Some("passive_long_favorable".to_string()),
+            size_tier: Some("normal_size".to_string()),
             reason: "mm bid gated by edge after costs recovered".to_string(),
             created_at: now_utc(),
             expires_at: Some(now_utc()),

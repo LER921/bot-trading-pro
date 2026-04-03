@@ -44,6 +44,8 @@ pub struct OrderRequest {
     pub edge_after_cost_bps: Option<Decimal>,
     pub expected_realized_edge_bps: Option<Decimal>,
     pub adverse_selection_penalty_bps: Option<Decimal>,
+    pub setup_type: Option<String>,
+    pub size_tier: Option<String>,
     pub source_intent_id: String,
 }
 
@@ -83,6 +85,8 @@ pub struct ExecutionReport {
     pub edge_after_cost_bps: Option<Decimal>,
     pub expected_realized_edge_bps: Option<Decimal>,
     pub adverse_selection_penalty_bps: Option<Decimal>,
+    pub setup_type: Option<String>,
+    pub size_tier: Option<String>,
     pub intent_role: Option<IntentRole>,
     pub exit_stage: Option<ExitStage>,
     pub exit_reason: Option<String>,
@@ -188,4 +192,28 @@ pub struct FillEvent {
     pub fee_quote: Option<Decimal>,
     pub liquidity_side: LiquiditySide,
     pub event_time: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FillMarkoutRecord {
+    pub trade_id: String,
+    pub order_id: String,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub intent_role: Option<IntentRole>,
+    pub setup_type: Option<String>,
+    pub size_tier: Option<String>,
+    pub edge_after_cost_bps: Option<Decimal>,
+    pub expected_realized_edge_bps: Option<Decimal>,
+    pub adverse_selection_penalty_bps: Option<Decimal>,
+    pub fill_price: Decimal,
+    pub quantity: Decimal,
+    pub markout_500ms_bps: Decimal,
+    pub markout_1s_bps: Decimal,
+    pub markout_3s_bps: Decimal,
+    pub markout_5s_bps: Decimal,
+    pub positive_markout: bool,
+    pub adverse_selection_hit: bool,
+    pub fill_quality_score: Decimal,
+    pub recorded_at: Timestamp,
 }

@@ -1,7 +1,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use common::{Decimal, Timestamp, now_utc};
-use domain::{FeatureSnapshot, MarketSnapshot, Symbol, VolatilityRegime};
+use domain::{
+    BookDynamicsFeatures, FeatureSnapshot, FlowFeatures, MarketSnapshot,
+    MicrostructureSnapshot, Symbol, VolatilityRegime,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -16,6 +19,10 @@ const MOMENTUM_1S_WINDOW_SECS: i64 = 1;
 const MOMENTUM_5S_WINDOW_SECS: i64 = 5;
 const MOMENTUM_15S_WINDOW_SECS: i64 = 15;
 const MIN_RATE_WINDOW_MS: i64 = 1_000;
+const FLOW_250MS_WINDOW_MS: i64 = 250;
+const FLOW_500MS_WINDOW_MS: i64 = 500;
+const FLOW_1S_WINDOW_MS: i64 = 1_000;
+const BOOK_ACTIVITY_WINDOW_MS: i64 = 1_000;
 
 #[async_trait]
 pub trait FeatureEngine: Send + Sync {
@@ -28,11 +35,42 @@ struct TimedDecimal {
     value: Decimal,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TimedBookObservation {
+    at: Timestamp,
+    best_bid_price: Decimal,
+    best_ask_price: Decimal,
+    best_bid_quantity: Decimal,
+    best_ask_quantity: Decimal,
+    micro_mid: Decimal,
+    bid_depth_l3_quote: Decimal,
+    ask_depth_l3_quote: Decimal,
+    bid_depth_l5_quote: Decimal,
+    ask_depth_l5_quote: Decimal,
+    orderbook_imbalance_l3: Decimal,
+    orderbook_imbalance_l5: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimedBookActivity {
+    at: Timestamp,
+    bid_add_quote: Decimal,
+    ask_add_quote: Decimal,
+    bid_cancel_quote: Decimal,
+    ask_cancel_quote: Decimal,
+    best_bid_changed: bool,
+    best_ask_changed: bool,
+}
+
 #[derive(Debug, Default, Clone)]
 struct SymbolFeatureState {
     mid_history: VecDeque<TimedDecimal>,
     spread_history: VecDeque<TimedDecimal>,
     imbalance_history: VecDeque<TimedDecimal>,
+    book_history: VecDeque<TimedBookObservation>,
+    activity_history: VecDeque<TimedBookActivity>,
+    best_bid_persist_since: Option<Timestamp>,
+    best_ask_persist_since: Option<Timestamp>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -52,19 +90,49 @@ impl FeatureEngine for RollingFeatureEngine {
         let current_imbalance = current_imbalance(snapshot);
         let vwap_window = trades_in_window(&snapshot.recent_trades, anchor_time, VWAP_WINDOW_SECS);
         let trade_window = trades_in_window(&snapshot.recent_trades, anchor_time, TRADE_RATE_WINDOW_SECS);
+        let flow_250ms_window = trades_in_window_ms(&snapshot.recent_trades, anchor_time, FLOW_250MS_WINDOW_MS);
+        let flow_500ms_window = trades_in_window_ms(&snapshot.recent_trades, anchor_time, FLOW_500MS_WINDOW_MS);
+        let flow_1s_window = trades_in_window_ms(&snapshot.recent_trades, anchor_time, FLOW_1S_WINDOW_MS);
+        let current_book_observation = current_book_observation(snapshot, anchor_time);
 
         let mut state = self.state.write().await;
         let entry = state.entry(snapshot.symbol).or_default();
+        let previous_book_observation = entry.book_history.back().copied();
         push_point(&mut entry.mid_history, anchor_time, current_mid);
         push_point(&mut entry.spread_history, anchor_time, current_spread_bps);
         push_point(&mut entry.imbalance_history, anchor_time, current_imbalance);
         prune_points(&mut entry.mid_history, anchor_time);
         prune_points(&mut entry.spread_history, anchor_time);
         prune_points(&mut entry.imbalance_history, anchor_time);
+        if let Some(current_book_observation) = current_book_observation {
+            update_best_quote_persistence(
+                &mut entry.best_bid_persist_since,
+                previous_book_observation.map(|observation| observation.best_bid_price),
+                current_book_observation.best_bid_price,
+                anchor_time,
+            );
+            update_best_quote_persistence(
+                &mut entry.best_ask_persist_since,
+                previous_book_observation.map(|observation| observation.best_ask_price),
+                current_book_observation.best_ask_price,
+                anchor_time,
+            );
+            push_book_observation(&mut entry.book_history, current_book_observation);
+            if let Some(activity) =
+                book_activity(previous_book_observation, current_book_observation, anchor_time)
+            {
+                push_book_activity(&mut entry.activity_history, activity);
+            }
+        }
+        prune_book_observations(&mut entry.book_history, anchor_time);
+        prune_book_activity(&mut entry.activity_history, anchor_time);
 
         let mid_window = points_in_window(&entry.mid_history, anchor_time, REALIZED_VOL_WINDOW_SECS);
         let spread_window = points_in_window(&entry.spread_history, anchor_time, SPREAD_WINDOW_SECS);
         let imbalance_window = points_in_window(&entry.imbalance_history, anchor_time, IMBALANCE_WINDOW_SECS);
+        let book_window = book_observations_in_window(&entry.book_history, anchor_time, FEATURE_HISTORY_SECS);
+        let book_activity_window =
+            book_activity_in_window(&entry.activity_history, anchor_time, BOOK_ACTIVITY_WINDOW_MS);
 
         let vwap = vwap_from_trades(&vwap_window)
             .or_else(|| snapshot.last_trade.as_ref().map(|trade| trade.price))
@@ -117,6 +185,20 @@ impl FeatureEngine for RollingFeatureEngine {
             spread_zscore,
             realized_volatility_bps,
         );
+        let flow_features = build_flow_features(
+            &flow_250ms_window,
+            &flow_500ms_window,
+            &flow_1s_window,
+        );
+        let book_dynamics = build_book_dynamics(
+            current_book_observation,
+            &book_window,
+            &book_activity_window,
+            entry.best_bid_persist_since,
+            entry.best_ask_persist_since,
+            anchor_time,
+            &flow_features,
+        );
 
         Ok(FeatureSnapshot {
             symbol: snapshot.symbol,
@@ -142,6 +224,10 @@ impl FeatureEngine for RollingFeatureEngine {
             local_momentum_bps,
             liquidity_score,
             toxicity_score,
+            microstructure: MicrostructureSnapshot {
+                flow: flow_features,
+                book: book_dynamics,
+            },
             volatility_regime,
             computed_at,
         })
@@ -206,6 +292,19 @@ fn trades_in_window(
         .collect()
 }
 
+fn trades_in_window_ms(
+    trades: &[domain::MarketTrade],
+    anchor_time: Timestamp,
+    window_ms: i64,
+) -> Vec<domain::MarketTrade> {
+    let cutoff = anchor_time - time::Duration::milliseconds(window_ms);
+    trades
+        .iter()
+        .filter(|trade| trade.received_at >= cutoff && trade.received_at <= anchor_time)
+        .cloned()
+        .collect()
+}
+
 fn current_mid(snapshot: &MarketSnapshot) -> Decimal {
     if let Some(best) = &snapshot.best_bid_ask {
         return (best.bid_price + best.ask_price) / Decimal::from(2u32);
@@ -250,6 +349,341 @@ fn microprice(best: &domain::BestBidAsk) -> Option<Decimal> {
                 / total_qty,
         )
     }
+}
+
+fn current_book_observation(
+    snapshot: &MarketSnapshot,
+    at: Timestamp,
+) -> Option<TimedBookObservation> {
+    let best = snapshot.best_bid_ask.as_ref()?;
+    let micro_mid = microprice(best).unwrap_or((best.bid_price + best.ask_price) / Decimal::from(2u32));
+    let (bid_depth_l3_quote, ask_depth_l3_quote, orderbook_imbalance_l3) =
+        depth_imbalance_from_snapshot(snapshot, 3);
+    let (bid_depth_l5_quote, ask_depth_l5_quote, orderbook_imbalance_l5) =
+        depth_imbalance_from_snapshot(snapshot, 5);
+
+    Some(TimedBookObservation {
+        at,
+        best_bid_price: best.bid_price,
+        best_ask_price: best.ask_price,
+        best_bid_quantity: best.bid_quantity,
+        best_ask_quantity: best.ask_quantity,
+        micro_mid,
+        bid_depth_l3_quote,
+        ask_depth_l3_quote,
+        bid_depth_l5_quote,
+        ask_depth_l5_quote,
+        orderbook_imbalance_l3,
+        orderbook_imbalance_l5,
+    })
+}
+
+fn depth_imbalance_from_snapshot(
+    snapshot: &MarketSnapshot,
+    depth: usize,
+) -> (Decimal, Decimal, Decimal) {
+    let Some(orderbook) = &snapshot.orderbook else {
+        let Some(best) = &snapshot.best_bid_ask else {
+            return (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        };
+        let bid_quote = best.bid_price * best.bid_quantity;
+        let ask_quote = best.ask_price * best.ask_quantity;
+        return (bid_quote, ask_quote, imbalance_from_quotes(bid_quote, ask_quote));
+    };
+
+    let bid_quote = orderbook
+        .bids
+        .iter()
+        .take(depth)
+        .fold(Decimal::ZERO, |acc, level| acc + level.price * level.quantity);
+    let ask_quote = orderbook
+        .asks
+        .iter()
+        .take(depth)
+        .fold(Decimal::ZERO, |acc, level| acc + level.price * level.quantity);
+    (bid_quote, ask_quote, imbalance_from_quotes(bid_quote, ask_quote))
+}
+
+fn imbalance_from_quotes(bid_quote: Decimal, ask_quote: Decimal) -> Decimal {
+    let total = bid_quote + ask_quote;
+    if total.is_zero() {
+        Decimal::ZERO
+    } else {
+        (bid_quote - ask_quote) / total
+    }
+}
+
+fn update_best_quote_persistence(
+    persist_since: &mut Option<Timestamp>,
+    previous_price: Option<Decimal>,
+    current_price: Decimal,
+    anchor_time: Timestamp,
+) {
+    match previous_price {
+        Some(previous_price) if previous_price == current_price => {
+            *persist_since = persist_since.or(Some(anchor_time));
+        }
+        _ => *persist_since = Some(anchor_time),
+    }
+}
+
+fn push_book_observation(history: &mut VecDeque<TimedBookObservation>, observation: TimedBookObservation) {
+    match history.back_mut() {
+        Some(last) if last.at == observation.at => *last = observation,
+        Some(last) if last.at > observation.at => {}
+        _ => history.push_back(observation),
+    }
+}
+
+fn push_book_activity(history: &mut VecDeque<TimedBookActivity>, activity: TimedBookActivity) {
+    match history.back_mut() {
+        Some(last) if last.at == activity.at => *last = activity,
+        Some(last) if last.at > activity.at => {}
+        _ => history.push_back(activity),
+    }
+}
+
+fn prune_book_observations(history: &mut VecDeque<TimedBookObservation>, anchor_time: Timestamp) {
+    let cutoff = anchor_time - time::Duration::seconds(FEATURE_HISTORY_SECS);
+    while matches!(history.front(), Some(point) if point.at < cutoff) {
+        history.pop_front();
+    }
+}
+
+fn prune_book_activity(history: &mut VecDeque<TimedBookActivity>, anchor_time: Timestamp) {
+    let cutoff = anchor_time - time::Duration::seconds(FEATURE_HISTORY_SECS);
+    while matches!(history.front(), Some(point) if point.at < cutoff) {
+        history.pop_front();
+    }
+}
+
+fn book_observations_in_window(
+    history: &VecDeque<TimedBookObservation>,
+    anchor_time: Timestamp,
+    window_secs: i64,
+) -> Vec<TimedBookObservation> {
+    let cutoff = anchor_time - time::Duration::seconds(window_secs);
+    history
+        .iter()
+        .copied()
+        .filter(|point| point.at >= cutoff && point.at <= anchor_time)
+        .collect()
+}
+
+fn book_activity_in_window(
+    history: &VecDeque<TimedBookActivity>,
+    anchor_time: Timestamp,
+    window_ms: i64,
+) -> Vec<TimedBookActivity> {
+    let cutoff = anchor_time - time::Duration::milliseconds(window_ms);
+    history
+        .iter()
+        .copied()
+        .filter(|point| point.at >= cutoff && point.at <= anchor_time)
+        .collect()
+}
+
+fn book_activity(
+    previous: Option<TimedBookObservation>,
+    current: TimedBookObservation,
+    at: Timestamp,
+) -> Option<TimedBookActivity> {
+    let previous = previous?;
+    let bid_delta = current.bid_depth_l3_quote - previous.bid_depth_l3_quote;
+    let ask_delta = current.ask_depth_l3_quote - previous.ask_depth_l3_quote;
+    Some(TimedBookActivity {
+        at,
+        bid_add_quote: bid_delta.max(Decimal::ZERO),
+        ask_add_quote: ask_delta.max(Decimal::ZERO),
+        bid_cancel_quote: (-bid_delta).max(Decimal::ZERO),
+        ask_cancel_quote: (-ask_delta).max(Decimal::ZERO),
+        best_bid_changed: previous.best_bid_price != current.best_bid_price,
+        best_ask_changed: previous.best_ask_price != current.best_ask_price,
+    })
+}
+
+fn build_flow_features(
+    flow_250ms_window: &[domain::MarketTrade],
+    flow_500ms_window: &[domain::MarketTrade],
+    flow_1s_window: &[domain::MarketTrade],
+) -> FlowFeatures {
+    let (buy_500ms, sell_500ms) = split_trade_notional(flow_500ms_window);
+    let (buy_1s, sell_1s) = split_trade_notional(flow_1s_window);
+    FlowFeatures {
+        trade_flow_imbalance_250ms: trade_flow_imbalance(flow_250ms_window),
+        trade_flow_imbalance_500ms: trade_flow_imbalance(flow_500ms_window),
+        trade_flow_imbalance_1s: trade_flow_imbalance(flow_1s_window),
+        market_buy_notional_500ms: buy_500ms,
+        market_sell_notional_500ms: sell_500ms,
+        market_buy_notional_1s: buy_1s,
+        market_sell_notional_1s: sell_1s,
+    }
+}
+
+fn split_trade_notional(trades: &[domain::MarketTrade]) -> (Decimal, Decimal) {
+    let buy = trades
+        .iter()
+        .filter(|trade| matches!(trade.aggressor_side, domain::Side::Buy))
+        .fold(Decimal::ZERO, |acc, trade| acc + trade.price * trade.quantity);
+    let sell = trades
+        .iter()
+        .filter(|trade| matches!(trade.aggressor_side, domain::Side::Sell))
+        .fold(Decimal::ZERO, |acc, trade| acc + trade.price * trade.quantity);
+    (buy, sell)
+}
+
+fn build_book_dynamics(
+    current: Option<TimedBookObservation>,
+    history: &[TimedBookObservation],
+    activity: &[TimedBookActivity],
+    best_bid_persist_since: Option<Timestamp>,
+    best_ask_persist_since: Option<Timestamp>,
+    anchor_time: Timestamp,
+    flow: &FlowFeatures,
+) -> BookDynamicsFeatures {
+    let Some(current) = current else {
+        return BookDynamicsFeatures::default();
+    };
+    let book_rate_window_secs = Decimal::from(BOOK_ACTIVITY_WINDOW_MS.max(MIN_RATE_WINDOW_MS))
+        / Decimal::from(1_000u32);
+    let bid_add_rate = activity
+        .iter()
+        .fold(Decimal::ZERO, |acc, point| acc + point.bid_add_quote)
+        / book_rate_window_secs;
+    let ask_add_rate = activity
+        .iter()
+        .fold(Decimal::ZERO, |acc, point| acc + point.ask_add_quote)
+        / book_rate_window_secs;
+    let bid_cancel_rate = activity
+        .iter()
+        .fold(Decimal::ZERO, |acc, point| acc + point.bid_cancel_quote)
+        / book_rate_window_secs;
+    let ask_cancel_rate = activity
+        .iter()
+        .fold(Decimal::ZERO, |acc, point| acc + point.ask_cancel_quote)
+        / book_rate_window_secs;
+    let best_bid_persistence_ms = best_bid_persist_since
+        .map(|since| (anchor_time - since).whole_milliseconds() as i64)
+        .unwrap_or_default();
+    let best_ask_persistence_ms = best_ask_persist_since
+        .map(|since| (anchor_time - since).whole_milliseconds() as i64)
+        .unwrap_or_default();
+    let micro_mid_drift_500ms_bps =
+        drift_bps(history, current.micro_mid, anchor_time, time::Duration::milliseconds(500));
+    let micro_mid_drift_1s_bps =
+        drift_bps(history, current.micro_mid, anchor_time, time::Duration::seconds(1));
+    let best_quote_change_count = activity
+        .iter()
+        .filter(|point| point.best_bid_changed || point.best_ask_changed)
+        .count() as u64;
+    let flicker_rate = Decimal::from(best_quote_change_count) / book_rate_window_secs;
+    let bid_absorption_score = clamp_unit(
+        normalized_score((-flow.trade_flow_imbalance_250ms).max(Decimal::ZERO), dec("0.05"), dec("0.55"))
+            * dec("0.40")
+            + normalized_score(current.orderbook_imbalance_l3, dec("0.02"), dec("0.25")) * dec("0.25")
+            + normalized_score(
+                (bid_add_rate - bid_cancel_rate).max(Decimal::ZERO),
+                dec("0.0"),
+                dec("2500"),
+            ) * dec("0.20")
+            + normalized_score(Decimal::from(best_bid_persistence_ms), dec("80"), dec("1000")) * dec("0.15"),
+    );
+    let ask_absorption_score = clamp_unit(
+        normalized_score(flow.trade_flow_imbalance_250ms.max(Decimal::ZERO), dec("0.05"), dec("0.55"))
+            * dec("0.40")
+            + normalized_score((-current.orderbook_imbalance_l3).max(Decimal::ZERO), dec("0.02"), dec("0.25"))
+                * dec("0.25")
+            + normalized_score(
+                (ask_add_rate - ask_cancel_rate).max(Decimal::ZERO),
+                dec("0.0"),
+                dec("2500"),
+            ) * dec("0.20")
+            + normalized_score(Decimal::from(best_ask_persistence_ms), dec("80"), dec("1000")) * dec("0.15"),
+    );
+    let bid_spoofing_score = clamp_unit(
+        normalized_score(bid_add_rate, dec("1500"), dec("7000")) * dec("0.45")
+            + normalized_score(bid_cancel_rate, dec("1200"), dec("6500")) * dec("0.35")
+            + (Decimal::ONE - normalized_score(Decimal::from(best_bid_persistence_ms), dec("40"), dec("400")))
+                * dec("0.20"),
+    );
+    let ask_spoofing_score = clamp_unit(
+        normalized_score(ask_add_rate, dec("1500"), dec("7000")) * dec("0.45")
+            + normalized_score(ask_cancel_rate, dec("1200"), dec("6500")) * dec("0.35")
+            + (Decimal::ONE - normalized_score(Decimal::from(best_ask_persistence_ms), dec("40"), dec("400")))
+                * dec("0.20"),
+    );
+    let bid_queue_quality = clamp_unit(
+        normalized_score(current.orderbook_imbalance_l3, dec("0.00"), dec("0.35")) * dec("0.40")
+            + normalized_score(Decimal::from(best_bid_persistence_ms), dec("80"), dec("1200")) * dec("0.25")
+            + normalized_score(
+                (bid_add_rate - bid_cancel_rate).max(Decimal::ZERO),
+                dec("0.0"),
+                dec("2500"),
+            ) * dec("0.20")
+            + (Decimal::ONE - bid_spoofing_score) * dec("0.15"),
+    );
+    let ask_queue_quality = clamp_unit(
+        normalized_score((-current.orderbook_imbalance_l3).max(Decimal::ZERO), dec("0.00"), dec("0.35"))
+            * dec("0.40")
+            + normalized_score(Decimal::from(best_ask_persistence_ms), dec("80"), dec("1200")) * dec("0.25")
+            + normalized_score(
+                (ask_add_rate - ask_cancel_rate).max(Decimal::ZERO),
+                dec("0.0"),
+                dec("2500"),
+            ) * dec("0.20")
+            + (Decimal::ONE - ask_spoofing_score) * dec("0.15"),
+    );
+    let book_instability_score = clamp_unit(
+        normalized_score(bid_cancel_rate + ask_cancel_rate, dec("1500"), dec("9000")) * dec("0.35")
+            + normalized_score(flicker_rate, dec("1.0"), dec("8.0")) * dec("0.25")
+            + normalized_score((current.orderbook_imbalance_l3 - current.orderbook_imbalance_l5).abs(), dec("0.03"), dec("0.25"))
+                * dec("0.20")
+            + normalized_score(
+                micro_mid_drift_500ms_bps.abs() + micro_mid_drift_1s_bps.abs(),
+                dec("0.5"),
+                dec("6.0"),
+            ) * dec("0.20"),
+    );
+
+    BookDynamicsFeatures {
+        orderbook_imbalance_l3: current.orderbook_imbalance_l3,
+        orderbook_imbalance_l5: current.orderbook_imbalance_l5,
+        bid_add_rate,
+        ask_add_rate,
+        bid_cancel_rate,
+        ask_cancel_rate,
+        best_bid_persistence_ms,
+        best_ask_persistence_ms,
+        micro_mid_drift_500ms_bps,
+        micro_mid_drift_1s_bps,
+        bid_absorption_score,
+        ask_absorption_score,
+        bid_spoofing_score,
+        ask_spoofing_score,
+        bid_queue_quality,
+        ask_queue_quality,
+        book_instability_score,
+    }
+}
+
+fn drift_bps(
+    history: &[TimedBookObservation],
+    current_value: Decimal,
+    anchor_time: Timestamp,
+    horizon: time::Duration,
+) -> Decimal {
+    if current_value.is_zero() || history.is_empty() {
+        return Decimal::ZERO;
+    }
+    let target = anchor_time - horizon;
+    let base = history
+        .iter()
+        .rev()
+        .find(|point| point.at <= target)
+        .or_else(|| history.first())
+        .map(|point| point.micro_mid)
+        .unwrap_or(current_value);
+    bps_distance(current_value, base)
 }
 
 fn vwap_from_trades(trades: &[domain::MarketTrade]) -> Option<Decimal> {
@@ -513,6 +947,33 @@ fn decimal_sqrt(value: Decimal) -> Option<Decimal> {
         guess = (guess + value / guess) / Decimal::from(2u32);
     }
     Some(guess)
+}
+
+fn normalized_score(value: Decimal, low: Decimal, high: Decimal) -> Decimal {
+    if high <= low {
+        return Decimal::ZERO;
+    }
+    if value <= low {
+        Decimal::ZERO
+    } else if value >= high {
+        Decimal::ONE
+    } else {
+        clamp_unit((value - low) / (high - low))
+    }
+}
+
+fn clamp_unit(value: Decimal) -> Decimal {
+    if value <= Decimal::ZERO {
+        Decimal::ZERO
+    } else if value >= Decimal::ONE {
+        Decimal::ONE
+    } else {
+        value
+    }
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
 }
 
 #[cfg(test)]

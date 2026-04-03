@@ -228,8 +228,20 @@ struct ExecutionStatsView {
 struct ExecutionQualityView {
     realized_edge_vs_expected_bps: Option<String>,
     expected_realized_edge_bps: Option<String>,
+    avg_markout_500ms_bps: Option<String>,
+    avg_markout_1s_bps: Option<String>,
+    avg_markout_3s_bps: Option<String>,
+    avg_markout_5s_bps: Option<String>,
     avg_markout_bps: Option<String>,
+    fill_quality_score: Option<String>,
+    positive_markout_rate: Option<String>,
+    adverse_selection_rate: Option<String>,
     adverse_selection_hits: u64,
+    favorable_fills: u64,
+    unfavorable_fills: u64,
+    passive_setup_fills: u64,
+    probe_setup_fills: u64,
+    absorption_reversal_fills: u64,
     samples: u64,
 }
 
@@ -255,6 +267,8 @@ struct ExecutionReportView {
     edge_after_cost_bps: Option<String>,
     expected_realized_edge_bps: Option<String>,
     adverse_selection_penalty_bps: Option<String>,
+    setup_type: Option<String>,
+    size_tier: Option<String>,
     intent_role: Option<String>,
     exit_stage: Option<String>,
     exit_reason: Option<String>,
@@ -280,6 +294,11 @@ struct FillView {
     fee: String,
     fee_asset: String,
     fee_quote: Option<String>,
+    setup_type: Option<String>,
+    size_tier: Option<String>,
+    markout_500ms_bps: Option<String>,
+    markout_1s_bps: Option<String>,
+    fill_quality_score: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -1111,7 +1130,7 @@ async fn fetch_recent_execution_reports(
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                        submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
                        edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
-                       intent_role, exit_stage, exit_reason, message
+                       setup_type, size_tier, intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 WHERE event_time >= ?
                 ORDER BY id DESC
@@ -1129,7 +1148,7 @@ async fn fetch_recent_execution_reports(
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                        submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
                        edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
-                       intent_role, exit_stage, exit_reason, message
+                       setup_type, size_tier, intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 ORDER BY id DESC
                 LIMIT 25
@@ -1156,7 +1175,7 @@ async fn fetch_open_orders(pool: &Pool<Sqlite>) -> Result<Vec<ExecutionReportVie
                    e.slippage_bps, e.decision_latency_ms, e.submit_ack_latency_ms,
                    e.submit_to_first_report_ms, e.submit_to_fill_ms, e.exchange_order_age_ms,
                    e.edge_after_cost_bps, e.expected_realized_edge_bps, e.adverse_selection_penalty_bps,
-                   e.intent_role, e.exit_stage, e.exit_reason, e.message
+                   e.setup_type, e.size_tier, e.intent_role, e.exit_stage, e.exit_reason, e.message
             FROM execution_reports e
             JOIN latest l ON l.max_id = e.id
             WHERE e.status IN ('New', 'PartiallyFilled')
@@ -1186,6 +1205,7 @@ async fn fetch_recent_fills(
                 )
                 SELECT f.event_time, f.trade_id, f.order_id, f.symbol, f.side, f.price, f.quantity,
                        f.fee, f.fee_asset, f.fee_quote,
+                       fm.setup_type, fm.size_tier, fm.markout_500ms_bps, fm.markout_1s_bps, fm.fill_quality_score,
                        CASE
                            WHEN er.client_order_id LIKE 'bot-%' THEN 'bot'
                            ELSE 'external'
@@ -1193,6 +1213,7 @@ async fn fetch_recent_fills(
                 FROM fills f
                 LEFT JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
                 LEFT JOIN execution_reports er ON er.id = lr.max_id
+                LEFT JOIN fill_markouts fm ON fm.trade_id = f.trade_id AND fm.order_id = f.order_id
                 WHERE f.event_time >= ?
                 ORDER BY f.id DESC
                 LIMIT 40
@@ -1212,6 +1233,7 @@ async fn fetch_recent_fills(
                 )
                 SELECT f.event_time, f.trade_id, f.order_id, f.symbol, f.side, f.price, f.quantity,
                        f.fee, f.fee_asset, f.fee_quote,
+                       fm.setup_type, fm.size_tier, fm.markout_500ms_bps, fm.markout_1s_bps, fm.fill_quality_score,
                        CASE
                            WHEN er.client_order_id LIKE 'bot-%' THEN 'bot'
                            ELSE 'external'
@@ -1219,6 +1241,7 @@ async fn fetch_recent_fills(
                 FROM fills f
                 LEFT JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
                 LEFT JOIN execution_reports er ON er.id = lr.max_id
+                LEFT JOIN fill_markouts fm ON fm.trade_id = f.trade_id AND fm.order_id = f.order_id
                 ORDER BY f.id DESC
                 LIMIT 40
                 "#,
@@ -1241,6 +1264,11 @@ async fn fetch_recent_fills(
             fee: row.get("fee"),
             fee_asset: row.get("fee_asset"),
             fee_quote: row.get("fee_quote"),
+            setup_type: row.get("setup_type"),
+            size_tier: row.get("size_tier"),
+            markout_500ms_bps: row.get("markout_500ms_bps"),
+            markout_1s_bps: row.get("markout_1s_bps"),
+            fill_quality_score: row.get("fill_quality_score"),
         })
         .collect())
 }
@@ -1253,33 +1281,15 @@ async fn fetch_execution_quality(
         if let Some(since) = session_started_at {
             sqlx::query(
                 r#"
-                WITH latest_reports AS (
-                    SELECT exchange_order_id, MAX(id) AS max_id
-                    FROM execution_reports
-                    WHERE exchange_order_id IS NOT NULL
-                    GROUP BY exchange_order_id
-                ),
-                latest_inventory AS (
-                    SELECT i.symbol, i.mark_price
-                    FROM inventory_snapshots i
-                    JOIN (
-                        SELECT symbol, MAX(id) AS max_id
-                        FROM inventory_snapshots
-                        GROUP BY symbol
-                    ) latest ON latest.max_id = i.id
-                )
-                SELECT f.symbol, f.side, f.price, f.quantity, li.mark_price,
-                       er.expected_realized_edge_bps, er.edge_after_cost_bps, er.intent_role
-                FROM fills f
-                JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
-                JOIN execution_reports er ON er.id = lr.max_id
-                LEFT JOIN latest_inventory li ON li.symbol = f.symbol
-                WHERE f.event_time >= ?
-                  AND er.client_order_id LIKE 'bot-%'
-                  AND er.intent_role = 'AddRisk'
-                  AND er.expected_realized_edge_bps IS NOT NULL
-                ORDER BY f.id DESC
-                LIMIT 80
+                SELECT expected_realized_edge_bps, markout_500ms_bps, markout_1s_bps,
+                       markout_3s_bps, markout_5s_bps, fill_quality_score,
+                       positive_markout, adverse_selection_hit, setup_type
+                FROM fill_markouts
+                WHERE recorded_at >= ?
+                  AND intent_role = 'AddRisk'
+                  AND expected_realized_edge_bps IS NOT NULL
+                ORDER BY rowid DESC
+                LIMIT 120
                 "#,
             )
             .bind(since)
@@ -1288,32 +1298,14 @@ async fn fetch_execution_quality(
         } else {
             sqlx::query(
                 r#"
-                WITH latest_reports AS (
-                    SELECT exchange_order_id, MAX(id) AS max_id
-                    FROM execution_reports
-                    WHERE exchange_order_id IS NOT NULL
-                    GROUP BY exchange_order_id
-                ),
-                latest_inventory AS (
-                    SELECT i.symbol, i.mark_price
-                    FROM inventory_snapshots i
-                    JOIN (
-                        SELECT symbol, MAX(id) AS max_id
-                        FROM inventory_snapshots
-                        GROUP BY symbol
-                    ) latest ON latest.max_id = i.id
-                )
-                SELECT f.symbol, f.side, f.price, f.quantity, li.mark_price,
-                       er.expected_realized_edge_bps, er.edge_after_cost_bps, er.intent_role
-                FROM fills f
-                JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
-                JOIN execution_reports er ON er.id = lr.max_id
-                LEFT JOIN latest_inventory li ON li.symbol = f.symbol
-                WHERE er.client_order_id LIKE 'bot-%'
-                  AND er.intent_role = 'AddRisk'
-                  AND er.expected_realized_edge_bps IS NOT NULL
-                ORDER BY f.id DESC
-                LIMIT 80
+                SELECT expected_realized_edge_bps, markout_500ms_bps, markout_1s_bps,
+                       markout_3s_bps, markout_5s_bps, fill_quality_score,
+                       positive_markout, adverse_selection_hit, setup_type
+                FROM fill_markouts
+                WHERE intent_role = 'AddRisk'
+                  AND expected_realized_edge_bps IS NOT NULL
+                ORDER BY rowid DESC
+                LIMIT 120
                 "#,
             )
             .fetch_all(pool)
@@ -1323,20 +1315,20 @@ async fn fetch_execution_quality(
 
     let mut samples = 0_u64;
     let mut adverse_selection_hits = 0_u64;
-    let mut realized_delta_sum = Decimal::ZERO;
     let mut expected_sum = Decimal::ZERO;
-    let mut markout_sum = Decimal::ZERO;
+    let mut realized_delta_sum = Decimal::ZERO;
+    let mut markout_500ms_sum = Decimal::ZERO;
+    let mut markout_1s_sum = Decimal::ZERO;
+    let mut markout_3s_sum = Decimal::ZERO;
+    let mut markout_5s_sum = Decimal::ZERO;
+    let mut weighted_markout_sum = Decimal::ZERO;
+    let mut fill_quality_score_sum = Decimal::ZERO;
+    let mut favorable_fills = 0_u64;
+    let mut passive_setup_fills = 0_u64;
+    let mut probe_setup_fills = 0_u64;
+    let mut absorption_reversal_fills = 0_u64;
 
     for row in rows {
-        let Some(fill_price) = parse_decimal_string(&row.get::<String, _>("price")) else {
-            continue;
-        };
-        let Some(mark_price_raw) = row.get::<Option<String>, _>("mark_price") else {
-            continue;
-        };
-        let Some(mark_price) = parse_decimal_string(&mark_price_raw) else {
-            continue;
-        };
         let Some(expected_realized_edge_bps_raw) =
             row.get::<Option<String>, _>("expected_realized_edge_bps")
         else {
@@ -1347,25 +1339,61 @@ async fn fetch_execution_quality(
         else {
             continue;
         };
-        if fill_price <= Decimal::ZERO {
+        let Some(markout_500ms_bps) =
+            parse_optional_decimal_column(&row, "markout_500ms_bps")
+        else {
             continue;
-        }
-
-        let side = row.get::<String, _>("side");
-        let markout_bps = if side.eq_ignore_ascii_case("Buy") {
-            ((mark_price - fill_price) / fill_price) * Decimal::from(10_000u32)
-        } else {
-            ((fill_price - mark_price) / fill_price) * Decimal::from(10_000u32)
         };
-
-        if markout_bps <= Decimal::from_str_exact("-0.30").unwrap() {
-            adverse_selection_hits = adverse_selection_hits.saturating_add(1);
-        }
+        let Some(markout_1s_bps) = parse_optional_decimal_column(&row, "markout_1s_bps") else {
+            continue;
+        };
+        let Some(markout_3s_bps) = parse_optional_decimal_column(&row, "markout_3s_bps") else {
+            continue;
+        };
+        let Some(markout_5s_bps) = parse_optional_decimal_column(&row, "markout_5s_bps") else {
+            continue;
+        };
+        let Some(fill_quality_score) =
+            parse_optional_decimal_column(&row, "fill_quality_score")
+        else {
+            continue;
+        };
+        let weighted_markout_bps = (markout_500ms_bps * dec("0.35"))
+            + (markout_1s_bps * dec("0.25"))
+            + (markout_3s_bps * dec("0.20"))
+            + (markout_5s_bps * dec("0.20"));
+        let positive_markout = row.get::<i64, _>("positive_markout") > 0;
+        let adverse_selection_hit = row.get::<i64, _>("adverse_selection_hit") > 0;
+        let setup_type = row.get::<Option<String>, _>("setup_type");
 
         samples = samples.saturating_add(1);
         expected_sum += expected_realized_edge_bps;
-        markout_sum += markout_bps;
-        realized_delta_sum += markout_bps - expected_realized_edge_bps;
+        markout_500ms_sum += markout_500ms_bps;
+        markout_1s_sum += markout_1s_bps;
+        markout_3s_sum += markout_3s_bps;
+        markout_5s_sum += markout_5s_bps;
+        weighted_markout_sum += weighted_markout_bps;
+        fill_quality_score_sum += fill_quality_score;
+        realized_delta_sum += weighted_markout_bps - expected_realized_edge_bps;
+
+        if adverse_selection_hit {
+            adverse_selection_hits = adverse_selection_hits.saturating_add(1);
+        }
+        if positive_markout {
+            favorable_fills = favorable_fills.saturating_add(1);
+        }
+        match setup_type.as_deref() {
+            Some("passive_long_favorable") => {
+                passive_setup_fills = passive_setup_fills.saturating_add(1);
+            }
+            Some("probe_entry") => {
+                probe_setup_fills = probe_setup_fills.saturating_add(1);
+            }
+            Some("absorption_reversal_long") => {
+                absorption_reversal_fills = absorption_reversal_fills.saturating_add(1);
+            }
+            _ => {}
+        }
     }
 
     Ok(if samples == 0 {
@@ -1377,8 +1405,24 @@ async fn fetch_execution_quality(
                 realized_delta_sum / sample_count,
             )),
             expected_realized_edge_bps: Some(decimal_to_string(expected_sum / sample_count)),
-            avg_markout_bps: Some(decimal_to_string(markout_sum / sample_count)),
+            avg_markout_500ms_bps: Some(decimal_to_string(markout_500ms_sum / sample_count)),
+            avg_markout_1s_bps: Some(decimal_to_string(markout_1s_sum / sample_count)),
+            avg_markout_3s_bps: Some(decimal_to_string(markout_3s_sum / sample_count)),
+            avg_markout_5s_bps: Some(decimal_to_string(markout_5s_sum / sample_count)),
+            avg_markout_bps: Some(decimal_to_string(weighted_markout_sum / sample_count)),
+            fill_quality_score: Some(decimal_to_string(fill_quality_score_sum / sample_count)),
+            positive_markout_rate: Some(decimal_to_string(
+                Decimal::from(favorable_fills) / sample_count,
+            )),
+            adverse_selection_rate: Some(decimal_to_string(
+                Decimal::from(adverse_selection_hits) / sample_count,
+            )),
             adverse_selection_hits,
+            favorable_fills,
+            unfavorable_fills: samples.saturating_sub(favorable_fills),
+            passive_setup_fills,
+            probe_setup_fills,
+            absorption_reversal_fills,
             samples,
         }
     })
@@ -1972,6 +2016,8 @@ fn map_execution_report(row: SqliteRow) -> ExecutionReportView {
         edge_after_cost_bps: row.get("edge_after_cost_bps"),
         expected_realized_edge_bps: row.get("expected_realized_edge_bps"),
         adverse_selection_penalty_bps: row.get("adverse_selection_penalty_bps"),
+        setup_type: row.get("setup_type"),
+        size_tier: row.get("size_tier"),
         intent_role: row.get("intent_role"),
         exit_stage: row.get("exit_stage"),
         exit_reason: row.get("exit_reason"),
@@ -2151,8 +2197,18 @@ fn parse_decimal_string(raw: &str) -> Option<Decimal> {
     Decimal::from_str_exact(raw).ok()
 }
 
+fn parse_optional_decimal_column(row: &SqliteRow, column: &str) -> Option<Decimal> {
+    row.get::<Option<String>, _>(column)
+        .as_deref()
+        .and_then(parse_decimal_string)
+}
+
 fn decimal_to_string(value: Decimal) -> String {
     value.normalize().to_string()
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
 }
 
 fn add_decimal_strings(left: &str, right: &str) -> Option<String> {
@@ -2296,6 +2352,8 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             edge_after_cost_bps TEXT,
             expected_realized_edge_bps TEXT,
             adverse_selection_penalty_bps TEXT,
+            setup_type TEXT,
+            size_tier TEXT,
             intent_role TEXT,
             exit_stage TEXT,
             exit_reason TEXT
@@ -2305,6 +2363,8 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
     add_column_if_missing(pool, "execution_reports", "message", "TEXT").await?;
+    add_column_if_missing(pool, "execution_reports", "setup_type", "TEXT").await?;
+    add_column_if_missing(pool, "execution_reports", "size_tier", "TEXT").await?;
     add_column_if_missing(pool, "execution_reports", "submit_ack_latency_ms", "INTEGER").await?;
     add_column_if_missing(
         pool,
@@ -2483,6 +2543,36 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
     add_column_if_missing(pool, "fills", "fee_quote", "TEXT").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fill_markouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at TEXT NOT NULL,
+            trade_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            intent_role TEXT,
+            setup_type TEXT,
+            size_tier TEXT,
+            edge_after_cost_bps TEXT,
+            expected_realized_edge_bps TEXT,
+            adverse_selection_penalty_bps TEXT,
+            fill_price TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            markout_500ms_bps TEXT NOT NULL,
+            markout_1s_bps TEXT NOT NULL,
+            markout_3s_bps TEXT NOT NULL,
+            markout_5s_bps TEXT NOT NULL,
+            positive_markout INTEGER NOT NULL,
+            adverse_selection_hit INTEGER NOT NULL,
+            fill_quality_score TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(
         r#"
@@ -3141,8 +3231,9 @@ mod tests {
                 event_time, client_order_id, exchange_order_id, symbol, status,
                 filled_quantity, average_fill_price, fill_ratio, requested_price,
                 slippage_bps, decision_latency_ms, submit_ack_latency_ms,
-                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                setup_type, size_tier, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(OffsetDateTime::UNIX_EPOCH.to_string())
@@ -3160,6 +3251,8 @@ mod tests {
         .bind(Some(95_i64))
         .bind(Some(410_i64))
         .bind(Some(5_200_i64))
+        .bind(Some("passive_long_favorable"))
+        .bind(Some("normal_size"))
         .bind(Some("filled"))
         .execute(&pool)
         .await
@@ -3176,6 +3269,8 @@ mod tests {
         assert_eq!(reports[0].submit_to_first_report_ms, Some(95));
         assert_eq!(reports[0].submit_to_fill_ms, Some(410));
         assert_eq!(reports[0].exchange_order_age_ms, Some(5_200));
+        assert_eq!(reports[0].setup_type.as_deref(), Some("passive_long_favorable"));
+        assert_eq!(reports[0].size_tier.as_deref(), Some("normal_size"));
     }
 
     #[tokio::test]
@@ -3185,76 +3280,12 @@ mod tests {
 
         sqlx::query(
             r#"
-            INSERT INTO inventory_snapshots (
-                observed_at, symbol, base_position, quote_position, mark_price, average_entry_price,
-                position_opened_at, last_fill_at, first_reduce_at, max_quote_notional,
-                reserved_quote_notional, soft_inventory_base, max_inventory_base,
-                neutralization_clip_fraction, reduce_only_trigger_ratio
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind((session_start + time::Duration::seconds(30)).to_string())
-        .bind("BTCUSDC")
-        .bind("0.010")
-        .bind("0")
-        .bind(Some("64990"))
-        .bind(Some("65000"))
-        .bind(Some(session_start.to_string()))
-        .bind(Some((session_start + time::Duration::seconds(10)).to_string()))
-        .bind(Option::<String>::None)
-        .bind("2000")
-        .bind("100")
-        .bind("0.018")
-        .bind("0.030")
-        .bind("0.50")
-        .bind("0.85")
-        .execute(&pool)
-        .await
-        .expect("insert inventory snapshot");
-
-        sqlx::query(
-            r#"
-            INSERT INTO execution_reports (
-                event_time, client_order_id, exchange_order_id, symbol, status,
-                filled_quantity, average_fill_price, fill_ratio, requested_price,
-                slippage_bps, decision_latency_ms, submit_ack_latency_ms,
-                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+            INSERT INTO fill_markouts (
+                recorded_at, trade_id, order_id, symbol, side, intent_role, setup_type, size_tier,
                 edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
-                intent_role, exit_stage, exit_reason, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind((session_start + time::Duration::seconds(12)).to_string())
-        .bind("bot-quality-1")
-        .bind(Some("quality-order-1"))
-        .bind("BTCUSDC")
-        .bind("Filled")
-        .bind("0.010")
-        .bind(Some("65000"))
-        .bind("1")
-        .bind(Some("65000"))
-        .bind(Some("0.4"))
-        .bind(Some(18_i64))
-        .bind(Some(72_i64))
-        .bind(Some(95_i64))
-        .bind(Some(410_i64))
-        .bind(Some(520_i64))
-        .bind(Some("1.10"))
-        .bind(Some("0.55"))
-        .bind(Some("0.35"))
-        .bind(Some("AddRisk"))
-        .bind(Option::<String>::None)
-        .bind(Option::<String>::None)
-        .bind(Some("filled"))
-        .execute(&pool)
-        .await
-        .expect("insert execution report");
-
-        sqlx::query(
-            r#"
-            INSERT INTO fills (
-                event_time, trade_id, order_id, symbol, side, price, quantity, fee, fee_asset, fee_quote
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fill_price, quantity, markout_500ms_bps, markout_1s_bps, markout_3s_bps,
+                markout_5s_bps, positive_markout, adverse_selection_hit, fill_quality_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind((session_start + time::Duration::seconds(12)).to_string())
@@ -3262,14 +3293,24 @@ mod tests {
         .bind("quality-order-1")
         .bind("BTCUSDC")
         .bind("Buy")
+        .bind(Some("AddRisk"))
+        .bind(Some("passive_long_favorable"))
+        .bind(Some("normal_size"))
+        .bind(Some("1.10"))
+        .bind(Some("0.55"))
+        .bind(Some("0.35"))
         .bind("65000")
         .bind("0.010")
-        .bind("0.01")
-        .bind("USDC")
-        .bind(Some("0.01"))
+        .bind("-0.42")
+        .bind("-0.18")
+        .bind("0.05")
+        .bind("0.14")
+        .bind(0_i64)
+        .bind(1_i64)
+        .bind("-0.28")
         .execute(&pool)
         .await
-        .expect("insert fill");
+        .expect("insert fill markout");
 
         let quality = fetch_execution_quality(&pool, Some(&session_start.to_string()))
             .await
@@ -3278,6 +3319,11 @@ mod tests {
         assert_eq!(quality.samples, 1);
         assert_eq!(quality.expected_realized_edge_bps.as_deref(), Some("0.55"));
         assert_eq!(quality.adverse_selection_hits, 1);
+        assert_eq!(quality.avg_markout_500ms_bps.as_deref(), Some("-0.42"));
+        assert_eq!(quality.avg_markout_1s_bps.as_deref(), Some("-0.18"));
+        assert_eq!(quality.fill_quality_score.as_deref(), Some("-0.28"));
+        assert_eq!(quality.passive_setup_fills, 1);
+        assert_eq!(quality.probe_setup_fills, 0);
         assert!(parse_decimal_string(
             quality
                 .realized_edge_vs_expected_bps

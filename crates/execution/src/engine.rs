@@ -85,6 +85,8 @@ impl TrackedOrder {
                 edge_after_cost_bps: None,
                 expected_realized_edge_bps: None,
                 adverse_selection_penalty_bps: None,
+                setup_type: None,
+                size_tier: None,
                 source_intent_id: format!("reconciled-{}", order.client_order_id),
             },
             exchange_order_id: order.exchange_order_id.clone(),
@@ -599,6 +601,8 @@ fn build_order_request(intent: &TradeIntent) -> OrderRequest {
         edge_after_cost_bps: Some(intent.edge_after_cost_bps),
         expected_realized_edge_bps: Some(intent.expected_realized_edge_bps),
         adverse_selection_penalty_bps: Some(intent.adverse_selection_penalty_bps),
+        setup_type: intent.setup_type.clone(),
+        size_tier: intent.size_tier.clone(),
         source_intent_id: intent.intent_id.clone(),
     }
 }
@@ -620,6 +624,8 @@ fn build_request_from_event(event: &BinanceExecutionEvent) -> OrderRequest {
         edge_after_cost_bps: None,
         expected_realized_edge_bps: None,
         adverse_selection_penalty_bps: None,
+        setup_type: None,
+        size_tier: None,
         source_intent_id: "user-stream".to_string(),
     }
 }
@@ -659,6 +665,8 @@ fn enrich_report(
     report.edge_after_cost_bps = request.edge_after_cost_bps;
     report.expected_realized_edge_bps = request.expected_realized_edge_bps;
     report.adverse_selection_penalty_bps = request.adverse_selection_penalty_bps;
+    report.setup_type = request.setup_type.clone();
+    report.size_tier = request.size_tier.clone();
     report.intent_role = Some(request.intent_role);
     report.exit_stage = request.exit_stage;
     report.exit_reason = request.exit_reason.clone();
@@ -1068,6 +1076,8 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         edge_after_cost_bps: request.edge_after_cost_bps,
         expected_realized_edge_bps: request.expected_realized_edge_bps,
         adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
+        setup_type: request.setup_type.clone(),
+        size_tier: request.size_tier.clone(),
         intent_role: Some(request.intent_role),
         exit_stage: request.exit_stage,
         exit_reason: request.exit_reason.clone(),
@@ -1269,6 +1279,11 @@ mod tests {
                     None
                 },
                 exchange_order_age_ms: None,
+                edge_after_cost_bps: request.edge_after_cost_bps,
+                expected_realized_edge_bps: request.expected_realized_edge_bps,
+                adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
+                setup_type: request.setup_type.clone(),
+                size_tier: request.size_tier.clone(),
                 intent_role: Some(request.intent_role),
                 exit_stage: request.exit_stage,
                 exit_reason: request.exit_reason.clone(),
@@ -1334,6 +1349,10 @@ mod tests {
             expected_fee_bps: dec("0.75"),
             expected_slippage_bps: Decimal::ZERO,
             edge_after_cost_bps: dec("2"),
+            expected_realized_edge_bps: dec("2"),
+            adverse_selection_penalty_bps: Decimal::ZERO,
+            setup_type: Some("test_setup".to_string()),
+            size_tier: Some("normal_size".to_string()),
             reason: "test intent".to_string(),
             created_at: now_utc(),
             expires_at: None,
@@ -1401,6 +1420,11 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                edge_after_cost_bps: request.edge_after_cost_bps,
+                expected_realized_edge_bps: request.expected_realized_edge_bps,
+                adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
+                setup_type: request.setup_type.clone(),
+                size_tier: request.size_tier.clone(),
                 intent_role: Some(request.intent_role),
                 exit_stage: request.exit_stage,
                 exit_reason: request.exit_reason.clone(),
@@ -1631,6 +1655,11 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                edge_after_cost_bps: rejected_request.edge_after_cost_bps,
+                expected_realized_edge_bps: rejected_request.expected_realized_edge_bps,
+                adverse_selection_penalty_bps: rejected_request.adverse_selection_penalty_bps,
+                setup_type: rejected_request.setup_type.clone(),
+                size_tier: rejected_request.size_tier.clone(),
                 intent_role: Some(rejected_request.intent_role),
                 exit_stage: rejected_request.exit_stage,
                 exit_reason: rejected_request.exit_reason.clone(),
@@ -1722,6 +1751,11 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: Some(8_000),
+                edge_after_cost_bps: None,
+                expected_realized_edge_bps: None,
+                adverse_selection_penalty_bps: None,
+                setup_type: None,
+                size_tier: None,
                 intent_role: None,
                 exit_stage: None,
                 exit_reason: None,

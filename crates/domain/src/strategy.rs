@@ -1,6 +1,6 @@
 use crate::{
-    BestBidAsk, FeatureSnapshot, InventorySnapshot, RegimeDecision, RiskMode, RuntimeState, Side,
-    Symbol, TimeInForce,
+    BestBidAsk, FeatureSnapshot, InventorySnapshot, RegimeDecision, RiskMode, RuntimeState,
+    Side, Symbol, TimeInForce,
 };
 use common::{Decimal, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ pub struct StrategyContext {
     pub symbol: Symbol,
     pub best_bid_ask: Option<BestBidAsk>,
     pub features: FeatureSnapshot,
+    pub fill_quality: FillQualitySnapshot,
     pub regime: RegimeDecision,
     pub inventory: InventorySnapshot,
     pub soft_inventory_base: Decimal,
@@ -46,6 +47,18 @@ pub struct StrategyContext {
     pub max_open_orders_for_symbol: u32,
     pub runtime_state: RuntimeState,
     pub risk_mode: RiskMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FillQualitySnapshot {
+    pub avg_markout_500ms_bps: Decimal,
+    pub avg_markout_1s_bps: Decimal,
+    pub avg_markout_3s_bps: Decimal,
+    pub avg_markout_5s_bps: Decimal,
+    pub positive_markout_rate: Decimal,
+    pub adverse_selection_rate: Decimal,
+    pub fill_quality_score: Decimal,
+    pub samples: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +82,8 @@ pub struct TradeIntent {
     pub edge_after_cost_bps: Decimal,
     pub expected_realized_edge_bps: Decimal,
     pub adverse_selection_penalty_bps: Decimal,
+    pub setup_type: Option<String>,
+    pub size_tier: Option<String>,
     pub reason: String,
     pub created_at: Timestamp,
     pub expires_at: Option<Timestamp>,
