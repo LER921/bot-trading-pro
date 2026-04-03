@@ -112,9 +112,8 @@ impl MarketMakingStrategy {
                 + extension_widening_bps,
         );
 
-        let market_half_spread_bps = context.features.spread_bps / Decimal::from(2u32);
-        if dynamic_half_spread_bps >= market_half_spread_bps * dec("4.0") {
-            return standby("required passive edge exceeds available market spread");
+        if dynamic_half_spread_bps >= dec("12.0") {
+            return standby("required passive edge exceeds deployable passive quoting width");
         }
 
         let reduce_only_trigger = context.max_inventory_base * dec("0.90");
@@ -592,10 +591,10 @@ mod tests {
     }
 
     #[test]
-    fn insufficient_edge_after_costs_produces_no_quotes() {
+    fn non_deployable_passive_width_produces_no_quotes() {
         let mut context = sample_context();
-        context.features.spread_bps = dec("1.0");
-        context.features.realized_volatility_bps = Decimal::ZERO;
+        context.features.spread_bps = dec("0.001");
+        context.features.realized_volatility_bps = dec("30");
         context.features.local_momentum_bps = Decimal::ZERO;
         context.features.momentum_1s_bps = Decimal::ZERO;
         context.features.momentum_5s_bps = Decimal::ZERO;
@@ -604,13 +603,61 @@ mod tests {
         context.features.orderbook_imbalance_rolling = Decimal::ZERO;
         context.features.vwap_distance_bps = Decimal::ZERO;
 
-        let outcome = MarketMakingStrategy::default().evaluate(&context);
+        let mut strategy = MarketMakingStrategy::default();
+        strategy.config.min_market_spread_bps = dec("0.001");
+        strategy.config.min_net_edge_bps = dec("5.0");
+
+        let outcome = strategy.evaluate(&context);
 
         assert!(outcome.intents.is_empty());
         assert!(outcome
             .standby_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("edge"));
+            .contains("deployable"));
+    }
+
+    #[test]
+    fn tight_spread_major_market_can_still_quote_when_edge_model_is_positive() {
+        let mut context = sample_context();
+        context.best_bid_ask = Some(BestBidAsk {
+            symbol: Symbol::BtcUsdc,
+            bid_price: dec("60000.00"),
+            bid_quantity: dec("2.0"),
+            ask_price: dec("60000.01"),
+            ask_quantity: dec("2.0"),
+            observed_at: now_utc(),
+        });
+        context.features.microprice = Some(dec("60000.005"));
+        context.features.spread_bps = dec("0.0016666667");
+        context.features.realized_volatility_bps = dec("0.15");
+        context.features.trade_flow_imbalance = dec("0.01");
+        context.features.orderbook_imbalance = Some(dec("0.01"));
+        context.features.orderbook_imbalance_rolling = dec("0.01");
+        context.features.local_momentum_bps = Decimal::ZERO;
+        context.features.momentum_1s_bps = Decimal::ZERO;
+        context.features.momentum_5s_bps = Decimal::ZERO;
+        context.features.vwap_distance_bps = Decimal::ZERO;
+        context.inventory.base_position = dec("0.001");
+
+        let strategy = MarketMakingStrategy {
+            config: MarketMakingConfig {
+                maker_fee_bps: dec("0.75"),
+                slippage_buffer_bps: dec("0.15"),
+                min_net_edge_bps: dec("0.50"),
+                min_market_spread_bps: dec("0.001"),
+                max_toxicity_score: dec("0.55"),
+                base_skew_bps: dec("10"),
+                momentum_skew_weight: dec("0.20"),
+                volatility_widening_weight: dec("0.22"),
+                quote_size_fraction: dec("0.10"),
+                quote_ttl_secs: 6,
+            },
+        };
+
+        let outcome = strategy.evaluate(&context);
+
+        assert!(!outcome.intents.is_empty());
+        assert!(side_quantity(&outcome, Side::Buy).unwrap() > Decimal::ZERO);
     }
 }

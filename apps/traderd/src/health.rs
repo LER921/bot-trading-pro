@@ -182,7 +182,10 @@ impl HealthTracker {
             last_trade_update_at,
         };
 
-        let account_reference = max_option_timestamp(self.last_balance_event_at, self.last_fill_event_at);
+        let account_reference = max_option_timestamp(
+            max_option_timestamp(self.last_balance_event_at, self.last_fill_event_at),
+            self.user_ws.last_message_at,
+        );
         let account_events = AccountEventFreshness {
             state: derive_age_state(account_reference, now, stale_account_events_ms),
             last_balance_event_at: self.last_balance_event_at,
@@ -314,5 +317,22 @@ mod tests {
         let health = tracker.snapshot(&[Symbol::BtcUsdc], 1_000, 1_000, 500);
         assert!(health.fallback_active);
         assert_ne!(health.overall_state, HealthState::Healthy);
+    }
+
+    #[test]
+    fn fresh_user_stream_heartbeat_keeps_account_channel_healthy_when_account_is_idle() {
+        let mut tracker = HealthTracker::default();
+        let now = now_utc();
+        tracker.record_market_ws_message(now);
+        tracker.record_user_ws_message(now);
+        tracker.record_orderbook(Symbol::BtcUsdc, now);
+        tracker.record_trade(Symbol::BtcUsdc, now);
+        tracker.record_rest_success(now);
+        tracker.record_clock_sample(now);
+
+        let health = tracker.snapshot(&[Symbol::BtcUsdc], 1_000, 1_000, 500);
+
+        assert_eq!(health.user_ws.state, HealthState::Healthy);
+        assert_eq!(health.account_events.state, HealthState::Healthy);
     }
 }

@@ -260,17 +260,25 @@ where
             .await
             .context("missing account snapshot before pipeline evaluation")?;
         let open_orders = self.execution.open_orders().await;
-        let inventory_map = self.collect_inventory().await;
         let mid_prices = self.collect_mid_prices().await;
         for (&symbol, &mark_price) in &mid_prices {
             self.accounting
                 .mark_to_market(symbol, mark_price, now_utc())
                 .await?;
+            self.portfolio.apply_mark_price(symbol, mark_price).await?;
         }
+        let inventory_map = self.collect_inventory().await;
+        let budgets = self.collect_budgets().await;
+        let inventory_snapshots = inventory_map.values().cloned().collect::<Vec<_>>();
+        self.storage.persist_health_snapshot(&health).await?;
+        self.storage
+            .persist_inventory_snapshots(&inventory_snapshots, &budgets)
+            .await?;
         let pnl_snapshot = self.accounting.snapshot().await;
         self.storage.persist_pnl_snapshot(&pnl_snapshot).await?;
         self.telemetry.emit_pnl_snapshot(&pnl_snapshot).await?;
         let execution_stats = self.execution.stats().await;
+        self.storage.persist_execution_stats(&execution_stats).await?;
         self.telemetry.emit_execution_stats(&execution_stats).await?;
         self.execution
             .cancel_stale_orders(
@@ -312,11 +320,6 @@ where
                 .cloned()
                 .unwrap_or_else(|| empty_inventory(symbol));
 
-            if let Some(best) = &snapshot.best_bid_ask {
-                let mark_price = (best.bid_price + best.ask_price) / Decimal::from(2u32);
-                self.portfolio.apply_mark_price(symbol, mark_price).await?;
-            }
-
             let context = StrategyContext {
                 symbol,
                 best_bid_ask: snapshot.best_bid_ask.clone(),
@@ -333,6 +336,13 @@ where
             let outcome = self.strategy_coordinator.evaluate(&context);
             self.telemetry
                 .emit_strategy_outcome(
+                    strategy_selection_label(selected_strategy),
+                    &context,
+                    &outcome,
+                )
+                .await?;
+            self.storage
+                .persist_strategy_outcome(
                     strategy_selection_label(selected_strategy),
                     &context,
                     &outcome,
@@ -913,6 +923,16 @@ where
         inventory
     }
 
+    async fn collect_budgets(&self) -> Vec<SymbolBudget> {
+        let mut budgets = Vec::new();
+        for &symbol in &self.symbols {
+            if let Some(budget) = self.portfolio.budget(symbol).await {
+                budgets.push(budget);
+            }
+        }
+        budgets
+    }
+
     async fn collect_mid_prices(&self) -> HashMap<Symbol, Decimal> {
         let mut mid_prices = HashMap::new();
         for &symbol in &self.symbols {
@@ -1124,7 +1144,9 @@ where
     }
 
     async fn promote_runtime_after_recovery(&mut self, reason: &str) -> Result<()> {
-        self.transition(RuntimeState::Ready, reason).await?;
+        if matches!(self.state(), RuntimeState::Reconciling | RuntimeState::Paused | RuntimeState::RiskOff) {
+            self.transition(RuntimeState::Ready, reason).await?;
+        }
         if self.should_auto_resume_trading() {
             self.transition(
                 RuntimeState::Trading,
@@ -1311,9 +1333,9 @@ mod tests {
         LiveConfig, PairConfig, PairsConfig, RiskConfig, RuntimeConfig,
     };
     use domain::{
-        AccountSnapshot, Balance, ControlPlaneRequest, ExecutionReport, FillEvent, OperatorCommand,
-        OrderBookDelta, OrderBookSnapshot, OrderStatus, OrderType, PriceLevel, RuntimeState, Side,
-        TimeInForce,
+        AccountSnapshot, Balance, ControlPlaneRequest, ExecutionReport, FillEvent, HealthState,
+        OperatorCommand, OrderBookDelta, OrderBookSnapshot, OrderStatus, OrderType, PriceLevel,
+        RuntimeState, Side, TimeInForce,
     };
     use exchange_binance_spot::{
         BinanceExecutionEvent, BinanceUserStreamEvent, MockBinanceSpotGateway, StreamKind,
@@ -1678,6 +1700,54 @@ mod tests {
             .state_snapshot()
             .reason
             .contains("market_ws=Degraded"));
+    }
+
+    #[tokio::test]
+    async fn runtime_recovers_when_user_stream_and_account_events_resume() {
+        let gateway = MockBinanceSpotGateway::new();
+        gateway.seed_account(sample_account()).await;
+        gateway.seed_orderbook(sample_book()).await;
+        gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
+        gateway.set_clock_time(now_utc()).await;
+
+        let mut runtime = TraderRuntime::new(sample_config(true), gateway.clone()).unwrap();
+        runtime.bootstrap().await.unwrap();
+        mark_streams_healthy(&gateway).await;
+        runtime.run_cycle().await.unwrap();
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+
+        gateway
+            .emit_user_stream_status(StreamStatus::reconnecting(
+                StreamKind::UserWs,
+                1,
+                "user stream reconnect test",
+            ))
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        assert_eq!(runtime.state(), RuntimeState::Reduced);
+        assert_eq!(runtime.health().user_ws.state, HealthState::Degraded);
+
+        gateway
+            .emit_user_stream_status(StreamStatus::connected(
+                StreamKind::UserWs,
+                1,
+                "user stream recovered",
+            ))
+            .await;
+        gateway
+            .emit_user_stream_event(BinanceUserStreamEvent::AccountPosition {
+                balances: sample_account().balances,
+                updated_at: now_utc(),
+            })
+            .await;
+
+        runtime.run_cycle().await.unwrap();
+
+        assert_eq!(runtime.state(), RuntimeState::Trading);
+        assert_eq!(runtime.health().user_ws.state, HealthState::Healthy);
+        assert_eq!(runtime.health().account_events.state, HealthState::Healthy);
     }
 
     #[tokio::test]

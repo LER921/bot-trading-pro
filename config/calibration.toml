@@ -1,35 +1,36 @@
 # Runtime / execution timing that directly affects churn, stale handling, and recovery.
 [execution]
 loop_interval_ms = 1000
-stale_order_cancel_ms = 6000
+stale_order_cancel_ms = 7000
 bootstrap_trade_seed_limit = 50
 fill_recovery_fetch_limit = 50
 
 # Coordinator thresholds that decide when the bot escalates from MM to scalp.
 [selection]
-scalp_activation_momentum_bps = "8"
-scalp_activation_flow_imbalance = "0.20"
+scalp_activation_momentum_bps = "2.00"
+scalp_activation_flow_imbalance = "0.22"
 
-# Passive quoting calibration. The coarse spread gate now covers explicit maker costs.
+# Passive quoting calibration for tight major spot books: the spread gate stays permissive,
+# while net edge, toxicity and passive quote width keep the bot disciplined.
 [market_making]
 maker_fee_bps = "0.75"
-slippage_buffer_bps = "0.25"
-min_net_edge_bps = "1.00"
-min_market_spread_bps = "1.00"
-max_toxicity_score = "0.70"
-base_skew_bps = "8"
-momentum_skew_weight = "0.25"
-volatility_widening_weight = "0.30"
-quote_size_fraction = "0.12"
-quote_ttl_secs = 5
+slippage_buffer_bps = "0.15"
+min_net_edge_bps = "0.50"
+min_market_spread_bps = "0.001"
+max_toxicity_score = "0.55"
+base_skew_bps = "10"
+momentum_skew_weight = "0.20"
+volatility_widening_weight = "0.22"
+quote_size_fraction = "0.10"
+quote_ttl_secs = 6
 
 # Opportunistic scalp calibration kept tighter than passive MM on toxicity, size, and inventory usage.
 [scalping]
 taker_fee_bps = "1.00"
 slippage_buffer_bps = "0.50"
-min_entry_score = "6"
-min_momentum_bps = "4"
-max_toxicity_score = "0.80"
-max_position_fraction = "0.40"
-quote_size_fraction = "0.08"
+min_entry_score = "6.5"
+min_momentum_bps = "1.20"
+max_toxicity_score = "0.50"
+max_position_fraction = "0.18"
+quote_size_fraction = "0.04"
 quote_ttl_secs = 2

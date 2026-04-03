@@ -32,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const STREAM_CHANNEL_CAPACITY: usize = 2048;
 const USER_STREAM_RECV_WINDOW_MS: u64 = 5_000;
+const USER_STREAM_HEARTBEAT_INTERVAL_SECS: u64 = 2;
 const FEE_QUOTE_CACHE_TTL_SECS: i64 = 5;
 
 #[async_trait]
@@ -796,24 +797,41 @@ async fn run_user_stream_task(
         match connect_async(client.user_ws_url.as_str()).await {
             Ok((stream, _)) => {
                 let (mut writer, mut reader) = stream.split();
-                if let Err(error) = writer
-                    .send(Message::Text(
-                        client.websocket_user_stream_request().unwrap_or_default().into(),
-                    ))
-                    .await
-                {
+                let subscription_request = match client.websocket_user_stream_request() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        warn!(?error, "failed to build user websocket subscription request");
+                        reconnect_count = reconnect_count.saturating_add(1);
+                        let _ = status_tx
+                            .send(StreamStatus::reconnecting(
+                                StreamKind::UserWs,
+                                reconnect_count,
+                                "user websocket reconnect scheduled",
+                            ))
+                            .await;
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                };
+
+                if let Err(error) = writer.send(Message::Text(subscription_request.into())).await {
                     warn!(?error, "failed to subscribe user websocket");
-                } else {
+                    reconnect_count = reconnect_count.saturating_add(1);
                     let _ = status_tx
-                        .send(StreamStatus::connected(
+                        .send(StreamStatus::reconnecting(
                             StreamKind::UserWs,
                             reconnect_count,
-                            "user websocket connected and subscription requested",
+                            "user websocket reconnect scheduled",
                         ))
                         .await;
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
                 }
 
-                let mut ping = interval(Duration::from_secs(15));
+                let mut subscription_confirmed = false;
+                let mut ping = interval(Duration::from_secs(USER_STREAM_HEARTBEAT_INTERVAL_SECS));
                 backoff = Duration::from_secs(1);
 
                 loop {
@@ -837,29 +855,80 @@ async fn run_user_stream_task(
                         }
                         maybe_message = reader.next() => {
                             match maybe_message {
-                                Some(Ok(Message::Text(text))) => match parse_user_stream_message(&text) {
-                                    Ok(Some(event)) => {
-                                        let event = match client.enrich_user_stream_event(event.clone()).await {
-                                            Ok(event) => event,
-                                            Err(error) => {
-                                                warn!(?error, "failed to enrich user event fill fee quote; queueing fill for REST recovery");
-                                                client.mark_fill_recovery_after_enrichment_failure(event, &error)
+                                Some(Ok(Message::Text(text))) => {
+                                    match parse_user_stream_response(&text) {
+                                        Ok(Some(response)) => {
+                                            if response.success {
+                                                subscription_confirmed = true;
+                                                let _ = status_tx
+                                                    .send(StreamStatus::connected(
+                                                        StreamKind::UserWs,
+                                                        reconnect_count,
+                                                        response.detail,
+                                                    ))
+                                                    .await;
+                                            } else {
+                                                warn!(
+                                                    status = response.status,
+                                                    detail = %response.detail,
+                                                    body = %text,
+                                                    "user websocket subscription rejected by exchange"
+                                                );
+                                                break;
                                             }
-                                        };
-                                        if event_tx.send(event).await.is_err() {
-                                            return;
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => {
+                                            warn!(?error, body = %text, "failed to parse user websocket response");
+                                            continue;
                                         }
                                     }
-                                    Ok(None) => {}
-                                    Err(error) => warn!(?error, "failed to parse user websocket message"),
-                                },
+
+                                    match parse_user_stream_message(&text) {
+                                        Ok(Some(event)) => {
+                                            if !subscription_confirmed {
+                                                subscription_confirmed = true;
+                                                let _ = status_tx
+                                                    .send(StreamStatus::connected(
+                                                        StreamKind::UserWs,
+                                                        reconnect_count,
+                                                        "user websocket streaming events confirmed",
+                                                    ))
+                                                    .await;
+                                            }
+                                            let event = match client.enrich_user_stream_event(event.clone()).await {
+                                                Ok(event) => event,
+                                                Err(error) => {
+                                                    warn!(?error, "failed to enrich user event fill fee quote; queueing fill for REST recovery");
+                                                    client.mark_fill_recovery_after_enrichment_failure(event, &error)
+                                                }
+                                            };
+                                            if event_tx.send(event).await.is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Ok(None) => {}
+                                        Err(error) => warn!(?error, body = %text, "failed to parse user websocket message"),
+                                    }
+                                }
                                 Some(Ok(Message::Ping(payload))) => {
                                     if let Err(error) = writer.send(Message::Pong(payload)).await {
                                         warn!(?error, "failed to answer user ping");
                                         break;
                                     }
                                 }
-                                Some(Ok(Message::Pong(_))) => {}
+                                Some(Ok(Message::Pong(_))) => {
+                                    if subscription_confirmed {
+                                        let _ = status_tx
+                                            .send(StreamStatus::connected(
+                                                StreamKind::UserWs,
+                                                reconnect_count,
+                                                "user websocket heartbeat pong",
+                                            ))
+                                            .await;
+                                    }
+                                }
                                 Some(Ok(Message::Binary(_))) => {}
                                 Some(Ok(Message::Frame(_))) => {}
                                 Some(Ok(Message::Close(frame))) => {
@@ -919,13 +988,21 @@ fn parse_market_stream_message(raw: &str) -> Result<Option<BinanceMarketEvent>> 
 
 fn parse_user_stream_message(raw: &str) -> Result<Option<BinanceUserStreamEvent>> {
     let payload: Value = serde_json::from_str(raw)?;
-    if payload.get("status").is_some() {
+    if payload.get("status").is_some() || payload.get("result").is_some() || payload.get("id").is_some() {
         return Ok(None);
     }
 
-    let Some(event) = payload.get("event").or_else(|| payload.get("data")).or(Some(&payload)) else {
+    let Some(event) = payload
+        .get("event")
+        .or_else(|| payload.get("data"))
+        .or_else(|| payload.get("e").map(|_| &payload))
+    else {
         return Ok(None);
     };
+
+    if event.get("e").is_none() {
+        return Ok(None);
+    }
 
     match event_type(event)? {
         "outboundAccountPosition" => parse_account_position_event(event).map(Some),
@@ -936,6 +1013,56 @@ fn parse_user_stream_message(raw: &str) -> Result<Option<BinanceUserStreamEvent>
         })),
         _ => Ok(None),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserStreamResponse {
+    status: u64,
+    success: bool,
+    detail: String,
+}
+
+fn parse_user_stream_response(raw: &str) -> Result<Option<UserStreamResponse>> {
+    let payload: Value = serde_json::from_str(raw)?;
+    let Some(status) = payload.get("status").and_then(Value::as_u64) else {
+        return Ok(None);
+    };
+
+    let subscription_id = payload
+        .get("result")
+        .and_then(|result| result.get("subscriptionId"))
+        .and_then(Value::as_u64);
+    let success = (200..300).contains(&status);
+    let detail = if success {
+        match subscription_id {
+            Some(subscription_id) => {
+                format!("user websocket subscription confirmed (subscription_id={subscription_id})")
+            }
+            None => "user websocket request acknowledged".to_string(),
+        }
+    } else {
+        let error = payload.get("error");
+        let error_code = error
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64);
+        let error_message = error
+            .and_then(|error| error.get("msg").and_then(Value::as_str))
+            .or_else(|| error.and_then(|error| error.get("message").and_then(Value::as_str)))
+            .unwrap_or("unknown websocket API error");
+
+        match error_code {
+            Some(error_code) => {
+                format!("user websocket request rejected: code={error_code} msg={error_message}")
+            }
+            None => format!("user websocket request rejected: status={status} msg={error_message}"),
+        }
+    };
+
+    Ok(Some(UserStreamResponse {
+        status,
+        success,
+        detail,
+    }))
 }
 
 fn parse_open_order_response(response: BinanceOpenOrderResponse) -> Result<OpenOrder> {
@@ -1836,6 +1963,51 @@ mod tests {
             }}
         }}"#
         )
+    }
+
+    #[test]
+    fn parses_user_stream_subscription_response() {
+        let response = parse_user_stream_response(
+            r#"{
+                "id":"req-1",
+                "status":200,
+                "result":{"subscriptionId":7}
+            }"#,
+        )
+        .unwrap()
+        .expect("subscription response should parse");
+
+        assert!(response.success);
+        assert_eq!(response.status, 200);
+        assert!(response.detail.contains("subscription_id=7"));
+        assert!(parse_user_stream_message(r#"{"id":"req-1","status":200,"result":{"subscriptionId":7}}"#)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn parses_user_stream_subscription_rejection() {
+        let response = parse_user_stream_response(
+            r#"{
+                "id":"req-1",
+                "status":400,
+                "error":{"code":-1102,"msg":"Mandatory parameter 'timestamp' was not sent"}
+            }"#,
+        )
+        .unwrap()
+        .expect("subscription error response should parse");
+
+        assert!(!response.success);
+        assert_eq!(response.status, 400);
+        assert!(response.detail.contains("-1102"));
+        assert!(response.detail.contains("timestamp"));
+    }
+
+    #[test]
+    fn ignores_non_event_user_stream_control_payload() {
+        assert!(parse_user_stream_message(r#"{"id":"req-1","result":{"subscriptionId":7}}"#)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

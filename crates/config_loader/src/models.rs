@@ -186,9 +186,8 @@ impl AppConfig {
             "calibration.market_making.quote_ttl_secs must be > 0"
         );
         ensure!(
-            market_making.min_market_spread_bps
-                >= market_making.maker_fee_bps + market_making.slippage_buffer_bps,
-            "calibration.market_making.min_market_spread_bps must cover explicit maker costs"
+            market_making.min_market_spread_bps <= dec("5.0"),
+            "calibration.market_making.min_market_spread_bps must stay in a realistic live gating range"
         );
 
         let scalping = &self.calibration.scalping;
@@ -618,13 +617,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_market_making_spread_gate_below_explicit_costs() {
+    fn allows_tight_market_making_spread_gate_for_major_spot_pairs() {
         let mut config = sample_app_config();
-        config.calibration.market_making.min_market_spread_bps = dec("0.50");
+        config.calibration.market_making.min_market_spread_bps = dec("0.001");
 
-        let error = config.validate().unwrap_err().to_string();
-
-        assert!(error.contains("explicit maker costs"));
+        config.validate().unwrap();
     }
 
     #[test]

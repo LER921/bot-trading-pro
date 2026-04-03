@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Bot Dashboard Live</title>
+  <style>
+    :root {
+      --bg: #07111f;
+      --panel: rgba(11, 24, 46, 0.78);
+      --line: rgba(113, 191, 255, 0.18);
+      --text: #eef7ff;
+      --muted: #8ea9c4;
+      --cyan: #49e7ff;
+      --blue: #59a7ff;
+      --green: #41ffae;
+      --amber: #ffc861;
+      --red: #ff6b83;
+      --violet: #c07cff;
+      --glow: 0 0 30px rgba(73, 231, 255, 0.12);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: "Segoe UI", "Inter", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(73,231,255,0.13), transparent 28%),
+        radial-gradient(circle at top right, rgba(192,124,255,0.12), transparent 24%),
+        linear-gradient(180deg, #050b16 0%, #08111f 45%, #050913 100%);
+      min-height: 100vh;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+      background-size: 34px 34px;
+      mask-image: linear-gradient(180deg, rgba(255,255,255,0.62), transparent 100%);
+    }
+    .shell { max-width: 1680px; margin: 0 auto; padding: 26px; }
+    .hero { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; margin-bottom: 18px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 24px; box-shadow: var(--glow); backdrop-filter: blur(18px); overflow: hidden; }
+    .hero-card { position: relative; padding: 24px 26px 22px; background: linear-gradient(135deg, rgba(73,231,255,0.08), rgba(89,167,255,0.04) 38%, rgba(192,124,255,0.05)); }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; color: var(--cyan); letter-spacing: 0.18em; text-transform: uppercase; font-size: 11px; font-weight: 700; }
+    .hero h1 { margin: 16px 0 12px; font-size: clamp(30px, 4vw, 48px); line-height: 1.04; letter-spacing: -0.04em; }
+    .subtitle { color: var(--muted); font-size: 15px; line-height: 1.5; max-width: 68ch; }
+    .runtime-strip { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .kpi-grid, .mini-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .kpi-grid { padding: 22px; }
+    .kpi, .mini-card, .symbol-card, .timeline-item, .log-panel, .table-wrap { border: 1px solid rgba(255,255,255,0.06); background: rgba(255,255,255,0.025); }
+    .kpi { padding: 18px; border-radius: 18px; }
+    .kpi .label, .mini-card .label, th, .log-title, .muted { color: var(--muted); }
+    .kpi .label, .mini-card .label, th, .log-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; font-weight: 700; }
+    .kpi .value { margin-top: 10px; font-size: 26px; font-weight: 700; letter-spacing: -0.04em; }
+    .kpi .sub { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .main-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 18px; }
+    .span-12 { grid-column: span 12; } .span-8 { grid-column: span 8; } .span-6 { grid-column: span 6; } .span-4 { grid-column: span 4; }
+    .section-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; padding: 20px 22px 0; }
+    .section-head h2 { margin: 0; font-size: 18px; letter-spacing: -0.03em; }
+    .section-head p { margin: 8px 0 0; color: var(--muted); font-size: 13px; }
+    .content { padding: 18px 22px 22px; }
+    .mini-card, .symbol-card, .timeline-item { padding: 16px; border-radius: 18px; }
+    .badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.08); background: rgba(255,255,255,0.035); font-size: 12px; font-weight: 700; letter-spacing: 0.04em; }
+    .badge::before { content: ""; width: 8px; height: 8px; border-radius: 999px; background: currentColor; box-shadow: 0 0 18px currentColor; }
+    .state-trading, .state-healthy { color: var(--green); } .state-reduced, .state-degraded { color: var(--amber); } .state-reconciling, .state-ready, .state-bootstrap { color: var(--blue); } .state-paused { color: var(--violet); } .state-riskoff, .state-shutdown, .state-unhealthy, .state-stale { color: var(--red); }
+    .reason { margin-top: 16px; padding: 14px 16px; border-radius: 16px; color: var(--muted); background: rgba(255,255,255,0.025); border: 1px solid rgba(255,255,255,0.06); line-height: 1.5; }
+    .symbol-grid, .timeline, .metric-list, .log-grid { display: grid; gap: 14px; }
+    .symbol-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .symbol-title { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
+    .symbol-title h3 { margin: 0; font-size: 18px; }
+    .metric-row { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; font-size: 14px; }
+    .metric-row span:first-child { color: var(--muted); }
+    canvas { width: 100%; height: 220px; display: block; background: linear-gradient(180deg, rgba(255,255,255,0.014), rgba(255,255,255,0)); border-radius: 18px; border: 1px solid rgba(255,255,255,0.05); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 12px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); text-align: left; vertical-align: top; }
+    .table-wrap { overflow-x: auto; border-radius: 16px; }
+    .log-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .log-panel { border-radius: 18px; min-height: 260px; overflow: hidden; background: rgba(2, 8, 19, 0.62); }
+    .log-title { padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .log-body { max-height: 330px; overflow-y: auto; padding: 10px 12px 14px; font-family: "Cascadia Code", "Consolas", monospace; font-size: 12px; }
+    .log-entry { padding: 10px 10px 12px; border-radius: 12px; background: rgba(255,255,255,0.02); margin-bottom: 8px; }
+    .log-meta { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); margin-bottom: 6px; }
+    .log-message { color: var(--cyan); font-weight: 700; margin-bottom: 6px; }
+    .footer-meta, .empty { color: var(--muted); font-size: 12px; }
+    .footer-meta { margin-top: 8px; word-break: break-all; }
+    @media (max-width: 1180px) { .hero { grid-template-columns: 1fr; } .span-8, .span-6, .span-4 { grid-column: span 12; } .kpi-grid, .mini-grid, .log-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 760px) { .shell { padding: 16px; } .kpi-grid, .mini-grid, .log-grid { grid-template-columns: 1fr; } .section-head { flex-direction: column; } }
+  </style>
+</head>
+<body>
+  <div class="shell bot-dashboard" id="bot-dashboard">
+    <div class="hero">
+      <section class="panel hero-card">
+        <div class="eyebrow">Live Trading Surface</div>
+        <h1>Bot Runtime Cockpit</h1>
+        <div class="subtitle">Runtime, santé, PnL, inventory, exécution, risk, stratégie et logs live sur une seule page.</div>
+        <div class="runtime-strip" id="runtime-strip"></div>
+        <div class="reason" id="runtime-reason">Chargement du dashboard…</div>
+        <div class="footer-meta" id="meta-line"></div>
+      </section>
+      <section class="panel"><div class="kpi-grid" id="hero-kpis"></div></section>
+    </div>
+    <div class="main-grid">
+      <section class="panel span-4"><div class="section-head"><div><h2>Santé système</h2><p>Vraie lecture live persistée par `traderd`.</p></div></div><div class="content"><div class="symbol-grid" id="health-grid"></div></div></section>
+      <section class="panel span-8"><div class="section-head"><div><h2>Timeline runtime</h2><p>Derniers changements d’état et raisons.</p></div></div><div class="content"><div class="timeline" id="runtime-timeline"></div></div></section>
+      <section class="panel span-8"><div class="section-head"><div><h2>PnL</h2><p>Net, realized, unrealized, fees, drawdown et historique.</p></div></div><div class="content"><canvas id="pnl-chart" width="960" height="220"></canvas><div class="mini-grid" id="pnl-mini-grid" style="margin-top:14px;"></div><div class="symbol-grid" id="symbol-pnl-grid" style="margin-top:14px;"></div></div></section>
+      <section class="panel span-4"><div class="section-head"><div><h2>Inventory</h2><p>Par symbole avec exposition et pression de neutralisation.</p></div></div><div class="content"><div class="symbol-grid" id="inventory-grid"></div></div></section>
+      <section class="panel span-6"><div class="section-head"><div><h2>Exécution</h2><p>Stats, churn, open orders et reports récents.</p></div></div><div class="content"><div class="mini-grid" id="execution-stats-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Px req</th><th>Px avg</th><th>Latence</th><th>Message</th></tr></thead><tbody id="execution-report-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Prix</th></tr></thead><tbody id="open-order-rows"></tbody></table></div></div></section>
+      <section class="panel span-6"><div class="section-head"><div><h2>Fills & Risk</h2><p>Chaque trade récent et les dernières décisions de garde-fou.</p></div></div><div class="content"><div class="table-wrap"><table><thead><tr><th>Heure</th><th>Trade</th><th>Symbole</th><th>Side</th><th>Prix</th><th>Qty</th><th>Fee</th></tr></thead><tbody id="fill-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Action</th><th>Symbole</th><th>Mode</th><th>Raison</th></tr></thead><tbody id="risk-rows"></tbody></table></div></div></section>
+      <section class="panel span-12"><div class="section-head"><div><h2>Stratégie</h2><p>Sélection courante, standby reasons, edge utile et causes de gating.</p></div></div><div class="content"><div class="symbol-grid" id="strategy-symbol-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Symbole</th><th>Stratégie</th><th>Status</th><th>Edge net</th><th>Intent</th><th>Raison</th><th>Microstructure</th></tr></thead><tbody id="strategy-rows"></tbody></table></div></div></section>
+      <section class="panel span-12"><div class="section-head"><div><h2>Logs live</h2><p>Flux opératoire compact : runtime, santé, stratégie, risk, exécution.</p></div></div><div class="content"><div class="log-grid" id="log-grid"></div></div></section>
+    </div>
+  </div>
+  <script>
+    const stateClass = (value) => {
+      const normalized = String(value || "").toUpperCase();
+      if (normalized === "TRADING" || normalized === "HEALTHY") return "state-trading";
+      if (normalized === "REDUCED" || normalized === "DEGRADED") return "state-reduced";
+      if (normalized === "RECONCILING" || normalized === "READY" || normalized === "BOOTSTRAP") return "state-reconciling";
+      if (normalized === "PAUSED") return "state-paused";
+      if (normalized === "RISKOFF" || normalized === "RISK_OFF" || normalized === "UNHEALTHY" || normalized === "STALE" || normalized === "SHUTDOWN") return "state-riskoff";
+      return "state-ready";
+    };
+
+    const escapeHtml = (value) => String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
+
+    const fmt = (value, digits = 2) => {
+      if (value === null || value === undefined || value === "") return "n/a";
+      const num = Number(value);
+      return Number.isFinite(num) ? num.toFixed(digits) : escapeHtml(value);
+    };
+
+    const fmtPct = (value, digits = 1) => value === null || value === undefined ? "n/a" : `${Number(value).toFixed(digits)}%`;
+    const fmtTimeAgo = (timestamp) => {
+      if (!timestamp) return "n/a";
+      const delta = Math.max(0, Date.now() - new Date(timestamp).getTime());
+      const seconds = Math.floor(delta / 1000);
+      const minutes = Math.floor(seconds / 60);
+      const hours = Math.floor(minutes / 60);
+      if (hours > 0) return `${hours}h ${minutes % 60}m`;
+      if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+      return `${seconds}s`;
+    };
+
+    const badge = (label, className) => `<span class="badge ${className}">${escapeHtml(label)}</span>`;
+
+    const renderHero = (data) => {
+      const runtime = data.runtime || {};
+      const pnl = data.pnl?.latest || {};
+      const stats = data.execution?.latest_stats || {};
+      const openOrders = data.execution?.open_orders?.length || 0;
+      document.getElementById("runtime-strip").innerHTML = [
+        badge(runtime.current_state || "Unavailable", stateClass(runtime.current_state)),
+        data.health ? badge(data.health.overall_state, stateClass(data.health.overall_state)) : badge("NO HEALTH", "state-riskoff"),
+        badge(data.health?.fallback_active ? "REST FALLBACK" : "WS PRIMARY", data.health?.fallback_active ? "state-reduced" : "state-trading"),
+      ].join("");
+      document.getElementById("runtime-reason").innerHTML = escapeHtml(runtime.current_reason || "Aucune raison runtime disponible.");
+      document.getElementById("meta-line").innerHTML = `URL <strong>${escapeHtml(data.meta.bind_address)}</strong> | DB <strong>${escapeHtml(data.meta.db_path)}</strong> | Logs <strong>${escapeHtml(data.meta.log_path)}</strong>`;
+      document.getElementById("hero-kpis").innerHTML = [
+        { label: "Net PnL", value: fmt(pnl.net_pnl_quote), sub: `Daily ${fmt(pnl.daily_pnl_quote)} | Drawdown ${fmt(pnl.drawdown_quote)}` },
+        { label: "Win Rate", value: data.pnl?.win_rate?.realized_close_win_rate != null ? fmtPct(data.pnl.win_rate.realized_close_win_rate) : "n/a", sub: `${data.pnl?.win_rate?.wins || 0} wins / ${data.pnl?.win_rate?.losses || 0} losses (realized)` },
+        { label: "Uptime", value: fmtTimeAgo(runtime.started_at), sub: runtime.started_at ? `Depuis ${escapeHtml(runtime.started_at)}` : "Démarrage inconnu" },
+        { label: "Latence", value: stats.avg_decision_latency_ms ? `${fmt(stats.avg_decision_latency_ms)} ms` : "n/a", sub: `Fill ratio ${fmtPct(stats.fill_report_rate)} | Cancel ${fmtPct(stats.cancel_rate)}` },
+        { label: "Fills", value: String(data.execution?.total_fills || 0), sub: `${openOrders} open orders | ${stats.churn_state || "idle"}` },
+        { label: "Read Only", value: data.meta.read_only ? "Oui" : "Non", sub: `Refresh auto toutes les 2s` },
+      ].map(card => `<div class="kpi"><div class="label">${escapeHtml(card.label)}</div><div class="value">${escapeHtml(card.value)}</div><div class="sub">${escapeHtml(card.sub)}</div></div>`).join("");
+    };
+
+    const renderHealth = (data) => {
+      const health = data.health;
+      const container = document.getElementById("health-grid");
+      if (!health) {
+        container.innerHTML = `<div class="empty">Aucun snapshot de santé persistant pour l’instant.</div>`;
+        return;
+      }
+      const cards = [
+        ["overall", health.overall_state, `observé ${health.observed_at}`],
+        ["market_ws", health.market_ws_state, `age ${health.market_ws_age_ms ?? "n/a"} ms | reconnect ${health.market_ws_reconnect_count}`],
+        ["user_ws", health.user_ws_state, `age ${health.user_ws_age_ms ?? "n/a"} ms | reconnect ${health.user_ws_reconnect_count}`],
+        ["rest", health.rest_state, `failures ${health.rest_consecutive_failures}`],
+        ["market_data", health.market_data_state, `fallback ${health.fallback_active ? "actif" : "off"}`],
+        ["account_events", health.account_events_state, `clock ${health.clock_drift_state} / ${health.clock_drift_ms} ms`],
+      ];
+      container.innerHTML = cards.map(([label, state, meta]) => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(label)}</h3>${badge(state, stateClass(state))}</div><div class="muted">${escapeHtml(meta)}</div></div>`).join("");
+    };
+
+    const renderTimeline = (data) => {
+      const container = document.getElementById("runtime-timeline");
+      const transitions = data.runtime?.transitions || [];
+      container.innerHTML = transitions.length
+        ? transitions.map(item => `<div class="timeline-item"><div class="muted">${escapeHtml(item.transitioned_at)}</div><div style="margin-top:6px;font-weight:700;">${escapeHtml(item.from_state)} → ${escapeHtml(item.to_state)}</div><div class="muted" style="margin-top:8px;">${escapeHtml(item.reason)}</div></div>`).join("")
+        : `<div class="empty">Aucune transition runtime persistée.</div>`;
+    };
+
+    const drawChart = (points) => {
+      const canvas = document.getElementById("pnl-chart");
+      const ctx = canvas.getContext("2d");
+      const width = canvas.width;
+      const height = canvas.height;
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "rgba(8, 15, 28, 0.95)";
+      ctx.fillRect(0, 0, width, height);
+      if (!points.length) {
+        ctx.fillStyle = "#8ea9c4";
+        ctx.font = "14px Segoe UI";
+        ctx.fillText("Pas encore assez de snapshots PnL.", 24, 42);
+        return;
+      }
+      const values = points.map(point => Number(point.net_pnl_quote));
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+      const spread = Math.max(1, max - min);
+      const padX = 22, padY = 22;
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      for (let i = 0; i < 4; i += 1) {
+        const y = padY + ((height - padY * 2) / 3) * i;
+        ctx.beginPath(); ctx.moveTo(padX, y); ctx.lineTo(width - padX, y); ctx.stroke();
+      }
+      ctx.beginPath();
+      points.forEach((point, index) => {
+        const x = padX + (index / Math.max(1, points.length - 1)) * (width - padX * 2);
+        const y = height - padY - ((Number(point.net_pnl_quote) - min) / spread) * (height - padY * 2);
+        if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.strokeStyle = values[values.length - 1] >= 0 ? "#41ffae" : "#ff6b83";
+      ctx.lineWidth = 3;
+      ctx.shadowBlur = 16;
+      ctx.shadowColor = ctx.strokeStyle;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+    };
+
+    const renderPnl = (data) => {
+      drawChart(data.pnl?.history || []);
+      const pnl = data.pnl?.latest || {};
+      document.getElementById("pnl-mini-grid").innerHTML = [
+        ["Realized", fmt(pnl.realized_pnl_quote), "PnL fermé"],
+        ["Unrealized", fmt(pnl.unrealized_pnl_quote), "Mark-to-market"],
+        ["Fees", fmt(pnl.fees_quote), "Coûts totaux"],
+        ["Peak", fmt(pnl.peak_net_pnl_quote), "Pic net"],
+      ].map(([label, value, sub]) => `<div class="mini-card"><div class="label">${escapeHtml(label)}</div><div class="value" style="margin-top:9px;font-size:18px;font-weight:700;">${escapeHtml(value)}</div><div class="muted">${escapeHtml(sub)}</div></div>`).join("");
+      const grid = document.getElementById("symbol-pnl-grid");
+      grid.innerHTML = (data.pnl?.by_symbol || []).length
+        ? data.pnl.by_symbol.map(symbol => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(symbol.symbol)}</h3>${badge(symbol.net_pnl_quote, Number(symbol.net_pnl_quote) >= 0 ? "state-trading" : "state-riskoff")}</div><div class="metric-list"><div class="metric-row"><span>Position</span><strong>${escapeHtml(symbol.position_base)}</strong></div><div class="metric-row"><span>Avg entry</span><strong>${escapeHtml(symbol.average_entry_price ?? "n/a")}</strong></div><div class="metric-row"><span>Mark</span><strong>${escapeHtml(symbol.mark_price ?? "n/a")}</strong></div><div class="metric-row"><span>Realized</span><strong>${escapeHtml(symbol.realized_pnl_quote)}</strong></div><div class="metric-row"><span>Unrealized</span><strong>${escapeHtml(symbol.unrealized_pnl_quote)}</strong></div><div class="metric-row"><span>Fees</span><strong>${escapeHtml(symbol.fees_quote)}</strong></div><div class="metric-row"><span>Drawdown</span><strong>${escapeHtml(symbol.drawdown_quote)}</strong></div></div></div>`).join("")
+        : `<div class="empty">Aucun PnL par symbole persistant pour l’instant.</div>`;
+    };
+
+    const renderInventory = (data) => {
+      const container = document.getElementById("inventory-grid");
+      const items = data.inventory || [];
+      container.innerHTML = items.length
+        ? items.map(item => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(item.symbol)}</h3>${badge(item.neutralization_ratio != null ? `${fmtPct(item.neutralization_ratio)}` : "n/a", item.neutralization_ratio >= 85 ? "state-riskoff" : item.neutralization_ratio >= 55 ? "state-reduced" : "state-trading")}</div><div class="metric-list"><div class="metric-row"><span>Base</span><strong>${escapeHtml(item.base_position)}</strong></div><div class="metric-row"><span>Quote</span><strong>${escapeHtml(item.quote_position)}</strong></div><div class="metric-row"><span>Avg entry</span><strong>${escapeHtml(item.average_entry_price ?? "n/a")}</strong></div><div class="metric-row"><span>Mark</span><strong>${escapeHtml(item.mark_price ?? "n/a")}</strong></div><div class="metric-row"><span>Exposure</span><strong>${item.exposure_quote != null ? fmt(item.exposure_quote) : "n/a"}</strong></div><div class="metric-row"><span>Reserved</span><strong>${escapeHtml(item.reserved_quote_notional)} / ${escapeHtml(item.max_quote_notional)}</strong></div><div class="metric-row"><span>Soft / Max</span><strong>${escapeHtml(item.soft_inventory_base)} / ${escapeHtml(item.max_inventory_base)}</strong></div><div class="metric-row"><span>Reduce-only trigger</span><strong>${escapeHtml(item.reduce_only_trigger_ratio)}</strong></div></div></div>`).join("")
+        : `<div class="empty">Aucun snapshot inventory persistant pour l’instant.</div>`;
+    };
+
+    const renderExecution = (data) => {
+      const stats = data.execution?.latest_stats || {};
+      document.getElementById("execution-stats-grid").innerHTML = [
+        ["Submitted", stats.total_submitted ?? 0, "ordres émis"],
+        ["Rejected", stats.total_rejected ?? 0, `reject rate ${escapeHtml(stats.reject_rate ?? "n/a")}`],
+        ["Canceled", stats.total_canceled ?? 0, `manual ${stats.total_manual_cancels ?? 0} | stale ${stats.total_stale_cancels ?? 0}`],
+        ["Duplicates", (stats.duplicate_suppressions ?? 0), `equivalent ${stats.total_equivalent_order_skips ?? 0}`],
+        ["Fill report rate", fmtPct(stats.fill_report_rate), `avg fill ${escapeHtml(stats.avg_fill_ratio ?? "n/a")}`],
+        ["Cancel rate", fmtPct(stats.cancel_rate), `${escapeHtml(stats.churn_state ?? "idle")}`],
+        ["Slippage", escapeHtml(stats.avg_slippage_bps ?? "n/a"), "bps"],
+        ["Latency", escapeHtml(stats.avg_decision_latency_ms ?? "n/a"), "ms"],
+      ].map(([label, value, sub]) => `<div class="mini-card"><div class="label">${escapeHtml(label)}</div><div class="value" style="margin-top:9px;font-size:18px;font-weight:700;">${escapeHtml(String(value))}</div><div class="muted">${escapeHtml(sub)}</div></div>`).join("");
+
+      const reportRows = data.execution?.recent_reports || [];
+      document.getElementById("execution-report-rows").innerHTML = reportRows.length
+        ? reportRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.fill_ratio)} / ${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td><td>${escapeHtml(row.average_fill_price ?? "n/a")}</td><td>${escapeHtml(row.decision_latency_ms ?? "n/a")}</td><td>${escapeHtml(row.message ?? "")}</td></tr>`).join("")
+        : `<tr><td colspan="9" class="empty">Aucun execution report persistant.</td></tr>`;
+
+      const openRows = data.execution?.open_orders || [];
+      document.getElementById("open-order-rows").innerHTML = openRows.length
+        ? openRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td></tr>`).join("")
+        : `<tr><td colspan="6" class="empty">Aucun ordre ouvert détecté.</td></tr>`;
+
+      const fills = data.execution?.recent_fills || [];
+      document.getElementById("fill-rows").innerHTML = fills.length
+        ? fills.map(fill => `<tr><td>${escapeHtml(fill.event_time)}</td><td>${escapeHtml(fill.trade_id)}</td><td>${escapeHtml(fill.symbol)}</td><td>${badge(fill.side, fill.side === "Buy" ? "state-trading" : "state-reduced")}</td><td>${escapeHtml(fill.price)}</td><td>${escapeHtml(fill.quantity)}</td><td>${escapeHtml(fill.fee_quote ?? fill.fee)} ${escapeHtml(fill.fee_asset)}</td></tr>`).join("")
+        : `<tr><td colspan="7" class="empty">Aucun fill persistant.</td></tr>`;
+    };
+
+    const renderRisk = (data) => {
+      const rows = data.risk?.recent || [];
+      document.getElementById("risk-rows").innerHTML = rows.length
+        ? rows.map(row => `<tr><td>${escapeHtml(row.decided_at)}</td><td>${badge(row.action, row.action === "Block" ? "state-riskoff" : row.action === "ReduceOnly" ? "state-reduced" : "state-trading")}</td><td>${escapeHtml(row.symbol)}</td><td>${escapeHtml(row.resulting_mode)}</td><td>${escapeHtml(row.reason)}</td></tr>`).join("")
+        : `<tr><td colspan="5" class="empty">Aucune décision risk persistante.</td></tr>`;
+    };
+
+    const renderStrategy = (data) => {
+      const latest = data.strategy?.latest_by_symbol || [];
+      document.getElementById("strategy-symbol-grid").innerHTML = latest.length
+        ? latest.map(item => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(item.symbol)}</h3>${badge(`${item.strategy} / ${item.status}`, item.status === "actionable" ? "state-trading" : "state-paused")}</div><div class="metric-list"><div class="metric-row"><span>Runtime / Risk</span><strong>${escapeHtml(item.runtime_state)} / ${escapeHtml(item.risk_mode)}</strong></div><div class="metric-row"><span>Edge net</span><strong>${escapeHtml(item.best_edge_after_cost_bps)}</strong></div><div class="metric-row"><span>Inventory base</span><strong>${escapeHtml(item.inventory_base)}</strong></div><div class="metric-row"><span>Spread / Toxicity</span><strong>${escapeHtml(item.spread_bps)} / ${escapeHtml(item.toxicity_score)}</strong></div><div class="metric-row"><span>Momentum / Flow</span><strong>${escapeHtml(item.local_momentum_bps)} / ${escapeHtml(item.trade_flow_imbalance)}</strong></div><div class="metric-row"><span>Standby</span><strong>${escapeHtml(item.standby_reason)}</strong></div></div></div>`).join("")
+        : `<div class="empty">Aucun strategy outcome persistant pour l’instant.</div>`;
+
+      const rows = data.strategy?.recent || [];
+      document.getElementById("strategy-rows").innerHTML = rows.length
+        ? rows.map(item => `<tr><td>${escapeHtml(item.observed_at)}</td><td>${escapeHtml(item.symbol)}</td><td>${escapeHtml(item.strategy)}</td><td>${badge(item.status, item.status === "actionable" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(item.best_edge_after_cost_bps)}</td><td>${escapeHtml(String(item.intent_count))} / reduce-only ${escapeHtml(String(item.reduce_only_intents))}</td><td>${escapeHtml(item.standby_reason)}</td><td>${escapeHtml(`spread=${item.spread_bps} tox=${item.toxicity_score} mom=${item.local_momentum_bps} flow=${item.trade_flow_imbalance}`)}</td></tr>`).join("")
+        : `<tr><td colspan="8" class="empty">Aucun strategy outcome récent.</td></tr>`;
+    };
+
+    const renderLogs = (data) => {
+      const groups = [["runtime", "Runtime"], ["health", "Santé"], ["strategy", "Stratégie"], ["risk", "Risk"], ["execution", "Exécution"]];
+      document.getElementById("log-grid").innerHTML = groups.map(([key, title]) => {
+        const items = data.logs?.[key] || [];
+        const body = items.length
+          ? items.map(item => `<div class="log-entry"><div class="log-meta"><span>${escapeHtml(item.timestamp)}</span><span>${escapeHtml(item.level)} · ${escapeHtml(item.target)}</span></div><div class="log-message">${escapeHtml(item.message)}</div><div class="muted">${escapeHtml(item.details)}</div></div>`).join("")
+          : `<div class="empty">Pas de logs ${escapeHtml(title.toLowerCase())} disponibles.</div>`;
+        return `<div class="log-panel"><div class="log-title">${escapeHtml(title)}</div><div class="log-body">${body}</div></div>`;
+      }).join("");
+    };
+
+    const renderDashboard = (data) => {
+      renderHero(data);
+      renderHealth(data);
+      renderTimeline(data);
+      renderPnl(data);
+      renderInventory(data);
+      renderExecution(data);
+      renderRisk(data);
+      renderStrategy(data);
+      renderLogs(data);
+    };
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/summary", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        renderDashboard(data);
+      } catch (error) {
+        document.getElementById("runtime-reason").innerHTML = `Erreur dashboard: ${escapeHtml(error.message)}`;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
