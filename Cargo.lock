@@ -2805,6 +2805,8 @@ dependencies = [
  "risk",
  "storage",
  "strategy_coordinator",
+ "strategy_mm",
+ "strategy_scalp",
  "telemetry",
  "time",
  "tokio",

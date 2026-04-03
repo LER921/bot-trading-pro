@@ -11,13 +11,41 @@ pub enum StrategySelection {
     RiskOff,
 }
 
+#[derive(Debug, Clone)]
+pub struct StrategySelectionConfig {
+    pub scalp_activation_momentum_bps: Decimal,
+    pub scalp_activation_flow_imbalance: Decimal,
+}
+
+impl Default for StrategySelectionConfig {
+    fn default() -> Self {
+        Self {
+            scalp_activation_momentum_bps: Decimal::from(8u32),
+            scalp_activation_flow_imbalance: Decimal::from_str_exact("0.20").unwrap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DefaultStrategyCoordinator {
+    pub selection: StrategySelectionConfig,
     pub market_making: MarketMakingStrategy,
     pub scalping: ScalpingStrategy,
 }
 
 impl DefaultStrategyCoordinator {
+    pub fn new(
+        selection: StrategySelectionConfig,
+        market_making: MarketMakingStrategy,
+        scalping: ScalpingStrategy,
+    ) -> Self {
+        Self {
+            selection,
+            market_making,
+            scalping,
+        }
+    }
+
     pub fn select(&self, context: &StrategyContext) -> StrategySelection {
         if matches!(context.runtime_state, RuntimeState::Paused | RuntimeState::RiskOff | RuntimeState::Shutdown) {
             return StrategySelection::RiskOff;
@@ -26,9 +54,10 @@ impl DefaultStrategyCoordinator {
         match context.regime.state {
             RegimeState::Range => StrategySelection::MarketMaking,
             RegimeState::TrendUp | RegimeState::TrendDown => {
-                if context.features.local_momentum_bps.abs() >= Decimal::from(8u32)
+                if context.features.local_momentum_bps.abs()
+                    >= self.selection.scalp_activation_momentum_bps
                     && context.features.trade_flow_imbalance.abs()
-                        >= Decimal::from_str_exact("0.20").unwrap()
+                        >= self.selection.scalp_activation_flow_imbalance
                 {
                     StrategySelection::Scalping
                 } else {

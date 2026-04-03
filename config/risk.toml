@@ -1,6 +1,7 @@
 max_daily_loss_usdc = "120"
 max_symbol_drawdown_usdc = "60"
 max_open_orders_per_symbol = 8
+max_reject_rate = "0.20"
 stale_market_data_ms = 1500
 stale_account_events_ms = 5000
 max_clock_drift_ms = 250

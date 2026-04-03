@@ -23,15 +23,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use storage::{MemoryStorage, SqliteStorage, StorageEngine};
-use strategy_coordinator::{DefaultStrategyCoordinator, StrategySelection};
+use strategy_coordinator::{
+    DefaultStrategyCoordinator, StrategySelection, StrategySelectionConfig,
+};
+use strategy_mm::{MarketMakingConfig, MarketMakingStrategy};
+use strategy_scalp::{ScalpingConfig, ScalpingStrategy};
 use telemetry::{TelemetrySink, TracingTelemetry};
 use tokio::sync::mpsc::error::TryRecvError;
 use tracing::{info, warn};
-
-const LOOP_INTERVAL_MS: u64 = 1_000;
-const STALE_QUOTE_CANCEL_MS: i64 = 5_000;
-const BOOTSTRAP_TRADE_SEED_LIMIT: usize = 50;
-const FILL_RECOVERY_FETCH_LIMIT: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FillKey {
@@ -88,6 +87,7 @@ where
     G: BinanceSpotGateway + Clone + Send + Sync + 'static,
 {
     pub fn new(config: AppConfig, gateway: G) -> Result<Self> {
+        config.validate()?;
         let symbols = config.enabled_symbols();
         let risk_limits = config.risk_limits();
         let operator_pause_active =
@@ -114,6 +114,7 @@ where
         } else {
             Arc::new(SqliteStorage::new(storage_path)?)
         };
+        let strategy_coordinator = build_strategy_coordinator(&config);
 
         Ok(Self {
             risk_manager: StrictRiskManager::new(risk_limits),
@@ -127,7 +128,7 @@ where
             market_data: InMemoryMarketDataService::default(),
             features: SimpleFeatureEngine::default(),
             regime_detector: ExecutionRegimeDetector::default(),
-            strategy_coordinator: DefaultStrategyCoordinator::default(),
+            strategy_coordinator,
             accounting: InMemoryAccountingService::default(),
             storage,
             telemetry: TracingTelemetry,
@@ -188,7 +189,10 @@ where
 
             for trade in self
                 .gateway
-                .fetch_recent_trades(symbol, BOOTSTRAP_TRADE_SEED_LIMIT)
+                .fetch_recent_trades(
+                    symbol,
+                    self.config.calibration.execution.bootstrap_trade_seed_limit,
+                )
                 .await?
             {
                 self.health_tracker.record_trade(symbol, trade.event_time);
@@ -269,7 +273,10 @@ where
         let execution_stats = self.execution.stats().await;
         self.telemetry.emit_execution_stats(&execution_stats).await?;
         self.execution
-            .cancel_stale_orders(STALE_QUOTE_CANCEL_MS, &mid_prices)
+            .cancel_stale_orders(
+                self.config.calibration.execution.stale_order_cancel_ms,
+                &mid_prices,
+            )
             .await?;
         let risk_context = RiskContext {
             account: account.clone(),
@@ -500,7 +507,9 @@ where
 
     pub async fn run_until_shutdown(mut self) -> Result<()> {
         self.bootstrap().await?;
-        let mut interval = tokio::time::interval(Duration::from_millis(LOOP_INTERVAL_MS));
+        let mut interval = tokio::time::interval(Duration::from_millis(
+            self.config.calibration.execution.loop_interval_ms,
+        ));
 
         loop {
             tokio::select! {
@@ -786,7 +795,10 @@ where
         for (symbol, recoveries) in recoveries_by_symbol {
             match self
                 .gateway
-                .fetch_recent_fills(symbol, FILL_RECOVERY_FETCH_LIMIT)
+                .fetch_recent_fills(
+                    symbol,
+                    self.config.calibration.execution.fill_recovery_fetch_limit,
+                )
                 .await
             {
                 Ok(fills) => {
@@ -1238,6 +1250,50 @@ fn strategy_selection_label(selection: StrategySelection) -> &'static str {
     }
 }
 
+fn build_strategy_coordinator(config: &AppConfig) -> DefaultStrategyCoordinator {
+    DefaultStrategyCoordinator::new(
+        StrategySelectionConfig {
+            scalp_activation_momentum_bps: config
+                .calibration
+                .selection
+                .scalp_activation_momentum_bps,
+            scalp_activation_flow_imbalance: config
+                .calibration
+                .selection
+                .scalp_activation_flow_imbalance,
+        },
+        MarketMakingStrategy {
+            config: MarketMakingConfig {
+                maker_fee_bps: config.calibration.market_making.maker_fee_bps,
+                slippage_buffer_bps: config.calibration.market_making.slippage_buffer_bps,
+                min_net_edge_bps: config.calibration.market_making.min_net_edge_bps,
+                min_market_spread_bps: config.calibration.market_making.min_market_spread_bps,
+                max_toxicity_score: config.calibration.market_making.max_toxicity_score,
+                base_skew_bps: config.calibration.market_making.base_skew_bps,
+                momentum_skew_weight: config.calibration.market_making.momentum_skew_weight,
+                volatility_widening_weight: config
+                    .calibration
+                    .market_making
+                    .volatility_widening_weight,
+                quote_size_fraction: config.calibration.market_making.quote_size_fraction,
+                quote_ttl_secs: config.calibration.market_making.quote_ttl_secs,
+            },
+        },
+        ScalpingStrategy {
+            config: ScalpingConfig {
+                taker_fee_bps: config.calibration.scalping.taker_fee_bps,
+                slippage_buffer_bps: config.calibration.scalping.slippage_buffer_bps,
+                min_entry_score: config.calibration.scalping.min_entry_score,
+                min_momentum_bps: config.calibration.scalping.min_momentum_bps,
+                max_toxicity_score: config.calibration.scalping.max_toxicity_score,
+                max_position_fraction: config.calibration.scalping.max_position_fraction,
+                quote_size_fraction: config.calibration.scalping.quote_size_fraction,
+                quote_ttl_secs: config.calibration.scalping.quote_ttl_secs,
+            },
+        },
+    )
+}
+
 fn drain_receiver<T>(receiver: &mut tokio::sync::mpsc::Receiver<T>, target: &mut Vec<T>) {
     loop {
         match receiver.try_recv() {
@@ -1251,8 +1307,8 @@ fn drain_receiver<T>(receiver: &mut tokio::sync::mpsc::Receiver<T>, target: &mut
 mod tests {
     use super::*;
     use config_loader::{
-        AppConfig, BinanceConfig, DashboardConfig, InventoryControlConfig, LiveConfig, PairConfig,
-        PairsConfig, RiskConfig, RuntimeConfig,
+        AppConfig, BinanceConfig, CalibrationConfig, DashboardConfig, InventoryControlConfig,
+        LiveConfig, PairConfig, PairsConfig, RiskConfig, RuntimeConfig,
     };
     use domain::{
         AccountSnapshot, Balance, ControlPlaneRequest, ExecutionReport, FillEvent, OperatorCommand,
@@ -1293,6 +1349,7 @@ mod tests {
                 max_daily_loss_usdc: Decimal::from(100u32),
                 max_symbol_drawdown_usdc: Decimal::from(50u32),
                 max_open_orders_per_symbol: 4,
+                max_reject_rate: Decimal::from_str_exact("0.20").unwrap(),
                 stale_market_data_ms: 5_000,
                 stale_account_events_ms: 5_000,
                 max_clock_drift_ms: 500,
@@ -1302,6 +1359,7 @@ mod tests {
                     reduce_only_trigger_ratio: Decimal::from_str_exact("0.90").unwrap(),
                 },
             },
+            calibration: CalibrationConfig::default(),
             dashboard: DashboardConfig {
                 bind_address: "127.0.0.1:8080".to_string(),
                 enable_write_routes: false,

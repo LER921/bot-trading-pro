@@ -20,6 +20,8 @@ regime = { path = "../../crates/regime" }
 risk = { path = "../../crates/risk" }
 storage = { path = "../../crates/storage" }
 strategy_coordinator = { path = "../../crates/strategy_coordinator" }
+strategy_mm = { path = "../../crates/strategy_mm" }
+strategy_scalp = { path = "../../crates/strategy_scalp" }
 telemetry = { path = "../../crates/telemetry" }
 tokio.workspace = true
 time.workspace = true
