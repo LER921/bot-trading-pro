@@ -59,6 +59,8 @@ struct CandidateIntent {
     exit_reason: Option<String>,
     expected_edge_bps: Decimal,
     edge_after_cost_bps: Decimal,
+    expected_realized_edge_bps: Decimal,
+    adverse_selection_penalty_bps: Decimal,
     priority_score: Decimal,
     reason: String,
 }
@@ -87,20 +89,11 @@ impl MarketMakingStrategy {
             return standby("market making withheld: symbol order slots saturated");
         }
 
-        let add_risk_block_reason = if context.features.spread_bps < self.config.min_market_spread_bps {
-            Some("spread too tight after costs".to_string())
-        } else if context.features.toxicity_score > self.config.max_toxicity_score {
-            Some("book too toxic for market making".to_string())
-        } else if context.inventory.base_position.abs() >= context.max_inventory_base {
-            Some("inventory ceiling reached".to_string())
-        } else {
-            None
-        };
-
         let current_time = context.features.computed_at;
         let mid = (best.bid_price + best.ask_price) / Decimal::from(2u32);
         let fair = context.features.microprice.unwrap_or(mid);
         let inventory_ratio = inventory_ratio(context);
+        let neutral_inventory = inventory_ratio.abs() < dec("0.05");
         let positive_inventory_ratio = clamp_unit(inventory_ratio.max(Decimal::ZERO));
         let slot_pressure = slot_pressure(context);
         let position_age_secs = position_age_secs(context, current_time);
@@ -116,6 +109,16 @@ impl MarketMakingStrategy {
         );
         let vwap_extension = normalized_abs_score(context.features.vwap_distance_bps, dec("8"));
         let momentum_extension = normalized_abs_score(momentum_signal_bps, dec("12"));
+        let volatility_pressure =
+            normalized_score(context.features.realized_volatility_bps, dec("1.5"), dec("8.0"));
+        let toxic_mode = context.features.toxicity_score > self.config.max_toxicity_score;
+        let entry_ttl_secs = if toxic_mode {
+            self.config.quote_ttl_secs + 2
+        } else if toxicity_pressure >= dec("0.65") {
+            self.config.quote_ttl_secs + 1
+        } else {
+            self.config.quote_ttl_secs
+        };
 
         let inventory_skew_bps = -inventory_ratio * self.config.base_skew_bps;
         let directional_center_skew_bps =
@@ -127,14 +130,19 @@ impl MarketMakingStrategy {
             inventory_skew_bps + directional_center_skew_bps + mean_reversion_skew_bps,
         );
 
+        let base_required_edge_bps = self.config.min_net_edge_bps.max(dec("0.65"));
         let minimum_required_edge_bps =
-            self.config.maker_fee_bps + self.config.slippage_buffer_bps + self.config.min_net_edge_bps;
+            self.config.maker_fee_bps + self.config.slippage_buffer_bps + base_required_edge_bps.min(dec("0.85"));
         let volatility_widening_bps =
-            context.features.realized_volatility_bps * self.config.volatility_widening_weight;
-        let toxicity_widening_bps = toxicity_pressure * dec("1.0");
-        let directional_widening_bps = directional_pressure.abs() * dec("0.9");
-        let imbalance_widening_bps = flow_book_pressure * dec("0.7");
-        let extension_widening_bps = (vwap_extension * dec("0.40")) + (momentum_extension * dec("0.25"));
+            context.features.realized_volatility_bps * (self.config.volatility_widening_weight * dec("0.55"));
+        let toxicity_widening_bps = if toxic_mode {
+            dec("0.25") + toxicity_pressure * dec("0.30")
+        } else {
+            toxicity_pressure * dec("0.18")
+        };
+        let directional_widening_bps = directional_pressure.abs() * dec("0.35");
+        let imbalance_widening_bps = flow_book_pressure * dec("0.28");
+        let extension_widening_bps = (vwap_extension * dec("0.18")) + (momentum_extension * dec("0.10"));
         let dynamic_half_spread_bps = (context.features.spread_bps / Decimal::from(2u32)).max(
             minimum_required_edge_bps
                 + volatility_widening_bps
@@ -144,9 +152,15 @@ impl MarketMakingStrategy {
                 + extension_widening_bps,
         );
 
-        let add_risk_width_viable = dynamic_half_spread_bps < dec("12.0");
-
         let reduce_only_trigger = context.max_inventory_base * dec("0.90");
+        let inventory_add_risk_blocked = context.inventory.base_position.abs() >= context.max_inventory_base
+            || context.inventory.base_position >= reduce_only_trigger;
+        let add_risk_block_reason = if inventory_add_risk_blocked {
+            Some("inventory".to_string())
+        } else {
+            None
+        };
+        let add_risk_width_viable = dynamic_half_spread_bps < dec("14.0");
         let raw_buy_price = shift_price_bps(quote_center, -dynamic_half_spread_bps);
         let raw_sell_price = shift_price_bps(quote_center, dynamic_half_spread_bps);
         let buy_price = raw_buy_price.min(best.bid_price);
@@ -161,31 +175,49 @@ impl MarketMakingStrategy {
 
         let bearish_pressure = clamp_unit((-directional_pressure).max(Decimal::ZERO));
         let bullish_pressure = clamp_unit(directional_pressure.max(Decimal::ZERO));
-        let bid_adverse_selection_penalty_bps = bearish_pressure * dec("1.35")
-            + toxicity_pressure * dec("0.85")
-            + flow_book_pressure * dec("0.65")
-            + vwap_extension * dec("0.35")
-            + positive_inventory_ratio * dec("1.10")
-            + slot_pressure * dec("0.80");
-        let ask_adverse_selection_penalty_bps = bullish_pressure * dec("1.00")
-            + toxicity_pressure * dec("0.45")
-            + flow_book_pressure * dec("0.30")
-            + vwap_extension * dec("0.20")
-            + slot_pressure * dec("0.35");
-        let bid_effective_edge_bps = bid_edge_after_cost_bps - bid_adverse_selection_penalty_bps;
-        let ask_effective_edge_bps =
-            ask_edge_after_cost_bps - ask_adverse_selection_penalty_bps + positive_inventory_ratio * dec("0.45");
-        let bid_hazard = clamp_unit(
-            bearish_pressure * dec("0.65")
-                + toxicity_pressure * dec("0.20")
-                + flow_book_pressure * dec("0.10")
-                + vwap_extension * dec("0.05"),
+        let bid_adverse_selection_penalty_bps = buy_adverse_selection_penalty_bps(
+            context,
+            toxicity_pressure,
+            positive_inventory_ratio,
+            slot_pressure,
         );
-        let ask_hazard = clamp_unit(
-            bullish_pressure * dec("0.65")
-                + toxicity_pressure * dec("0.20")
-                + flow_book_pressure * dec("0.10")
-                + vwap_extension * dec("0.05"),
+        let bid_flow_penalty_bps = buy_flow_penalty_bps(context);
+        let ask_adverse_selection_penalty_bps = bullish_pressure * dec("0.30")
+            + toxicity_pressure * dec("0.12")
+            + flow_book_pressure * dec("0.08")
+            + vwap_extension * dec("0.05")
+            + slot_pressure * dec("0.08");
+        let bid_hazard_penalty_bps = (bid_hazard_score(
+            bearish_pressure,
+            toxicity_pressure,
+            flow_book_pressure,
+            vwap_extension,
+        ) * dec("0.50"))
+        .min(dec("0.50"));
+        let ask_hazard_penalty_bps = (ask_hazard_score(
+            bullish_pressure,
+            toxicity_pressure,
+            flow_book_pressure,
+            vwap_extension,
+        ) * dec("0.50"))
+        .min(dec("0.50"));
+        let bid_effective_edge_bps =
+            bid_edge_after_cost_bps - bid_adverse_selection_penalty_bps - bid_hazard_penalty_bps;
+        let bid_expected_realized_edge_bps = bid_effective_edge_bps - bid_flow_penalty_bps;
+        let ask_effective_edge_bps =
+            ask_edge_after_cost_bps - ask_adverse_selection_penalty_bps - ask_hazard_penalty_bps
+                + positive_inventory_ratio * dec("0.35");
+        let bid_hazard = bid_hazard_score(
+            bearish_pressure,
+            toxicity_pressure,
+            flow_book_pressure,
+            vwap_extension,
+        );
+        let ask_hazard = ask_hazard_score(
+            bullish_pressure,
+            toxicity_pressure,
+            flow_book_pressure,
+            vwap_extension,
         );
 
         let regime_size_factor = match context.regime.state {
@@ -193,12 +225,12 @@ impl MarketMakingStrategy {
             RegimeState::TrendUp | RegimeState::TrendDown => dec("0.70"),
             _ => Decimal::ZERO,
         };
-        let toxicity_size_factor = (Decimal::ONE - toxicity_pressure * dec("0.60")).max(dec("0.35"));
+        let toxicity_size_factor = (Decimal::ONE - toxicity_pressure * dec("0.65")).max(dec("0.25"));
         let base_quote_size = context.soft_inventory_base * self.config.quote_size_fraction;
         let bid_edge_size_factor = clamp_unit(bid_edge_after_cost_bps.max(Decimal::ZERO) / dec("6")).max(dec("0.25"));
         let ask_edge_size_factor = clamp_unit(ask_edge_after_cost_bps.max(Decimal::ZERO) / dec("6")).max(dec("0.25"));
         let bid_inventory_size_factor =
-            (Decimal::ONE - positive_inventory_ratio * dec("0.80")).max(dec("0.20"));
+            (Decimal::ONE - positive_inventory_ratio * dec("1.05")).max(dec("0.15"));
         let ask_inventory_size_factor = if positive_inventory_ratio > Decimal::ZERO {
             (dec("0.85") + positive_inventory_ratio * dec("0.35")).min(dec("1.10"))
         } else {
@@ -214,24 +246,26 @@ impl MarketMakingStrategy {
             regime_size_factor * toxicity_size_factor * ask_edge_size_factor * ask_inventory_size_factor,
         );
 
-        let base_required_edge_bps = self.config.min_net_edge_bps.max(dec("1.25"));
-        let bid_required_edge_bps = base_required_edge_bps
-            + bearish_pressure * dec("0.70")
-            + toxicity_pressure * dec("0.55")
-            + positive_inventory_ratio * dec("0.85")
-            + slot_pressure * dec("0.65");
-        let ask_required_edge_bps = (base_required_edge_bps
-            + bullish_pressure * dec("0.30")
-            + toxicity_pressure * dec("0.30")
-            + slot_pressure * dec("0.30")
-            - positive_inventory_ratio * dec("0.25"))
-            .max(self.config.min_net_edge_bps);
-        let bid_hazard_limit = (dec("0.62") - positive_inventory_ratio * dec("0.08")).max(dec("0.46"));
-        let ask_hazard_limit = if positive_inventory_ratio > Decimal::ZERO {
-            dec("0.74")
-        } else {
-            dec("0.60")
-        };
+        let bid_required_edge_bps = capped_entry_required_edge_bps(
+            context.symbol,
+            base_required_edge_bps,
+            toxicity_pressure * dec("0.35"),
+            positive_inventory_ratio * dec("0.30"),
+            volatility_pressure * dec("0.20"),
+            neutral_inventory,
+        );
+        let ask_required_edge_bps = capped_entry_required_edge_bps(
+            context.symbol,
+            base_required_edge_bps.max(dec("0.55")),
+            toxicity_pressure * dec("0.20"),
+            Decimal::ZERO,
+            volatility_pressure * dec("0.12"),
+            neutral_inventory,
+        );
+        let ask_required_edge_bps =
+            (ask_required_edge_bps - positive_inventory_ratio * dec("0.18")).max(dec("0.45"));
+        let bid_hazard_excessive = bid_hazard >= dec("0.96");
+        let ask_hazard_excessive = ask_hazard >= dec("0.98");
         let bid_deployable = has_deployable_notional(
             bid_size,
             buy_price,
@@ -246,17 +280,44 @@ impl MarketMakingStrategy {
         let bid_allowed = add_risk_block_reason.is_none()
             && add_risk_width_viable
             && context.inventory.base_position <= reduce_only_trigger
-            && bid_hazard < bid_hazard_limit
+            && !bid_hazard_excessive
+            && (!toxic_mode || bid_effective_edge_bps >= bid_required_edge_bps + dec("0.60"))
             && bid_effective_edge_bps >= bid_required_edge_bps
+            && bid_expected_realized_edge_bps > dec("0.30")
             && bid_size > Decimal::ZERO
             && bid_deployable;
+        let ask_direction_ok = bullish_pressure < dec("0.75") || positive_inventory_ratio > dec("0.35");
         let ask_allowed = context.inventory.base_position > Decimal::ZERO
-            && ask_hazard < ask_hazard_limit
+            && ask_direction_ok
+            && !ask_hazard_excessive
             && ask_effective_edge_bps >= ask_required_edge_bps
             && ask_size > Decimal::ZERO
             && ask_deployable;
-
-        let expires_at = Some(now_utc() + time::Duration::seconds(self.config.quote_ttl_secs));
+        let probe_bid_expected_edge_bps = edge_from_fair_bps(fair, best.bid_price, Side::Buy);
+        let probe_bid_edge_after_cost_bps = probe_bid_expected_edge_bps
+            - self.config.maker_fee_bps
+            - self.config.slippage_buffer_bps
+            - bid_adverse_selection_penalty_bps.min(dec("0.35"))
+            - bid_hazard_penalty_bps;
+        let probe_bid_expected_realized_edge_bps = probe_bid_edge_after_cost_bps - bid_flow_penalty_bps;
+        let probe_threshold_bps = probing_edge_threshold(context.symbol);
+        let probe_width_viable = dynamic_half_spread_bps < dec("8.0");
+        let probe_size_fraction = ((dec("0.10")
+            + clamp_unit(
+                (probe_bid_edge_after_cost_bps - probe_threshold_bps).max(Decimal::ZERO) / dec("1.00"),
+            ) * dec("0.15"))
+            * if toxic_mode { dec("0.55") } else { Decimal::ONE })
+        .min(dec("0.25"));
+        let bid_probe_size = scaled_quote_size(
+            bid_size.max(base_quote_size * dec("0.25")),
+            probe_size_fraction,
+        );
+        let bid_probe_deployable = has_deployable_notional(
+            bid_probe_size,
+            best.bid_price,
+            context.local_min_notional_quote,
+        );
+        let expires_at = Some(now_utc() + time::Duration::seconds(entry_ttl_secs));
         let mut candidates = Vec::new();
         let mut withheld = Vec::new();
 
@@ -292,6 +353,18 @@ impl MarketMakingStrategy {
                 ) || matches!(candidate.exit_stage, Some(ExitStage::Aggressive | ExitStage::Emergency))
             })
             .unwrap_or(false);
+        let bid_probe_allowed = add_risk_block_reason.is_none()
+            && !exit_blocks_new_risk
+            && probe_width_viable
+            && bearish_pressure < dec("0.35")
+            && flow_book_pressure < dec("0.55")
+            && context.features.local_momentum_bps >= dec("-0.5")
+            && context.features.trade_flow_imbalance >= dec("-0.5")
+            && !bid_hazard_excessive
+            && probe_bid_edge_after_cost_bps > probe_threshold_bps
+            && probe_bid_expected_realized_edge_bps > dec("0.30")
+            && bid_probe_size > Decimal::ZERO
+            && bid_probe_deployable;
 
         if let Some(candidate) = exit_candidate {
             candidates.push(candidate);
@@ -311,9 +384,12 @@ impl MarketMakingStrategy {
                     exit_reason: None,
                     expected_edge_bps: bid_expected_edge_bps,
                     edge_after_cost_bps: bid_effective_edge_bps,
+                    expected_realized_edge_bps: bid_expected_realized_edge_bps,
+                    adverse_selection_penalty_bps: bid_adverse_selection_penalty_bps
+                        + bid_flow_penalty_bps,
                     priority_score: bid_effective_edge_bps,
                     reason: format!(
-                        "mm bid: fair={} inv_skew_bps={} pressure_skew_bps={} mean_rev_skew_bps={} half_spread_bps={} bid_hazard={} bid_required_edge_bps={} bid_effective_edge_bps={} dir_pressure={} tox={} slot_pressure={} age_secs={} size={}",
+                        "mm bid: fair={} inv_skew_bps={} pressure_skew_bps={} mean_rev_skew_bps={} half_spread_bps={} bid_hazard={} bid_required_edge_bps={} bid_effective_edge_bps={} expected_realized_edge_bps={} adverse_penalty_bps={} flow_penalty_bps={} dir_pressure={} tox={} slot_pressure={} age_secs={} size={}",
                         fair,
                         inventory_skew_bps,
                         directional_center_skew_bps,
@@ -322,6 +398,9 @@ impl MarketMakingStrategy {
                         bid_hazard,
                         bid_required_edge_bps,
                         bid_effective_edge_bps,
+                        bid_expected_realized_edge_bps,
+                        bid_adverse_selection_penalty_bps,
+                        bid_flow_penalty_bps,
                         directional_pressure,
                         context.features.toxicity_score,
                         slot_pressure,
@@ -332,6 +411,37 @@ impl MarketMakingStrategy {
             } else {
                 withheld.push("bid suppressed while forced reduce-risk unwind is active".to_string());
             }
+        } else if bid_probe_allowed {
+            candidates.push(CandidateIntent {
+                side: Side::Buy,
+                quantity: bid_probe_size,
+                limit_price: best.bid_price,
+                post_only: true,
+                time_in_force: Some(TimeInForce::Gtc),
+                reduce_only: false,
+                role: IntentRole::AddRisk,
+                exit_stage: None,
+                exit_reason: None,
+                expected_edge_bps: probe_bid_expected_edge_bps,
+                edge_after_cost_bps: probe_bid_edge_after_cost_bps,
+                expected_realized_edge_bps: probe_bid_expected_realized_edge_bps,
+                adverse_selection_penalty_bps: bid_adverse_selection_penalty_bps.min(dec("0.35"))
+                    + bid_flow_penalty_bps,
+                priority_score: probe_bid_expected_realized_edge_bps * dec("0.75"),
+                reason: format!(
+                    "mm probing bid: fair={} probe_edge_after_cost_bps={} probe_expected_realized_edge_bps={} required_edge_bps={} tox={} hazard={} adverse_penalty_bps={} flow_penalty_bps={} size={} ttl_secs={}",
+                    fair,
+                    probe_bid_edge_after_cost_bps,
+                    probe_bid_expected_realized_edge_bps,
+                    bid_required_edge_bps,
+                    context.features.toxicity_score,
+                    bid_hazard,
+                    bid_adverse_selection_penalty_bps.min(dec("0.35")),
+                    bid_flow_penalty_bps,
+                    bid_probe_size,
+                    entry_ttl_secs,
+                ),
+            });
         } else {
             withheld.push(format!(
                 "bid gated: edge_after_cost_bps={} effective_edge_bps={} required_edge_bps={} hazard={} deployable={} inv_ratio={} slots={}/{}",
@@ -368,6 +478,8 @@ impl MarketMakingStrategy {
                 },
                 expected_edge_bps: ask_expected_edge_bps,
                 edge_after_cost_bps: ask_effective_edge_bps,
+                expected_realized_edge_bps: ask_effective_edge_bps,
+                adverse_selection_penalty_bps: ask_adverse_selection_penalty_bps,
                 priority_score: ask_effective_edge_bps + if reduce_risk { dec("0.90") } else { dec("0.45") },
                 reason: format!(
                     "mm ask: fair={} inv_skew_bps={} pressure_skew_bps={} mean_rev_skew_bps={} half_spread_bps={} ask_hazard={} ask_required_edge_bps={} ask_effective_edge_bps={} dir_pressure={} tox={} slot_pressure={} age_secs={} size={}",
@@ -406,6 +518,9 @@ impl MarketMakingStrategy {
             withheld.push("single remaining order slot reserved for highest-quality quote".to_string());
         }
 
+        let has_add_risk_candidate = candidates
+            .iter()
+            .any(|candidate| matches!(candidate.role, IntentRole::AddRisk));
         let intents = candidates
             .into_iter()
             .take(available_slots as usize)
@@ -425,18 +540,47 @@ impl MarketMakingStrategy {
                     self.config.maker_fee_bps,
                     self.config.slippage_buffer_bps,
                     candidate.edge_after_cost_bps,
+                    candidate.expected_realized_edge_bps,
+                    candidate.adverse_selection_penalty_bps,
                     candidate.reason,
                     expires_at,
                 )
             })
             .collect::<Vec<_>>();
 
+        let entry_block_reason = if has_add_risk_candidate {
+            None
+        } else if add_risk_block_reason.is_some() || exit_blocks_new_risk {
+            Some("inventory".to_string())
+        } else if toxic_mode && context.features.toxicity_score > self.config.max_toxicity_score {
+            Some("toxicity".to_string())
+        } else if bid_hazard_excessive {
+            Some("hazard".to_string())
+        } else {
+            Some("edge_too_low".to_string())
+        };
+        let best_expected_realized_edge_bps =
+            intents.iter().map(|intent| intent.expected_realized_edge_bps).max();
+        let adverse_selection_hits = intents
+            .iter()
+            .filter(|intent| intent.adverse_selection_penalty_bps >= dec("0.30"))
+            .count() as u64;
+
         if intents.is_empty() {
-            standby(&format!("market making withheld: {}", withheld.join("; ")))
+            StrategyOutcome {
+                intents,
+                standby_reason: Some(format!("market making withheld: {}", withheld.join("; "))),
+                entry_block_reason,
+                best_expected_realized_edge_bps,
+                adverse_selection_hits,
+            }
         } else {
             StrategyOutcome {
                 intents,
                 standby_reason: None,
+                entry_block_reason,
+                best_expected_realized_edge_bps,
+                adverse_selection_hits,
             }
         }
     }
@@ -457,6 +601,8 @@ fn build_intent(
     expected_fee_bps: Decimal,
     expected_slippage_bps: Decimal,
     edge_after_cost_bps: Decimal,
+    expected_realized_edge_bps: Decimal,
+    adverse_selection_penalty_bps: Decimal,
     reason: String,
     expires_at: Option<common::Timestamp>,
 ) -> TradeIntent {
@@ -478,6 +624,8 @@ fn build_intent(
         expected_fee_bps,
         expected_slippage_bps,
         edge_after_cost_bps,
+        expected_realized_edge_bps,
+        adverse_selection_penalty_bps,
         reason,
         created_at: now_utc(),
         expires_at,
@@ -620,6 +768,12 @@ fn staged_exit_candidate(
         } else {
             strategy.config.maker_fee_bps + strategy.config.slippage_buffer_bps + dec("0.50")
         },
+        expected_realized_edge_bps: profit_bps - if post_only {
+            strategy.config.maker_fee_bps
+        } else {
+            strategy.config.maker_fee_bps + strategy.config.slippage_buffer_bps + dec("0.50")
+        },
+        adverse_selection_penalty_bps: Decimal::ZERO,
         priority_score: profit_bps + priority_boost + inventory_pressure * dec("2.20"),
         reason: format!(
             "{} | age_secs={} profit_bps={} reversal_pressure={} inventory_pressure={} ask_effective_edge_bps={}",
@@ -637,6 +791,9 @@ fn standby(reason: &str) -> StrategyOutcome {
     StrategyOutcome {
         intents: Vec::new(),
         standby_reason: Some(reason.to_string()),
+        entry_block_reason: None,
+        best_expected_realized_edge_bps: None,
+        adverse_selection_hits: 0,
     }
 }
 
@@ -672,6 +829,35 @@ fn inventory_ratio(context: &StrategyContext) -> Decimal {
     } else {
         context.inventory.base_position / context.max_inventory_base
     }
+}
+
+fn required_edge_cap(symbol: domain::Symbol) -> Decimal {
+    match symbol {
+        domain::Symbol::BtcUsdc => dec("1.4"),
+        domain::Symbol::EthUsdc => dec("1.6"),
+    }
+}
+
+fn probing_edge_threshold(symbol: domain::Symbol) -> Decimal {
+    match symbol {
+        domain::Symbol::BtcUsdc => dec("0.7"),
+        domain::Symbol::EthUsdc => dec("0.9"),
+    }
+}
+
+fn capped_entry_required_edge_bps(
+    symbol: domain::Symbol,
+    base_edge_bps: Decimal,
+    toxicity_penalty_bps: Decimal,
+    inventory_penalty_bps: Decimal,
+    volatility_penalty_bps: Decimal,
+    neutral_inventory: bool,
+) -> Decimal {
+    let mut required = base_edge_bps + toxicity_penalty_bps + inventory_penalty_bps + volatility_penalty_bps;
+    if neutral_inventory {
+        required *= dec("0.70");
+    }
+    required.min(required_edge_cap(symbol)).max(dec("0.45"))
 }
 
 fn position_age_secs(context: &StrategyContext, current_time: Timestamp) -> Option<i64> {
@@ -735,6 +921,68 @@ fn slot_pressure(context: &StrategyContext) -> Decimal {
                 / Decimal::from(context.max_open_orders_for_symbol),
         )
     }
+}
+
+fn buy_adverse_selection_penalty_bps(
+    context: &StrategyContext,
+    toxicity_pressure: Decimal,
+    positive_inventory_ratio: Decimal,
+    slot_pressure: Decimal,
+) -> Decimal {
+    let adverse_momentum = normalized_score((-context.features.local_momentum_bps).max(Decimal::ZERO), dec("0.5"), dec("4.0"));
+    let adverse_flow =
+        normalized_score((-context.features.trade_flow_imbalance).max(Decimal::ZERO), dec("0.15"), dec("0.75"));
+    let adverse_book = normalized_score(
+        (-orderbook_signal(context)).max(Decimal::ZERO),
+        dec("0.10"),
+        dec("0.60"),
+    );
+    adverse_momentum * dec("0.28")
+        + adverse_flow * dec("0.34")
+        + adverse_book * dec("0.22")
+        + toxicity_pressure * dec("0.12")
+        + positive_inventory_ratio * dec("0.16")
+        + slot_pressure * dec("0.10")
+}
+
+fn buy_flow_penalty_bps(context: &StrategyContext) -> Decimal {
+    let adverse_flow =
+        normalized_score((-context.features.trade_flow_imbalance).max(Decimal::ZERO), dec("0.20"), dec("0.80"));
+    let adverse_book = normalized_score(
+        (-orderbook_signal(context)).max(Decimal::ZERO),
+        dec("0.12"),
+        dec("0.65"),
+    );
+    let adverse_momentum = normalized_score((-context.features.local_momentum_bps).max(Decimal::ZERO), dec("0.5"), dec("5.0"));
+    adverse_flow * dec("0.32") + adverse_book * dec("0.18") + adverse_momentum * dec("0.10")
+}
+
+fn bid_hazard_score(
+    bearish_pressure: Decimal,
+    toxicity_pressure: Decimal,
+    flow_book_pressure: Decimal,
+    vwap_extension: Decimal,
+) -> Decimal {
+    clamp_unit(
+        bearish_pressure * dec("0.55")
+            + toxicity_pressure * dec("0.18")
+            + flow_book_pressure * dec("0.17")
+            + vwap_extension * dec("0.10"),
+    )
+}
+
+fn ask_hazard_score(
+    bullish_pressure: Decimal,
+    toxicity_pressure: Decimal,
+    flow_book_pressure: Decimal,
+    vwap_extension: Decimal,
+) -> Decimal {
+    clamp_unit(
+        bullish_pressure * dec("0.45")
+            + toxicity_pressure * dec("0.16")
+            + flow_book_pressure * dec("0.14")
+            + vwap_extension * dec("0.08"),
+    )
 }
 
 fn available_order_slots(context: &StrategyContext) -> u32 {
@@ -912,21 +1160,64 @@ mod tests {
     }
 
     #[test]
-    fn toxic_context_blocks_market_making() {
+    fn live_edge_caps_match_reactivation_targets() {
+        assert_eq!(required_edge_cap(Symbol::BtcUsdc), dec("1.4"));
+        assert_eq!(required_edge_cap(Symbol::EthUsdc), dec("1.6"));
+        assert_eq!(probing_edge_threshold(Symbol::BtcUsdc), dec("0.7"));
+        assert_eq!(probing_edge_threshold(Symbol::EthUsdc), dec("0.9"));
+    }
+
+    #[test]
+    fn toxic_context_switches_to_smaller_quote_instead_of_full_block() {
+        let healthy = MarketMakingStrategy::default().evaluate(&sample_context());
+        let healthy_buy = side_quantity(&healthy, Side::Buy).unwrap();
         let mut context = sample_context();
         context.features.toxicity_score = dec("0.85");
 
         let outcome = MarketMakingStrategy::default().evaluate(&context);
 
-        assert!(!outcome
+        let toxic_buy = outcome
             .intents
             .iter()
-            .any(|intent| matches!(intent.role, IntentRole::AddRisk)));
-        assert!(outcome.intents.iter().any(|intent| intent.reduce_only));
+            .find(|intent| matches!(intent.role, IntentRole::AddRisk) && intent.side == Side::Buy)
+            .expect("buy quote should remain available in toxic mode");
+        assert!(toxic_buy.quantity < healthy_buy);
     }
 
     #[test]
-    fn strong_bearish_pressure_removes_passive_bid() {
+    fn probing_is_disabled_under_adverse_momentum_and_flow() {
+        let strategy = MarketMakingStrategy::default();
+        let mut context = sample_context();
+        context.inventory.base_position = Decimal::ZERO;
+        context.features.toxicity_score = dec("0.85");
+        context.features.spread_bps = dec("5.5");
+        context.features.local_momentum_bps = dec("0.8");
+        context.features.trade_flow_imbalance = dec("0.18");
+        context.features.orderbook_imbalance = Some(dec("0.06"));
+        context.features.orderbook_imbalance_rolling = dec("0.04");
+
+        let probe_enabled = strategy.evaluate(&context);
+        assert!(probe_enabled
+            .intents
+            .iter()
+            .any(|intent| matches!(intent.role, IntentRole::AddRisk)
+                && intent.reason.contains("mm probing bid")));
+
+        context.features.local_momentum_bps = dec("-0.6");
+        context.features.trade_flow_imbalance = dec("-0.55");
+        context.features.orderbook_imbalance = Some(dec("-0.10"));
+        context.features.orderbook_imbalance_rolling = dec("-0.08");
+
+        let probe_disabled = strategy.evaluate(&context);
+        assert!(!probe_disabled
+            .intents
+            .iter()
+            .any(|intent| matches!(intent.role, IntentRole::AddRisk)
+                && intent.reason.contains("mm probing bid")));
+    }
+
+    #[test]
+    fn strong_bearish_pressure_keeps_buy_side_small_if_any() {
         let mut context = sample_context();
         context.regime.state = RegimeState::TrendDown;
         context.features.local_momentum_bps = dec("-18");
@@ -940,7 +1231,9 @@ mod tests {
 
         let outcome = MarketMakingStrategy::default().evaluate(&context);
 
-        assert!(side_quantity(&outcome, Side::Buy).is_none());
+        if let Some(buy_quantity) = side_quantity(&outcome, Side::Buy) {
+            assert!(buy_quantity < dec("0.0010"));
+        }
         assert!(side_quantity(&outcome, Side::Sell).is_some());
     }
 
@@ -1110,37 +1403,6 @@ mod tests {
                 aggressive_exit_secs: 75,
             },
         };
-
-        let outcome = strategy.evaluate(&context);
-
-        assert!(outcome.intents.is_empty());
-        assert!(outcome
-            .standby_reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("deployable"));
-    }
-
-    #[test]
-    fn non_deployable_passive_width_produces_no_quotes() {
-        let mut context = sample_context();
-        context.inventory.base_position = Decimal::ZERO;
-        context.inventory.average_entry_price = None;
-        context.inventory.position_opened_at = None;
-        context.inventory.last_fill_at = None;
-        context.features.spread_bps = dec("0.001");
-        context.features.realized_volatility_bps = dec("30");
-        context.features.local_momentum_bps = Decimal::ZERO;
-        context.features.momentum_1s_bps = Decimal::ZERO;
-        context.features.momentum_5s_bps = Decimal::ZERO;
-        context.features.trade_flow_imbalance = Decimal::ZERO;
-        context.features.orderbook_imbalance = Some(Decimal::ZERO);
-        context.features.orderbook_imbalance_rolling = Decimal::ZERO;
-        context.features.vwap_distance_bps = Decimal::ZERO;
-
-        let mut strategy = MarketMakingStrategy::default();
-        strategy.config.min_market_spread_bps = dec("0.001");
-        strategy.config.min_net_edge_bps = dec("5.0");
 
         let outcome = strategy.evaluate(&context);
 

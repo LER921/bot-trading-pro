@@ -225,6 +225,15 @@ struct ExecutionStatsView {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+struct ExecutionQualityView {
+    realized_edge_vs_expected_bps: Option<String>,
+    expected_realized_edge_bps: Option<String>,
+    avg_markout_bps: Option<String>,
+    adverse_selection_hits: u64,
+    samples: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
 struct ExecutionReportView {
     event_time: String,
     client_order_id: String,
@@ -243,6 +252,9 @@ struct ExecutionReportView {
     submit_to_first_report_ms: Option<i64>,
     submit_to_fill_ms: Option<i64>,
     exchange_order_age_ms: Option<i64>,
+    edge_after_cost_bps: Option<String>,
+    expected_realized_edge_bps: Option<String>,
+    adverse_selection_penalty_bps: Option<String>,
     intent_role: Option<String>,
     exit_stage: Option<String>,
     exit_reason: Option<String>,
@@ -273,6 +285,7 @@ struct FillView {
 #[derive(Debug, Clone, Serialize, Default)]
 struct ExecutionPanel {
     latest_stats: Option<ExecutionStatsView>,
+    quality: ExecutionQualityView,
     recent_reports: Vec<ExecutionReportView>,
     open_orders: Vec<ExecutionReportView>,
     recent_fills: Vec<FillView>,
@@ -304,8 +317,10 @@ struct StrategyOutcomeView {
     strategy: String,
     status: String,
     standby_reason: String,
+    entry_block_reason: Option<String>,
     intent_count: u64,
     best_edge_after_cost_bps: String,
+    best_expected_realized_edge_bps: Option<String>,
     reduce_only_intents: u64,
     sample_reason: String,
     runtime_state: String,
@@ -331,6 +346,7 @@ struct StrategyOutcomeView {
     inventory_pressure_exit_intents: u64,
     adverse_exit_intents: u64,
     profit_capture_exit_intents: u64,
+    adverse_selection_hits: u64,
     oldest_inventory_age_ms: Option<i64>,
     stale_inventory_count: u64,
 }
@@ -473,6 +489,7 @@ async fn build_summary(state: &AppState) -> Result<DashboardSummary> {
     let recent_reports = fetch_recent_execution_reports(&state.pool, session_started_at).await?;
     let open_orders = fetch_open_orders(&state.pool).await?;
     let recent_fills = fetch_recent_fills(&state.pool, session_started_at).await?;
+    let quality = fetch_execution_quality(&state.pool, session_started_at).await?;
     let status_counts = fetch_execution_status_counts(&state.pool, session_started_at).await?;
     let local_reject_causes = fetch_local_reject_causes(&state.pool, session_started_at).await?;
     let (total_fills, external_fills) = fetch_fill_counts(&state.pool, session_started_at).await?;
@@ -508,6 +525,7 @@ async fn build_summary(state: &AppState) -> Result<DashboardSummary> {
         inventory,
         execution: ExecutionPanel {
             latest_stats,
+            quality,
             recent_reports,
             open_orders,
             recent_fills,
@@ -1092,6 +1110,7 @@ async fn fetch_recent_execution_reports(
                        filled_quantity, average_fill_price, fill_ratio, requested_price,
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                        submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                       edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
                        intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 WHERE event_time >= ?
@@ -1109,6 +1128,7 @@ async fn fetch_recent_execution_reports(
                        filled_quantity, average_fill_price, fill_ratio, requested_price,
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                        submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                       edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
                        intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 ORDER BY id DESC
@@ -1135,6 +1155,7 @@ async fn fetch_open_orders(pool: &Pool<Sqlite>) -> Result<Vec<ExecutionReportVie
                    e.filled_quantity, e.average_fill_price, e.fill_ratio, e.requested_price,
                    e.slippage_bps, e.decision_latency_ms, e.submit_ack_latency_ms,
                    e.submit_to_first_report_ms, e.submit_to_fill_ms, e.exchange_order_age_ms,
+                   e.edge_after_cost_bps, e.expected_realized_edge_bps, e.adverse_selection_penalty_bps,
                    e.intent_role, e.exit_stage, e.exit_reason, e.message
             FROM execution_reports e
             JOIN latest l ON l.max_id = e.id
@@ -1222,6 +1243,145 @@ async fn fetch_recent_fills(
             fee_quote: row.get("fee_quote"),
         })
         .collect())
+}
+
+async fn fetch_execution_quality(
+    pool: &Pool<Sqlite>,
+    session_started_at: Option<&str>,
+) -> Result<ExecutionQualityView> {
+    let rows = default_if_missing(
+        if let Some(since) = session_started_at {
+            sqlx::query(
+                r#"
+                WITH latest_reports AS (
+                    SELECT exchange_order_id, MAX(id) AS max_id
+                    FROM execution_reports
+                    WHERE exchange_order_id IS NOT NULL
+                    GROUP BY exchange_order_id
+                ),
+                latest_inventory AS (
+                    SELECT i.symbol, i.mark_price
+                    FROM inventory_snapshots i
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM inventory_snapshots
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = i.id
+                )
+                SELECT f.symbol, f.side, f.price, f.quantity, li.mark_price,
+                       er.expected_realized_edge_bps, er.edge_after_cost_bps, er.intent_role
+                FROM fills f
+                JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
+                JOIN execution_reports er ON er.id = lr.max_id
+                LEFT JOIN latest_inventory li ON li.symbol = f.symbol
+                WHERE f.event_time >= ?
+                  AND er.client_order_id LIKE 'bot-%'
+                  AND er.intent_role = 'AddRisk'
+                  AND er.expected_realized_edge_bps IS NOT NULL
+                ORDER BY f.id DESC
+                LIMIT 80
+                "#,
+            )
+            .bind(since)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                WITH latest_reports AS (
+                    SELECT exchange_order_id, MAX(id) AS max_id
+                    FROM execution_reports
+                    WHERE exchange_order_id IS NOT NULL
+                    GROUP BY exchange_order_id
+                ),
+                latest_inventory AS (
+                    SELECT i.symbol, i.mark_price
+                    FROM inventory_snapshots i
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM inventory_snapshots
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = i.id
+                )
+                SELECT f.symbol, f.side, f.price, f.quantity, li.mark_price,
+                       er.expected_realized_edge_bps, er.edge_after_cost_bps, er.intent_role
+                FROM fills f
+                JOIN latest_reports lr ON lr.exchange_order_id = f.order_id
+                JOIN execution_reports er ON er.id = lr.max_id
+                LEFT JOIN latest_inventory li ON li.symbol = f.symbol
+                WHERE er.client_order_id LIKE 'bot-%'
+                  AND er.intent_role = 'AddRisk'
+                  AND er.expected_realized_edge_bps IS NOT NULL
+                ORDER BY f.id DESC
+                LIMIT 80
+                "#,
+            )
+            .fetch_all(pool)
+            .await
+        },
+    )?;
+
+    let mut samples = 0_u64;
+    let mut adverse_selection_hits = 0_u64;
+    let mut realized_delta_sum = Decimal::ZERO;
+    let mut expected_sum = Decimal::ZERO;
+    let mut markout_sum = Decimal::ZERO;
+
+    for row in rows {
+        let Some(fill_price) = parse_decimal_string(&row.get::<String, _>("price")) else {
+            continue;
+        };
+        let Some(mark_price_raw) = row.get::<Option<String>, _>("mark_price") else {
+            continue;
+        };
+        let Some(mark_price) = parse_decimal_string(&mark_price_raw) else {
+            continue;
+        };
+        let Some(expected_realized_edge_bps_raw) =
+            row.get::<Option<String>, _>("expected_realized_edge_bps")
+        else {
+            continue;
+        };
+        let Some(expected_realized_edge_bps) =
+            parse_decimal_string(&expected_realized_edge_bps_raw)
+        else {
+            continue;
+        };
+        if fill_price <= Decimal::ZERO {
+            continue;
+        }
+
+        let side = row.get::<String, _>("side");
+        let markout_bps = if side.eq_ignore_ascii_case("Buy") {
+            ((mark_price - fill_price) / fill_price) * Decimal::from(10_000u32)
+        } else {
+            ((fill_price - mark_price) / fill_price) * Decimal::from(10_000u32)
+        };
+
+        if markout_bps <= Decimal::from_str_exact("-0.30").unwrap() {
+            adverse_selection_hits = adverse_selection_hits.saturating_add(1);
+        }
+
+        samples = samples.saturating_add(1);
+        expected_sum += expected_realized_edge_bps;
+        markout_sum += markout_bps;
+        realized_delta_sum += markout_bps - expected_realized_edge_bps;
+    }
+
+    Ok(if samples == 0 {
+        ExecutionQualityView::default()
+    } else {
+        let sample_count = Decimal::from(samples);
+        ExecutionQualityView {
+            realized_edge_vs_expected_bps: Some(decimal_to_string(
+                realized_delta_sum / sample_count,
+            )),
+            expected_realized_edge_bps: Some(decimal_to_string(expected_sum / sample_count)),
+            avg_markout_bps: Some(decimal_to_string(markout_sum / sample_count)),
+            adverse_selection_hits,
+            samples,
+        }
+    })
 }
 
 async fn fetch_fill_counts(pool: &Pool<Sqlite>, session_started_at: Option<&str>) -> Result<(u64, u64)> {
@@ -1438,15 +1598,15 @@ async fn fetch_latest_strategy_by_symbol(pool: &Pool<Sqlite>) -> Result<Vec<Stra
                 FROM strategy_outcomes
                 GROUP BY symbol
             )
-            SELECT s.observed_at, s.symbol, s.strategy, s.status, s.standby_reason, s.intent_count,
-                   s.best_edge_after_cost_bps, s.reduce_only_intents, s.sample_reason,
+            SELECT s.observed_at, s.symbol, s.strategy, s.status, s.standby_reason, s.entry_block_reason, s.intent_count,
+                   s.best_edge_after_cost_bps, s.best_expected_realized_edge_bps, s.reduce_only_intents, s.sample_reason,
                    s.runtime_state, s.risk_mode, s.inventory_base, s.spread_bps,
                    s.toxicity_score, s.local_momentum_bps, s.trade_flow_imbalance, s.orderbook_imbalance,
                    s.low_edge_intents, s.medium_edge_intents, s.high_edge_intents,
                    s.reduce_risk_intents, s.add_risk_intents, s.open_order_slots_used, s.max_open_order_slots,
                    s.passive_exit_intents, s.aggressive_exit_intents, s.forced_unwind_intents,
                    s.timeout_exit_intents, s.reversal_exit_intents, s.inventory_pressure_exit_intents,
-                   s.adverse_exit_intents, s.profit_capture_exit_intents, s.oldest_inventory_age_ms,
+                   s.adverse_exit_intents, s.profit_capture_exit_intents, s.adverse_selection_hits, s.oldest_inventory_age_ms,
                    s.stale_inventory_count
             FROM strategy_outcomes s
             JOIN latest l ON l.max_id = s.id
@@ -1463,15 +1623,15 @@ async fn fetch_recent_strategy_outcomes(pool: &Pool<Sqlite>) -> Result<Vec<Strat
     let rows = default_if_missing(
         sqlx::query(
             r#"
-            SELECT observed_at, symbol, strategy, status, standby_reason, intent_count,
-                   best_edge_after_cost_bps, reduce_only_intents, sample_reason,
+            SELECT observed_at, symbol, strategy, status, standby_reason, entry_block_reason, intent_count,
+                   best_edge_after_cost_bps, best_expected_realized_edge_bps, reduce_only_intents, sample_reason,
                    runtime_state, risk_mode, inventory_base, spread_bps,
                    toxicity_score, local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
                    low_edge_intents, medium_edge_intents, high_edge_intents,
                    reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots,
                    passive_exit_intents, aggressive_exit_intents, forced_unwind_intents,
                    timeout_exit_intents, reversal_exit_intents, inventory_pressure_exit_intents,
-                   adverse_exit_intents, profit_capture_exit_intents, oldest_inventory_age_ms,
+                   adverse_exit_intents, profit_capture_exit_intents, adverse_selection_hits, oldest_inventory_age_ms,
                    stale_inventory_count
             FROM strategy_outcomes
             ORDER BY id DESC
@@ -1809,6 +1969,9 @@ fn map_execution_report(row: SqliteRow) -> ExecutionReportView {
         submit_to_first_report_ms: row.get("submit_to_first_report_ms"),
         submit_to_fill_ms: row.get("submit_to_fill_ms"),
         exchange_order_age_ms: row.get("exchange_order_age_ms"),
+        edge_after_cost_bps: row.get("edge_after_cost_bps"),
+        expected_realized_edge_bps: row.get("expected_realized_edge_bps"),
+        adverse_selection_penalty_bps: row.get("adverse_selection_penalty_bps"),
         intent_role: row.get("intent_role"),
         exit_stage: row.get("exit_stage"),
         exit_reason: row.get("exit_reason"),
@@ -1823,8 +1986,10 @@ fn map_strategy_outcome(row: SqliteRow) -> StrategyOutcomeView {
         strategy: row.get("strategy"),
         status: row.get("status"),
         standby_reason: row.get("standby_reason"),
+        entry_block_reason: row.get("entry_block_reason"),
         intent_count: row.get::<i64, _>("intent_count").max(0) as u64,
         best_edge_after_cost_bps: row.get("best_edge_after_cost_bps"),
+        best_expected_realized_edge_bps: row.get("best_expected_realized_edge_bps"),
         reduce_only_intents: row.get::<i64, _>("reduce_only_intents").max(0) as u64,
         sample_reason: row.get("sample_reason"),
         runtime_state: row.get("runtime_state"),
@@ -1853,6 +2018,7 @@ fn map_strategy_outcome(row: SqliteRow) -> StrategyOutcomeView {
         adverse_exit_intents: row.get::<i64, _>("adverse_exit_intents").max(0) as u64,
         profit_capture_exit_intents: row.get::<i64, _>("profit_capture_exit_intents").max(0)
             as u64,
+        adverse_selection_hits: row.get::<i64, _>("adverse_selection_hits").max(0) as u64,
         oldest_inventory_age_ms: row.get("oldest_inventory_age_ms"),
         stale_inventory_count: row.get::<i64, _>("stale_inventory_count").max(0) as u64,
     }
@@ -2127,6 +2293,9 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             submit_to_first_report_ms INTEGER,
             submit_to_fill_ms INTEGER,
             exchange_order_age_ms INTEGER,
+            edge_after_cost_bps TEXT,
+            expected_realized_edge_bps TEXT,
+            adverse_selection_penalty_bps TEXT,
             intent_role TEXT,
             exit_stage TEXT,
             exit_reason TEXT
@@ -2146,6 +2315,16 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
     .await?;
     add_column_if_missing(pool, "execution_reports", "submit_to_fill_ms", "INTEGER").await?;
     add_column_if_missing(pool, "execution_reports", "exchange_order_age_ms", "INTEGER").await?;
+    add_column_if_missing(pool, "execution_reports", "edge_after_cost_bps", "TEXT").await?;
+    add_column_if_missing(pool, "execution_reports", "expected_realized_edge_bps", "TEXT")
+        .await?;
+    add_column_if_missing(
+        pool,
+        "execution_reports",
+        "adverse_selection_penalty_bps",
+        "TEXT",
+    )
+    .await?;
     add_column_if_missing(pool, "execution_reports", "intent_role", "TEXT").await?;
     add_column_if_missing(pool, "execution_reports", "exit_stage", "TEXT").await?;
     add_column_if_missing(pool, "execution_reports", "exit_reason", "TEXT").await?;
@@ -2364,8 +2543,10 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             strategy TEXT NOT NULL,
             status TEXT NOT NULL,
             standby_reason TEXT NOT NULL,
+            entry_block_reason TEXT,
             intent_count INTEGER NOT NULL,
             best_edge_after_cost_bps TEXT NOT NULL,
+            best_expected_realized_edge_bps TEXT,
             reduce_only_intents INTEGER NOT NULL,
             sample_reason TEXT NOT NULL,
             runtime_state TEXT NOT NULL,
@@ -2391,12 +2572,27 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             inventory_pressure_exit_intents INTEGER NOT NULL DEFAULT 0,
             adverse_exit_intents INTEGER NOT NULL DEFAULT 0,
             profit_capture_exit_intents INTEGER NOT NULL DEFAULT 0,
+            adverse_selection_hits INTEGER NOT NULL DEFAULT 0,
             oldest_inventory_age_ms INTEGER,
             stale_inventory_count INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )
     .execute(pool)
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "entry_block_reason",
+        "TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "best_expected_realized_edge_bps",
+        "TEXT",
+    )
     .await?;
     add_column_if_missing(
         pool,
@@ -2500,6 +2696,13 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
         pool,
         "strategy_outcomes",
         "profit_capture_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "adverse_selection_hits",
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
@@ -2649,13 +2852,13 @@ mod tests {
         sqlx::query(
             r#"
             INSERT INTO strategy_outcomes (
-                observed_at, symbol, strategy, status, standby_reason, intent_count,
+                observed_at, symbol, strategy, status, standby_reason, entry_block_reason, intent_count,
                 best_edge_after_cost_bps, reduce_only_intents, sample_reason,
                 runtime_state, risk_mode, inventory_base, spread_bps, toxicity_score,
                 local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
                 low_edge_intents, medium_edge_intents, high_edge_intents,
                 reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(OffsetDateTime::UNIX_EPOCH.to_string())
@@ -2663,6 +2866,7 @@ mod tests {
         .bind("market_making")
         .bind("standby")
         .bind("edge too small")
+        .bind(Some("edge_too_low"))
         .bind(0_i64)
         .bind("0")
         .bind(0_i64)
@@ -2693,6 +2897,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "BTCUSDC");
         assert_eq!(rows[0].strategy, "market_making");
+        assert_eq!(rows[0].entry_block_reason.as_deref(), Some("edge_too_low"));
     }
 
     #[tokio::test]
@@ -2971,6 +3176,121 @@ mod tests {
         assert_eq!(reports[0].submit_to_first_report_ms, Some(95));
         assert_eq!(reports[0].submit_to_fill_ms, Some(410));
         assert_eq!(reports[0].exchange_order_age_ms, Some(5_200));
+    }
+
+    #[tokio::test]
+    async fn execution_quality_exposes_realized_vs_expected_and_adverse_hits() {
+        let pool = test_pool().await;
+        let session_start = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2);
+
+        sqlx::query(
+            r#"
+            INSERT INTO inventory_snapshots (
+                observed_at, symbol, base_position, quote_position, mark_price, average_entry_price,
+                position_opened_at, last_fill_at, first_reduce_at, max_quote_notional,
+                reserved_quote_notional, soft_inventory_base, max_inventory_base,
+                neutralization_clip_fraction, reduce_only_trigger_ratio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind((session_start + time::Duration::seconds(30)).to_string())
+        .bind("BTCUSDC")
+        .bind("0.010")
+        .bind("0")
+        .bind(Some("64990"))
+        .bind(Some("65000"))
+        .bind(Some(session_start.to_string()))
+        .bind(Some((session_start + time::Duration::seconds(10)).to_string()))
+        .bind(Option::<String>::None)
+        .bind("2000")
+        .bind("100")
+        .bind("0.018")
+        .bind("0.030")
+        .bind("0.50")
+        .bind("0.85")
+        .execute(&pool)
+        .await
+        .expect("insert inventory snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO execution_reports (
+                event_time, client_order_id, exchange_order_id, symbol, status,
+                filled_quantity, average_fill_price, fill_ratio, requested_price,
+                slippage_bps, decision_latency_ms, submit_ack_latency_ms,
+                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
+                intent_role, exit_stage, exit_reason, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind((session_start + time::Duration::seconds(12)).to_string())
+        .bind("bot-quality-1")
+        .bind(Some("quality-order-1"))
+        .bind("BTCUSDC")
+        .bind("Filled")
+        .bind("0.010")
+        .bind(Some("65000"))
+        .bind("1")
+        .bind(Some("65000"))
+        .bind(Some("0.4"))
+        .bind(Some(18_i64))
+        .bind(Some(72_i64))
+        .bind(Some(95_i64))
+        .bind(Some(410_i64))
+        .bind(Some(520_i64))
+        .bind(Some("1.10"))
+        .bind(Some("0.55"))
+        .bind(Some("0.35"))
+        .bind(Some("AddRisk"))
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Some("filled"))
+        .execute(&pool)
+        .await
+        .expect("insert execution report");
+
+        sqlx::query(
+            r#"
+            INSERT INTO fills (
+                event_time, trade_id, order_id, symbol, side, price, quantity, fee, fee_asset, fee_quote
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind((session_start + time::Duration::seconds(12)).to_string())
+        .bind("trade-quality-1")
+        .bind("quality-order-1")
+        .bind("BTCUSDC")
+        .bind("Buy")
+        .bind("65000")
+        .bind("0.010")
+        .bind("0.01")
+        .bind("USDC")
+        .bind(Some("0.01"))
+        .execute(&pool)
+        .await
+        .expect("insert fill");
+
+        let quality = fetch_execution_quality(&pool, Some(&session_start.to_string()))
+            .await
+            .expect("execution quality");
+
+        assert_eq!(quality.samples, 1);
+        assert_eq!(quality.expected_realized_edge_bps.as_deref(), Some("0.55"));
+        assert_eq!(quality.adverse_selection_hits, 1);
+        assert!(parse_decimal_string(
+            quality
+                .realized_edge_vs_expected_bps
+                .as_deref()
+                .expect("realized vs expected"),
+        )
+        .expect("realized vs expected decimal")
+            < Decimal::ZERO);
+        assert!(parse_decimal_string(
+            quality.avg_markout_bps.as_deref().expect("markout"),
+        )
+        .expect("markout decimal")
+            < Decimal::ZERO);
     }
 
     #[tokio::test]

@@ -82,6 +82,9 @@ impl TrackedOrder {
                 intent_role: order.intent_role,
                 exit_stage: order.exit_stage,
                 exit_reason: order.exit_reason.clone(),
+                edge_after_cost_bps: None,
+                expected_realized_edge_bps: None,
+                adverse_selection_penalty_bps: None,
                 source_intent_id: format!("reconciled-{}", order.client_order_id),
             },
             exchange_order_id: order.exchange_order_id.clone(),
@@ -593,6 +596,9 @@ fn build_order_request(intent: &TradeIntent) -> OrderRequest {
         intent_role: intent.role,
         exit_stage: intent.exit_stage,
         exit_reason: intent.exit_reason.clone(),
+        edge_after_cost_bps: Some(intent.edge_after_cost_bps),
+        expected_realized_edge_bps: Some(intent.expected_realized_edge_bps),
+        adverse_selection_penalty_bps: Some(intent.adverse_selection_penalty_bps),
         source_intent_id: intent.intent_id.clone(),
     }
 }
@@ -611,6 +617,9 @@ fn build_request_from_event(event: &BinanceExecutionEvent) -> OrderRequest {
         intent_role: domain::IntentRole::AddRisk,
         exit_stage: None,
         exit_reason: None,
+        edge_after_cost_bps: None,
+        expected_realized_edge_bps: None,
+        adverse_selection_penalty_bps: None,
         source_intent_id: "user-stream".to_string(),
     }
 }
@@ -647,6 +656,9 @@ fn enrich_report(
     } else {
         None
     };
+    report.edge_after_cost_bps = request.edge_after_cost_bps;
+    report.expected_realized_edge_bps = request.expected_realized_edge_bps;
+    report.adverse_selection_penalty_bps = request.adverse_selection_penalty_bps;
     report.intent_role = Some(request.intent_role);
     report.exit_stage = request.exit_stage;
     report.exit_reason = request.exit_reason.clone();
@@ -685,6 +697,12 @@ fn correlate_report_with_tracked(
 ) -> ExecutionReport {
     report.decision_latency_ms = tracked.decision_latency_ms;
     report.submit_ack_latency_ms = tracked.submit_ack_latency_ms;
+    report.edge_after_cost_bps = tracked.request.edge_after_cost_bps;
+    report.expected_realized_edge_bps = tracked.request.expected_realized_edge_bps;
+    report.adverse_selection_penalty_bps = tracked.request.adverse_selection_penalty_bps;
+    report.intent_role = Some(tracked.request.intent_role);
+    report.exit_stage = tracked.request.exit_stage;
+    report.exit_reason = tracked.request.exit_reason.clone();
 
     if let Some(submit_started_at) = tracked.submit_started_at {
         let first_report_observed_at = tracked.first_report_observed_at.get_or_insert(observed_at);
@@ -1047,6 +1065,9 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        edge_after_cost_bps: request.edge_after_cost_bps,
+        expected_realized_edge_bps: request.expected_realized_edge_bps,
+        adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
         intent_role: Some(request.intent_role),
         exit_stage: request.exit_stage,
         exit_reason: request.exit_reason.clone(),

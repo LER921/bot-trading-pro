@@ -41,6 +41,9 @@ pub struct OrderRequest {
     pub intent_role: IntentRole,
     pub exit_stage: Option<ExitStage>,
     pub exit_reason: Option<String>,
+    pub edge_after_cost_bps: Option<Decimal>,
+    pub expected_realized_edge_bps: Option<Decimal>,
+    pub adverse_selection_penalty_bps: Option<Decimal>,
     pub source_intent_id: String,
 }
 
@@ -77,6 +80,9 @@ pub struct ExecutionReport {
     pub submit_to_first_report_ms: Option<i64>,
     pub submit_to_fill_ms: Option<i64>,
     pub exchange_order_age_ms: Option<i64>,
+    pub edge_after_cost_bps: Option<Decimal>,
+    pub expected_realized_edge_bps: Option<Decimal>,
+    pub adverse_selection_penalty_bps: Option<Decimal>,
     pub intent_role: Option<IntentRole>,
     pub exit_stage: Option<ExitStage>,
     pub exit_reason: Option<String>,

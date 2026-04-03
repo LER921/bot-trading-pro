@@ -97,9 +97,15 @@ impl ScalpingStrategy {
             if let Some(exit) =
                 self.exit_intent(context, best, base_quote_size, max_position, entry_cost_bps, expires_at)
             {
+                let best_expected_realized_edge_bps = Some(exit.expected_realized_edge_bps);
+                let adverse_selection_hits =
+                    u64::from(exit.adverse_selection_penalty_bps >= dec("0.30"));
                 return StrategyOutcome {
                     intents: vec![exit],
                     standby_reason: None,
+                    entry_block_reason: None,
+                    best_expected_realized_edge_bps,
+                    adverse_selection_hits,
                 };
             }
         }
@@ -177,6 +183,8 @@ impl ScalpingStrategy {
                 expected_fee_bps: self.config.taker_fee_bps,
                 expected_slippage_bps: self.config.slippage_buffer_bps,
                 edge_after_cost_bps: entry.effective_edge_after_quality_bps,
+                expected_realized_edge_bps: entry.effective_edge_after_quality_bps,
+                adverse_selection_penalty_bps: Decimal::ZERO,
                 reason: format!(
                     "scalp long entry: score={} pressure={} mom={} flow={} book={} vwap_dist={} tox={} required_edge_bps={} effective_edge_bps={} slots={}/{} size={}",
                     entry.entry_score,
@@ -196,6 +204,9 @@ impl ScalpingStrategy {
                 expires_at,
             }],
             standby_reason: None,
+            entry_block_reason: None,
+            best_expected_realized_edge_bps: Some(entry.effective_edge_after_quality_bps),
+            adverse_selection_hits: 0,
         }
     }
 
@@ -323,6 +334,12 @@ impl ScalpingStrategy {
             } else {
                 entry_cost_bps
             },
+            expected_realized_edge_bps: exit.pnl_bps - if post_only {
+                self.config.taker_fee_bps * dec("0.75")
+            } else {
+                entry_cost_bps
+            },
+            adverse_selection_penalty_bps: Decimal::ZERO,
             reason,
             created_at: now_utc(),
             expires_at,
@@ -606,6 +623,9 @@ fn standby(reason: &str) -> StrategyOutcome {
     StrategyOutcome {
         intents: Vec::new(),
         standby_reason: Some(reason.to_string()),
+        entry_block_reason: None,
+        best_expected_realized_edge_bps: None,
+        adverse_selection_hits: 0,
     }
 }
 

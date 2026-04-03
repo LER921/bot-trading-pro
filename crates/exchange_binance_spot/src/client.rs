@@ -1483,6 +1483,9 @@ fn rejected_execution_report(request: &OrderRequest, reason: impl Into<String>) 
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        edge_after_cost_bps: request.edge_after_cost_bps,
+        expected_realized_edge_bps: request.expected_realized_edge_bps,
+        adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
         intent_role: Some(request.intent_role),
         exit_stage: request.exit_stage,
         exit_reason: request.exit_reason.clone(),
@@ -1581,6 +1584,9 @@ fn parse_order_response(expected_symbol: Symbol, response: BinanceOrderResponse)
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        edge_after_cost_bps: None,
+        expected_realized_edge_bps: None,
+        adverse_selection_penalty_bps: None,
         intent_role: None,
         exit_stage: None,
         exit_reason: None,
@@ -1720,6 +1726,9 @@ fn parse_execution_report_event(event: &Value) -> Result<BinanceUserStreamEvent>
                 .and_then(Value::as_i64)
                 .map(|created| required_i64(event, "E").map(|event_time| event_time - created))
                 .transpose()?,
+            edge_after_cost_bps: None,
+            expected_realized_edge_bps: None,
+            adverse_selection_penalty_bps: None,
             intent_role: None,
             exit_stage: None,
             exit_reason: None,
@@ -2282,6 +2291,9 @@ impl BinanceSpotGateway for MockBinanceSpotGateway {
                 None
             },
             exchange_order_age_ms: None,
+            edge_after_cost_bps: request.edge_after_cost_bps,
+            expected_realized_edge_bps: request.expected_realized_edge_bps,
+            adverse_selection_penalty_bps: request.adverse_selection_penalty_bps,
             intent_role: Some(request.intent_role),
             exit_stage: request.exit_stage,
             exit_reason: request.exit_reason.clone(),
@@ -2399,6 +2411,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use domain::IntentRole;
     
     fn dec(raw: &str) -> Decimal {
         Decimal::from_str_exact(raw).unwrap()
@@ -2537,6 +2550,12 @@ mod tests {
             time_in_force: Some(TimeInForce::Gtc),
             post_only: true,
             reduce_only: false,
+            intent_role: IntentRole::AddRisk,
+            exit_stage: None,
+            exit_reason: None,
+            edge_after_cost_bps: None,
+            expected_realized_edge_bps: None,
+            adverse_selection_penalty_bps: None,
             source_intent_id: "intent-1".to_string(),
         });
 
@@ -2665,6 +2684,12 @@ mod tests {
                 time_in_force: Some(TimeInForce::Gtc),
                 post_only: true,
                 reduce_only: false,
+                intent_role: IntentRole::AddRisk,
+                exit_stage: None,
+                exit_reason: None,
+                edge_after_cost_bps: None,
+                expected_realized_edge_bps: None,
+                adverse_selection_penalty_bps: None,
                 source_intent_id: "intent-1".to_string(),
             })
             .await
@@ -2715,6 +2740,12 @@ mod tests {
                 time_in_force: Some(TimeInForce::Gtc),
                 post_only: true,
                 reduce_only: false,
+                intent_role: IntentRole::AddRisk,
+                exit_stage: None,
+                exit_reason: None,
+                edge_after_cost_bps: None,
+                expected_realized_edge_bps: None,
+                adverse_selection_penalty_bps: None,
                 source_intent_id: "intent-1".to_string(),
             })
             .await
@@ -2768,6 +2799,12 @@ mod tests {
                 time_in_force: Some(TimeInForce::Gtc),
                 post_only: true,
                 reduce_only: false,
+                intent_role: IntentRole::AddRisk,
+                exit_stage: None,
+                exit_reason: None,
+                edge_after_cost_bps: None,
+                expected_realized_edge_bps: None,
+                adverse_selection_penalty_bps: None,
                 source_intent_id: "intent-eth-1".to_string(),
             })
             .await

@@ -273,6 +273,9 @@ impl SqliteStorage {
                         submit_to_first_report_ms INTEGER,
                         submit_to_fill_ms INTEGER,
                         exchange_order_age_ms INTEGER,
+                        edge_after_cost_bps TEXT,
+                        expected_realized_edge_bps TEXT,
+                        adverse_selection_penalty_bps TEXT,
                         intent_role TEXT,
                         exit_stage TEXT,
                         exit_reason TEXT
@@ -308,6 +311,27 @@ impl SqliteStorage {
                     "execution_reports",
                     "exchange_order_age_ms",
                     "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "edge_after_cost_bps",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "expected_realized_edge_bps",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "adverse_selection_penalty_bps",
+                    "TEXT",
                 )
                 .await?;
                 add_column_if_missing(
@@ -564,8 +588,10 @@ impl SqliteStorage {
                         strategy TEXT NOT NULL,
                         status TEXT NOT NULL,
                         standby_reason TEXT NOT NULL,
+                        entry_block_reason TEXT,
                         intent_count INTEGER NOT NULL,
                         best_edge_after_cost_bps TEXT NOT NULL,
+                        best_expected_realized_edge_bps TEXT,
                         reduce_only_intents INTEGER NOT NULL,
                         sample_reason TEXT NOT NULL,
                         runtime_state TEXT NOT NULL,
@@ -591,12 +617,27 @@ impl SqliteStorage {
                         inventory_pressure_exit_intents INTEGER NOT NULL DEFAULT 0,
                         adverse_exit_intents INTEGER NOT NULL DEFAULT 0,
                         profit_capture_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        adverse_selection_hits INTEGER NOT NULL DEFAULT 0,
                         oldest_inventory_age_ms INTEGER,
                         stale_inventory_count INTEGER NOT NULL DEFAULT 0
                     );
                     "#,
                 )
                 .execute(&self.pool)
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "entry_block_reason",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "best_expected_realized_edge_bps",
+                    "TEXT",
+                )
                 .await?;
                 add_column_if_missing(
                     &self.pool,
@@ -700,6 +741,13 @@ impl SqliteStorage {
                     &self.pool,
                     "strategy_outcomes",
                     "profit_capture_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "adverse_selection_hits",
                     "INTEGER NOT NULL DEFAULT 0",
                 )
                 .await?;
@@ -862,8 +910,9 @@ impl StorageEngine for SqliteStorage {
                 filled_quantity, average_fill_price, fill_ratio, requested_price,
                 slippage_bps, decision_latency_ms, submit_ack_latency_ms,
                 submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                edge_after_cost_bps, expected_realized_edge_bps, adverse_selection_penalty_bps,
                 intent_role, exit_stage, exit_reason, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(report.event_time.to_string())
@@ -881,6 +930,9 @@ impl StorageEngine for SqliteStorage {
         .bind(report.submit_to_first_report_ms)
         .bind(report.submit_to_fill_ms)
         .bind(report.exchange_order_age_ms)
+        .bind(report.edge_after_cost_bps.map(|value| value.to_string()))
+        .bind(report.expected_realized_edge_bps.map(|value| value.to_string()))
+        .bind(report.adverse_selection_penalty_bps.map(|value| value.to_string()))
         .bind(report.intent_role.map(|value| format!("{value:?}")))
         .bind(report.exit_stage.map(|value| format!("{value:?}")))
         .bind(&report.exit_reason)
@@ -1048,6 +1100,8 @@ impl StorageEngine for SqliteStorage {
             .map(|intent| intent.edge_after_cost_bps)
             .max()
             .unwrap_or_default();
+        let best_expected_realized_edge_bps =
+            outcome.best_expected_realized_edge_bps.unwrap_or_default();
         let reduce_only_intents = outcome
             .intents
             .iter()
@@ -1159,6 +1213,7 @@ impl StorageEngine for SqliteStorage {
             .standby_reason
             .clone()
             .unwrap_or_else(|| format!("{strategy} produced actionable intents"));
+        let entry_block_reason = outcome.entry_block_reason.clone();
         let sample_reason = outcome
             .intents
             .first()
@@ -1168,17 +1223,17 @@ impl StorageEngine for SqliteStorage {
         sqlx::query(
             r#"
             INSERT INTO strategy_outcomes (
-                observed_at, symbol, strategy, status, standby_reason, intent_count,
-                best_edge_after_cost_bps, reduce_only_intents, sample_reason,
+                observed_at, symbol, strategy, status, standby_reason, entry_block_reason, intent_count,
+                best_edge_after_cost_bps, best_expected_realized_edge_bps, reduce_only_intents, sample_reason,
                 runtime_state, risk_mode, inventory_base, spread_bps, toxicity_score,
                 local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
                 low_edge_intents, medium_edge_intents, high_edge_intents,
                 reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots,
                 passive_exit_intents, aggressive_exit_intents, forced_unwind_intents,
                 timeout_exit_intents, reversal_exit_intents, inventory_pressure_exit_intents,
-                adverse_exit_intents, profit_capture_exit_intents, oldest_inventory_age_ms,
+                adverse_exit_intents, profit_capture_exit_intents, adverse_selection_hits, oldest_inventory_age_ms,
                 stale_inventory_count
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(context.features.computed_at.to_string())
@@ -1186,8 +1241,10 @@ impl StorageEngine for SqliteStorage {
         .bind(strategy)
         .bind(status)
         .bind(standby_reason)
+        .bind(entry_block_reason)
         .bind(i64::try_from(outcome.intents.len()).unwrap_or(i64::MAX))
         .bind(best_edge_after_cost_bps.to_string())
+        .bind(best_expected_realized_edge_bps.to_string())
         .bind(i64::try_from(reduce_only_intents).unwrap_or(i64::MAX))
         .bind(sample_reason)
         .bind(format!("{:?}", context.runtime_state))
@@ -1213,6 +1270,7 @@ impl StorageEngine for SqliteStorage {
         .bind(i64::try_from(inventory_pressure_exit_intents).unwrap_or(i64::MAX))
         .bind(i64::try_from(adverse_exit_intents).unwrap_or(i64::MAX))
         .bind(i64::try_from(profit_capture_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(outcome.adverse_selection_hits).unwrap_or(i64::MAX))
         .bind(oldest_inventory_age_ms)
         .bind(i64::try_from(stale_inventory_count).unwrap_or(i64::MAX))
         .execute(&self.pool)
@@ -1346,6 +1404,9 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                edge_after_cost_bps: Some(Decimal::from_str_exact("1.10").unwrap()),
+                expected_realized_edge_bps: Some(Decimal::from_str_exact("0.72").unwrap()),
+                adverse_selection_penalty_bps: Some(Decimal::from_str_exact("0.18").unwrap()),
                 intent_role: Some(IntentRole::AddRisk),
                 exit_stage: None,
                 exit_reason: None,

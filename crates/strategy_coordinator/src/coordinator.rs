@@ -75,6 +75,9 @@ impl DefaultStrategyCoordinator {
             StrategySelection::Standby | StrategySelection::RiskOff => StrategyOutcome {
                 intents: Vec::new(),
                 standby_reason: Some("coordinator held the symbol in standby".to_string()),
+                entry_block_reason: None,
+                best_expected_realized_edge_bps: None,
+                adverse_selection_hits: 0,
             },
         }
     }

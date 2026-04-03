@@ -67,6 +67,8 @@ pub struct TradeIntent {
     pub expected_fee_bps: Decimal,
     pub expected_slippage_bps: Decimal,
     pub edge_after_cost_bps: Decimal,
+    pub expected_realized_edge_bps: Decimal,
+    pub adverse_selection_penalty_bps: Decimal,
     pub reason: String,
     pub created_at: Timestamp,
     pub expires_at: Option<Timestamp>,
@@ -76,4 +78,7 @@ pub struct TradeIntent {
 pub struct StrategyOutcome {
     pub intents: Vec<TradeIntent>,
     pub standby_reason: Option<String>,
+    pub entry_block_reason: Option<String>,
+    pub best_expected_realized_edge_bps: Option<Decimal>,
+    pub adverse_selection_hits: u64,
 }
