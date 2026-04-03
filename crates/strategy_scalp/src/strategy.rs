@@ -42,7 +42,8 @@ struct EntryAnalysis {
     toxicity_pressure: Decimal,
     extension_penalty: Decimal,
     expected_edge_bps: Decimal,
-    edge_after_cost_bps: Decimal,
+    effective_edge_after_quality_bps: Decimal,
+    required_edge_bps: Decimal,
     signal_quality: Decimal,
 }
 
@@ -97,6 +98,10 @@ impl ScalpingStrategy {
             return standby("scalping blocked by position cap");
         }
 
+        if available_order_slots(context) == 0 {
+            return standby("scalping blocked by symbol order-slot saturation");
+        }
+
         let entry = analyze_long_entry(context, entry_cost_bps, &self.config);
         if entry.momentum_signal_bps < self.config.min_momentum_bps {
             return standby("scalping entry blocked by weak short momentum");
@@ -114,7 +119,7 @@ impl ScalpingStrategy {
             return standby("scalping entry score too weak");
         }
 
-        if entry.edge_after_cost_bps < dec("1.00") {
+        if entry.effective_edge_after_quality_bps < entry.required_edge_bps {
             return standby("scalping edge is not positive enough after costs");
         }
 
@@ -124,11 +129,19 @@ impl ScalpingStrategy {
             max_position,
             entry.signal_quality,
             entry.toxicity_pressure,
-            entry.edge_after_cost_bps,
+            entry.effective_edge_after_quality_bps,
         );
 
         if quantity <= Decimal::ZERO {
             return standby("scalping size collapsed after inventory and signal filters");
+        }
+
+        if !has_deployable_notional(
+            quantity,
+            best.ask_price,
+            context.local_min_notional_quote,
+        ) {
+            return standby("scalping size below local deployable notional floor");
         }
 
         StrategyOutcome {
@@ -146,9 +159,9 @@ impl ScalpingStrategy {
                 expected_edge_bps: entry.expected_edge_bps,
                 expected_fee_bps: self.config.taker_fee_bps,
                 expected_slippage_bps: self.config.slippage_buffer_bps,
-                edge_after_cost_bps: entry.edge_after_cost_bps,
+                edge_after_cost_bps: entry.effective_edge_after_quality_bps,
                 reason: format!(
-                    "scalp long entry: score={} pressure={} mom={} flow={} book={} vwap_dist={} tox={} size={}",
+                    "scalp long entry: score={} pressure={} mom={} flow={} book={} vwap_dist={} tox={} required_edge_bps={} effective_edge_bps={} slots={}/{} size={}",
                     entry.entry_score,
                     entry.bullish_pressure,
                     entry.momentum_signal_bps,
@@ -156,6 +169,10 @@ impl ScalpingStrategy {
                     entry.orderbook_signal,
                     context.features.vwap_distance_bps,
                     context.features.toxicity_score,
+                    entry.required_edge_bps,
+                    entry.effective_edge_after_quality_bps,
+                    context.open_bot_orders_for_symbol,
+                    context.max_open_orders_for_symbol,
                     quantity,
                 ),
                 created_at: now_utc(),
@@ -270,6 +287,22 @@ fn analyze_long_entry(context: &StrategyContext, entry_cost_bps: Decimal, config
     let fragility_penalty_bps = toxicity_pressure * dec("2.5") + extension_penalty * dec("2.0");
     let expected_edge_bps = (raw_alpha_bps - fragility_penalty_bps).max(Decimal::ZERO);
     let edge_after_cost_bps = expected_edge_bps - entry_cost_bps;
+    let slot_pressure = slot_pressure(context);
+    let inventory_usage = if context.max_inventory_base <= Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        clamp_unit((context.inventory.base_position / context.max_inventory_base).max(Decimal::ZERO))
+    };
+    let quality_penalty_bps = toxicity_pressure * dec("0.95")
+        + extension_penalty * dec("1.05")
+        + (Decimal::ONE - bullish_pressure).max(Decimal::ZERO) * dec("0.85")
+        + inventory_usage * dec("0.90")
+        + slot_pressure * dec("0.70");
+    let effective_edge_after_quality_bps = edge_after_cost_bps - quality_penalty_bps;
+    let required_edge_bps = dec("1.50")
+        + toxicity_pressure * dec("0.40")
+        + extension_penalty * dec("0.35")
+        + slot_pressure * dec("0.30");
     let signal_quality = clamp_unit((entry_score - config.min_entry_score + dec("1.0")) / dec("4.0"));
 
     EntryAnalysis {
@@ -280,7 +313,8 @@ fn analyze_long_entry(context: &StrategyContext, entry_cost_bps: Decimal, config
         toxicity_pressure,
         extension_penalty,
         expected_edge_bps,
-        edge_after_cost_bps,
+        effective_edge_after_quality_bps,
+        required_edge_bps,
         signal_quality,
     }
 }
@@ -367,6 +401,29 @@ fn entry_size(
     scaled
         .max(dec("0.0001"))
         .min((max_position - context.inventory.base_position).max(Decimal::ZERO))
+}
+
+fn has_deployable_notional(quantity: Decimal, limit_price: Decimal, local_min_notional_quote: Decimal) -> bool {
+    quantity > Decimal::ZERO
+        && limit_price > Decimal::ZERO
+        && (quantity * limit_price) >= local_min_notional_quote
+}
+
+fn slot_pressure(context: &StrategyContext) -> Decimal {
+    if context.max_open_orders_for_symbol == 0 {
+        Decimal::ZERO
+    } else {
+        clamp_unit(
+            Decimal::from(context.open_bot_orders_for_symbol)
+                / Decimal::from(context.max_open_orders_for_symbol),
+        )
+    }
+}
+
+fn available_order_slots(context: &StrategyContext) -> u32 {
+    context
+        .max_open_orders_for_symbol
+        .saturating_sub(context.open_bot_orders_for_symbol)
 }
 
 fn short_momentum_signal_bps(context: &StrategyContext) -> Decimal {
@@ -466,8 +523,8 @@ mod tests {
                 symbol: Symbol::BtcUsdc,
                 microprice: Some(dec("100.03")),
                 top_of_book_depth_quote: dec("6000"),
-                orderbook_imbalance: Some(dec("0.18")),
-                orderbook_imbalance_rolling: dec("0.12"),
+                orderbook_imbalance: Some(dec("0.22")),
+                orderbook_imbalance_rolling: dec("0.18"),
                 realized_volatility_bps: dec("5.0"),
                 vwap: dec("99.98"),
                 vwap_distance_bps: dec("3.5"),
@@ -475,16 +532,16 @@ mod tests {
                 spread_mean_bps: dec("1.6"),
                 spread_std_bps: dec("0.2"),
                 spread_zscore: dec("0.30"),
-                trade_flow_imbalance: dec("0.22"),
+                trade_flow_imbalance: dec("0.28"),
                 trade_flow_rate: dec("1.5"),
                 trade_rate_per_sec: dec("2.0"),
                 tick_rate_per_sec: dec("3.0"),
                 tape_speed: dec("2.5"),
-                momentum_1s_bps: dec("7.0"),
-                momentum_5s_bps: dec("5.0"),
+                momentum_1s_bps: dec("9.0"),
+                momentum_5s_bps: dec("7.0"),
                 momentum_15s_bps: dec("3.0"),
-                local_momentum_bps: dec("8.0"),
-                liquidity_score: dec("7000"),
+                local_momentum_bps: dec("10.0"),
+                liquidity_score: dec("8200"),
                 toxicity_score: dec("0.20"),
                 volatility_regime: VolatilityRegime::Medium,
                 computed_at: now_utc(),
@@ -506,6 +563,9 @@ mod tests {
             },
             soft_inventory_base: dec("0.020"),
             max_inventory_base: dec("0.050"),
+            local_min_notional_quote: dec("0.01"),
+            open_bot_orders_for_symbol: 0,
+            max_open_orders_for_symbol: 4,
             runtime_state: RuntimeState::Trading,
             risk_mode: RiskMode::Normal,
         }
@@ -527,7 +587,7 @@ mod tests {
         let intent = &outcome.intents[0];
         assert_eq!(intent.side, Side::Buy);
         assert!(intent.quantity > Decimal::ZERO);
-        assert!(intent.edge_after_cost_bps >= dec("1.0"));
+        assert!(intent.edge_after_cost_bps >= dec("1.5"));
     }
 
     #[test]
@@ -606,8 +666,8 @@ mod tests {
     #[test]
     fn insufficient_edge_after_costs_blocks_entry() {
         let mut strategy = ScalpingStrategy::default();
-        strategy.config.taker_fee_bps = dec("6.0");
-        strategy.config.slippage_buffer_bps = dec("3.0");
+        strategy.config.taker_fee_bps = dec("12.0");
+        strategy.config.slippage_buffer_bps = dec("8.0");
 
         let outcome = strategy.evaluate(&sample_context());
 
@@ -615,6 +675,44 @@ mod tests {
         assert_eq!(
             outcome.standby_reason.as_deref(),
             Some("scalping edge is not positive enough after costs")
+        );
+    }
+
+    #[test]
+    fn local_min_notional_floor_blocks_tiny_scalp_entry() {
+        let mut context = sample_context();
+        context.local_min_notional_quote = dec("15.00");
+        context.soft_inventory_base = dec("0.020");
+        context.max_inventory_base = dec("0.050");
+
+        let strategy = ScalpingStrategy {
+            config: ScalpingConfig {
+                quote_size_fraction: dec("0.03"),
+                ..ScalpingConfig::default()
+            },
+        };
+
+        let outcome = strategy.evaluate(&context);
+
+        assert!(outcome.intents.is_empty());
+        assert_eq!(
+            outcome.standby_reason.as_deref(),
+            Some("scalping size below local deployable notional floor")
+        );
+    }
+
+    #[test]
+    fn slot_saturation_blocks_non_reduce_only_scalp_entry() {
+        let mut context = sample_context();
+        context.open_bot_orders_for_symbol = 4;
+        context.max_open_orders_for_symbol = 4;
+
+        let outcome = ScalpingStrategy::default().evaluate(&context);
+
+        assert!(outcome.intents.is_empty());
+        assert_eq!(
+            outcome.standby_reason.as_deref(),
+            Some("scalping blocked by symbol order-slot saturation")
         );
     }
 }

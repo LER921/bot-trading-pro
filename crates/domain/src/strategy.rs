@@ -21,6 +21,9 @@ pub struct StrategyContext {
     pub inventory: InventorySnapshot,
     pub soft_inventory_base: Decimal,
     pub max_inventory_base: Decimal,
+    pub local_min_notional_quote: Decimal,
+    pub open_bot_orders_for_symbol: u32,
+    pub max_open_orders_for_symbol: u32,
     pub runtime_state: RuntimeState,
     pub risk_mode: RiskMode,
 }

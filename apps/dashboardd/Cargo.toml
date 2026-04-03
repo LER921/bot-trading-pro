@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+common = { path = "../../crates/common" }
 config_loader = { path = "../../crates/config_loader" }
 domain = { path = "../../crates/domain" }
 serde.workspace = true

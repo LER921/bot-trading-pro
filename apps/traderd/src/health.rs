@@ -41,6 +41,7 @@ pub struct HealthTracker {
     user_ws: StreamTracker,
     rest_last_success_at: Option<Timestamp>,
     rest_consecutive_failures: u64,
+    rest_last_roundtrip_ms: Option<i64>,
     last_clock_drift_ms: i64,
     last_clock_sample_at: Option<Timestamp>,
     market_times: HashMap<Symbol, SymbolMarketTimes>,
@@ -83,9 +84,10 @@ impl HealthTracker {
         self.user_ws.lifecycle = StreamRuntimeState::Connected;
     }
 
-    pub fn record_rest_success(&mut self, at: Timestamp) {
+    pub fn record_rest_success(&mut self, at: Timestamp, roundtrip_ms: i64) {
         self.rest_last_success_at = Some(at);
         self.rest_consecutive_failures = 0;
+        self.rest_last_roundtrip_ms = Some(roundtrip_ms.max(0));
     }
 
     pub fn record_rest_failure(&mut self) {
@@ -144,6 +146,7 @@ impl HealthTracker {
             },
             last_success_at: self.rest_last_success_at,
             consecutive_failures: self.rest_consecutive_failures,
+            roundtrip_ms: self.rest_last_roundtrip_ms,
         };
 
         let clock_drift = ClockDriftHealth {
@@ -290,7 +293,7 @@ mod tests {
         let stale_at = now_utc() - Duration::seconds(30);
         tracker.record_market_ws_message(stale_at);
         tracker.record_user_ws_message(now_utc());
-        tracker.record_rest_success(now_utc());
+        tracker.record_rest_success(now_utc(), 42);
         tracker.record_clock_sample(now_utc());
         tracker.record_orderbook(Symbol::BtcUsdc, stale_at);
         tracker.record_account_snapshot(now_utc());
@@ -310,7 +313,7 @@ mod tests {
         tracker.record_trade(Symbol::BtcUsdc, now);
         tracker.record_account_snapshot(now);
         tracker.record_fill(now);
-        tracker.record_rest_success(now);
+        tracker.record_rest_success(now, 42);
         tracker.record_clock_sample(now);
         tracker.set_fallback_active(true);
 
@@ -327,7 +330,7 @@ mod tests {
         tracker.record_user_ws_message(now);
         tracker.record_orderbook(Symbol::BtcUsdc, now);
         tracker.record_trade(Symbol::BtcUsdc, now);
-        tracker.record_rest_success(now);
+        tracker.record_rest_success(now, 42);
         tracker.record_clock_sample(now);
 
         let health = tracker.snapshot(&[Symbol::BtcUsdc], 1_000, 1_000, 500);

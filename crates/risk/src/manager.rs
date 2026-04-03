@@ -211,9 +211,10 @@ impl StrictRiskManager {
         }
 
         if context.execution_stats.total_submitted >= 10
-            && context.execution_stats.reject_rate >= self.limits.max_reject_rate
+            && context.execution_stats.risk_scored_rejections >= 3
+            && context.execution_stats.risk_reject_rate >= self.limits.max_reject_rate
         {
-            return Some("reject-rate limit breached".to_string());
+            return Some("risk-scored reject-rate limit breached".to_string());
         }
 
         None

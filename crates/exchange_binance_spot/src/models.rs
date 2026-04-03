@@ -1,5 +1,8 @@
 use common::{Decimal, Timestamp};
-use domain::{AccountSnapshot, Balance, FillEvent, OpenOrder, OrderBookDelta, OrderBookSnapshot};
+use domain::{
+    AccountSnapshot, Balance, ExecutionReport, FillEvent, OpenOrder, OrderBookDelta,
+    OrderBookSnapshot, OrderRequest,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
@@ -135,4 +138,10 @@ pub struct BinanceBootstrapState {
     pub open_orders: Vec<OpenOrder>,
     pub fills: Vec<FillEvent>,
     pub fetched_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PreparedOrder {
+    Ready(OrderRequest),
+    Rejected(ExecutionReport),
 }

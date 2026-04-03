@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
         &config.binance.market_ws_url,
         &config.binance.user_ws_url,
         config.binance.recv_window_ms,
+        config.calibration.execution.local_min_notional_quote,
         credentials,
     )?;
 

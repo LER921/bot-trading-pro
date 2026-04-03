@@ -37,6 +37,7 @@ pub struct RestHealth {
     pub state: HealthState,
     pub last_success_at: Option<Timestamp>,
     pub consecutive_failures: u64,
+    pub roundtrip_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,6 +94,7 @@ impl SystemHealth {
                 state: HealthState::Healthy,
                 last_success_at: Some(updated_at),
                 consecutive_failures: 0,
+                roundtrip_ms: Some(0),
             },
             clock_drift: ClockDriftHealth {
                 state: HealthState::Healthy,

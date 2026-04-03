@@ -109,9 +109,9 @@
       <section class="panel span-8"><div class="section-head"><div><h2>Timeline runtime</h2><p>Derniers changements d’état et raisons.</p></div></div><div class="content"><div class="timeline" id="runtime-timeline"></div></div></section>
       <section class="panel span-8"><div class="section-head"><div><h2>PnL</h2><p>Net, realized, unrealized, fees, drawdown et historique.</p></div></div><div class="content"><canvas id="pnl-chart" width="960" height="220"></canvas><div class="mini-grid" id="pnl-mini-grid" style="margin-top:14px;"></div><div class="symbol-grid" id="symbol-pnl-grid" style="margin-top:14px;"></div></div></section>
       <section class="panel span-4"><div class="section-head"><div><h2>Inventory</h2><p>Par symbole avec exposition et pression de neutralisation.</p></div></div><div class="content"><div class="symbol-grid" id="inventory-grid"></div></div></section>
-      <section class="panel span-6"><div class="section-head"><div><h2>Exécution</h2><p>Stats, churn, open orders et reports récents.</p></div></div><div class="content"><div class="mini-grid" id="execution-stats-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Px req</th><th>Px avg</th><th>Latence</th><th>Message</th></tr></thead><tbody id="execution-report-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Prix</th></tr></thead><tbody id="open-order-rows"></tbody></table></div></div></section>
-      <section class="panel span-6"><div class="section-head"><div><h2>Fills & Risk</h2><p>Chaque trade récent et les dernières décisions de garde-fou.</p></div></div><div class="content"><div class="table-wrap"><table><thead><tr><th>Heure</th><th>Trade</th><th>Symbole</th><th>Side</th><th>Prix</th><th>Qty</th><th>Fee</th></tr></thead><tbody id="fill-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Action</th><th>Symbole</th><th>Mode</th><th>Raison</th></tr></thead><tbody id="risk-rows"></tbody></table></div></div></section>
-      <section class="panel span-12"><div class="section-head"><div><h2>Stratégie</h2><p>Sélection courante, standby reasons, edge utile et causes de gating.</p></div></div><div class="content"><div class="symbol-grid" id="strategy-symbol-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Symbole</th><th>Stratégie</th><th>Status</th><th>Edge net</th><th>Intent</th><th>Raison</th><th>Microstructure</th></tr></thead><tbody id="strategy-rows"></tbody></table></div></div></section>
+      <section class="panel span-6"><div class="section-head"><div><h2>Exécution</h2><p>Stats, churn, open orders et reports récents.</p></div></div><div class="content"><div class="mini-grid" id="execution-stats-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Origine</th><th>Type</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Px req</th><th>Px avg</th><th>Decision</th><th>Ack</th><th>1er report</th><th>1er fill</th><th>Age exch</th><th>Message</th></tr></thead><tbody id="execution-report-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Origine</th><th>Order</th><th>Symbole</th><th>Status</th><th>Fill</th><th>Prix</th><th>Age exch</th></tr></thead><tbody id="open-order-rows"></tbody></table></div></div></section>
+      <section class="panel span-6"><div class="section-head"><div><h2>Fills & Risk</h2><p>Chaque trade récent et les dernières décisions de garde-fou.</p></div></div><div class="content"><div class="table-wrap"><table><thead><tr><th>Heure</th><th>Origine</th><th>Trade</th><th>Symbole</th><th>Side</th><th>Prix</th><th>Qty</th><th>Fee</th></tr></thead><tbody id="fill-rows"></tbody></table></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Action</th><th>Symbole</th><th>Mode</th><th>Raison</th></tr></thead><tbody id="risk-rows"></tbody></table></div></div></section>
+      <section class="panel span-12"><div class="section-head"><div><h2>Stratégie</h2><p>Sélection courante, standby reasons, edge utile et causes de gating.</p></div></div><div class="content"><div class="symbol-grid" id="strategy-symbol-grid"></div><div class="table-wrap" style="margin-top:14px;"><table><thead><tr><th>Heure</th><th>Symbole</th><th>Stratégie</th><th>Status</th><th>Edge net</th><th>Intent</th><th>Edge buckets</th><th>Risk intents / slots</th><th>Raison</th><th>Microstructure</th></tr></thead><tbody id="strategy-rows"></tbody></table></div></div></section>
       <section class="panel span-12"><div class="section-head"><div><h2>Logs live</h2><p>Flux opératoire compact : runtime, santé, stratégie, risk, exécution.</p></div></div><div class="content"><div class="log-grid" id="log-grid"></div></div></section>
     </div>
   </div>
@@ -140,15 +140,53 @@
     };
 
     const fmtPct = (value, digits = 1) => value === null || value === undefined ? "n/a" : `${Number(value).toFixed(digits)}%`;
+    const latencyValue = (average, samples) => {
+      const count = Number(samples || 0);
+      if (count <= 0 || average === null || average === undefined) return "n/a";
+      return `${fmt(average)} ms`;
+    };
+    const latencySub = (samples) => {
+      const count = Number(samples || 0);
+      return count > 0 ? `${count} sample${count > 1 ? "s" : ""}` : "sample insuffisant";
+    };
+    const parseTimestampMs = (timestamp) => {
+      if (!timestamp) return null;
+      let normalized = String(timestamp).trim();
+      if (!normalized.includes("T") && normalized.includes(" ")) {
+        normalized = normalized.replace(" ", "T");
+      }
+      normalized = normalized.replace(/\.(\d{3})\d+/, ".$1");
+      normalized = normalized.replace(/ ([+-]\d{2}:\d{2}):\d{2}$/, "$1");
+      normalized = normalized.replace(/([+-]\d{2}:\d{2}):\d{2}$/, "$1");
+      if (normalized.endsWith("+00:00")) {
+        normalized = normalized.replace("+00:00", "Z");
+      }
+      const parsed = Date.parse(normalized);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
     const fmtTimeAgo = (timestamp) => {
       if (!timestamp) return "n/a";
-      const delta = Math.max(0, Date.now() - new Date(timestamp).getTime());
+      const parsed = parseTimestampMs(timestamp);
+      if (parsed === null) return "n/a";
+      const delta = Math.max(0, Date.now() - parsed);
       const seconds = Math.floor(delta / 1000);
       const minutes = Math.floor(seconds / 60);
       const hours = Math.floor(minutes / 60);
       if (hours > 0) return `${hours}h ${minutes % 60}m`;
       if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
       return `${seconds}s`;
+    };
+    const fmtTimestamp = (timestamp) => {
+      const parsed = parseTimestampMs(timestamp);
+      return parsed === null ? escapeHtml(timestamp ?? "n/a") : new Date(parsed).toLocaleString("fr-FR");
+    };
+    const heroLatency = (data) => {
+      const stats = data.execution?.latest_stats || {};
+      return latencyValue(stats.avg_submit_ack_latency_ms, stats.submit_ack_latency_samples);
+    };
+    const heroLatencySub = (data) => {
+      const stats = data.execution?.latest_stats || {};
+      return `decision ${latencyValue(stats.avg_decision_latency_ms, stats.decision_latency_samples)} | report ${latencyValue(stats.avg_submit_to_first_report_ms, stats.submit_to_first_report_samples)} | fill ${latencyValue(stats.avg_submit_to_fill_ms, stats.submit_to_fill_samples)}`;
     };
 
     const badge = (label, className) => `<span class="badge ${className}">${escapeHtml(label)}</span>`;
@@ -157,6 +195,7 @@
       const runtime = data.runtime || {};
       const pnl = data.pnl?.latest || {};
       const stats = data.execution?.latest_stats || {};
+      const usdc = data.account?.usdc || null;
       const openOrders = data.execution?.open_orders?.length || 0;
       document.getElementById("runtime-strip").innerHTML = [
         badge(runtime.current_state || "Unavailable", stateClass(runtime.current_state)),
@@ -166,11 +205,12 @@
       document.getElementById("runtime-reason").innerHTML = escapeHtml(runtime.current_reason || "Aucune raison runtime disponible.");
       document.getElementById("meta-line").innerHTML = `URL <strong>${escapeHtml(data.meta.bind_address)}</strong> | DB <strong>${escapeHtml(data.meta.db_path)}</strong> | Logs <strong>${escapeHtml(data.meta.log_path)}</strong>`;
       document.getElementById("hero-kpis").innerHTML = [
-        { label: "Net PnL", value: fmt(pnl.net_pnl_quote), sub: `Daily ${fmt(pnl.daily_pnl_quote)} | Drawdown ${fmt(pnl.drawdown_quote)}` },
+        { label: "PnL Session", value: fmt(pnl.net_pnl_quote), sub: `Depuis ce démarrage | Fees ${fmt(pnl.fees_quote)} | Drawdown ${fmt(pnl.drawdown_quote)}` },
         { label: "Win Rate", value: data.pnl?.win_rate?.realized_close_win_rate != null ? fmtPct(data.pnl.win_rate.realized_close_win_rate) : "n/a", sub: `${data.pnl?.win_rate?.wins || 0} wins / ${data.pnl?.win_rate?.losses || 0} losses (realized)` },
-        { label: "Uptime", value: fmtTimeAgo(runtime.started_at), sub: runtime.started_at ? `Depuis ${escapeHtml(runtime.started_at)}` : "Démarrage inconnu" },
-        { label: "Latence", value: stats.avg_decision_latency_ms ? `${fmt(stats.avg_decision_latency_ms)} ms` : "n/a", sub: `Fill ratio ${fmtPct(stats.fill_report_rate)} | Cancel ${fmtPct(stats.cancel_rate)}` },
-        { label: "Fills", value: String(data.execution?.total_fills || 0), sub: `${openOrders} open orders | ${stats.churn_state || "idle"}` },
+        { label: "Uptime", value: fmtTimeAgo(runtime.started_at), sub: runtime.started_at ? `Depuis ${fmtTimestamp(runtime.started_at)}` : "Démarrage inconnu" },
+        { label: "Exec Ack", value: heroLatency(data), sub: heroLatencySub(data) },
+        { label: "Fills Session", value: String(data.execution?.total_fills || 0), sub: `${openOrders} open orders | ext ${data.execution?.external_fills || 0} | ${stats.churn_state || "idle"}` },
+        { label: "Capital USDC", value: usdc ? fmt(usdc.total) : "n/a", sub: usdc ? `free ${fmt(usdc.free)} | locked ${fmt(usdc.locked)}` : "snapshot compte indisponible" },
         { label: "Read Only", value: data.meta.read_only ? "Oui" : "Non", sub: `Refresh auto toutes les 2s` },
       ].map(card => `<div class="kpi"><div class="label">${escapeHtml(card.label)}</div><div class="value">${escapeHtml(card.value)}</div><div class="sub">${escapeHtml(card.sub)}</div></div>`).join("");
     };
@@ -186,7 +226,7 @@
         ["overall", health.overall_state, `observé ${health.observed_at}`],
         ["market_ws", health.market_ws_state, `age ${health.market_ws_age_ms ?? "n/a"} ms | reconnect ${health.market_ws_reconnect_count}`],
         ["user_ws", health.user_ws_state, `age ${health.user_ws_age_ms ?? "n/a"} ms | reconnect ${health.user_ws_reconnect_count}`],
-        ["rest", health.rest_state, `failures ${health.rest_consecutive_failures}`],
+        ["rest", health.rest_state, `rtt ${health.rest_roundtrip_ms ?? "n/a"} ms | failures ${health.rest_consecutive_failures}`],
         ["market_data", health.market_data_state, `fallback ${health.fallback_active ? "actif" : "off"}`],
         ["account_events", health.account_events_state, `clock ${health.clock_drift_state} / ${health.clock_drift_ms} ms`],
       ];
@@ -264,31 +304,44 @@
 
     const renderExecution = (data) => {
       const stats = data.execution?.latest_stats || {};
+      const health = data.health || {};
+      const localRejectCauses = data.execution?.local_reject_causes || [];
+      const localRejectSummary = localRejectCauses.length
+        ? localRejectCauses.slice(0, 3).map(item => `${item.status}:${item.count}`).join(" | ")
+        : "aucun";
       document.getElementById("execution-stats-grid").innerHTML = [
-        ["Submitted", stats.total_submitted ?? 0, "ordres émis"],
-        ["Rejected", stats.total_rejected ?? 0, `reject rate ${escapeHtml(stats.reject_rate ?? "n/a")}`],
-        ["Canceled", stats.total_canceled ?? 0, `manual ${stats.total_manual_cancels ?? 0} | stale ${stats.total_stale_cancels ?? 0}`],
+        ["Submitted", stats.total_submitted ?? 0, "ordres bot envoyés"],
+        ["Rejected", stats.total_rejected ?? 0, `risk-scored rate ${escapeHtml(stats.risk_reject_rate ?? "n/a")}`],
+        ["Local rejects", stats.total_local_validation_rejects ?? 0, `benign exch ${stats.total_benign_exchange_rejected ?? 0}`],
+        ["Reject causes", localRejectCauses.length ? localRejectCauses[0].status : "n/a", localRejectSummary],
+        ["Canceled", stats.total_canceled ?? 0, `manual ${stats.total_manual_cancels ?? 0} | stale ${stats.total_stale_cancels ?? 0} | ext ${stats.total_external_cancels ?? 0}`],
         ["Duplicates", (stats.duplicate_suppressions ?? 0), `equivalent ${stats.total_equivalent_order_skips ?? 0}`],
         ["Fill report rate", fmtPct(stats.fill_report_rate), `avg fill ${escapeHtml(stats.avg_fill_ratio ?? "n/a")}`],
         ["Cancel rate", fmtPct(stats.cancel_rate), `${escapeHtml(stats.churn_state ?? "idle")}`],
-        ["Slippage", escapeHtml(stats.avg_slippage_bps ?? "n/a"), "bps"],
-        ["Latency", escapeHtml(stats.avg_decision_latency_ms ?? "n/a"), "ms"],
+        ["Decision", latencyValue(stats.avg_decision_latency_ms, stats.decision_latency_samples), latencySub(stats.decision_latency_samples)],
+        ["Exec Ack", latencyValue(stats.avg_submit_ack_latency_ms, stats.submit_ack_latency_samples), latencySub(stats.submit_ack_latency_samples)],
+        ["1er report", latencyValue(stats.avg_submit_to_first_report_ms, stats.submit_to_first_report_samples), latencySub(stats.submit_to_first_report_samples)],
+        ["1er fill", latencyValue(stats.avg_submit_to_fill_ms, stats.submit_to_fill_samples), latencySub(stats.submit_to_fill_samples)],
+        ["Cancel Ack", latencyValue(stats.avg_cancel_ack_latency_ms, stats.cancel_ack_latency_samples), latencySub(stats.cancel_ack_latency_samples)],
+        ["Market WS", health.market_ws_age_ms != null ? `${health.market_ws_age_ms} ms` : "n/a", `${health.market_ws_state || "n/a"} | reconnect ${health.market_ws_reconnect_count ?? 0}`],
+        ["User WS", health.user_ws_age_ms != null ? `${health.user_ws_age_ms} ms` : "n/a", `${health.user_ws_state || "n/a"} | reconnect ${health.user_ws_reconnect_count ?? 0}`],
+        ["REST RTT", health.rest_roundtrip_ms != null ? `${health.rest_roundtrip_ms} ms` : "n/a", `${health.rest_state || "n/a"} | failures ${health.rest_consecutive_failures ?? 0}`],
       ].map(([label, value, sub]) => `<div class="mini-card"><div class="label">${escapeHtml(label)}</div><div class="value" style="margin-top:9px;font-size:18px;font-weight:700;">${escapeHtml(String(value))}</div><div class="muted">${escapeHtml(sub)}</div></div>`).join("");
 
       const reportRows = data.execution?.recent_reports || [];
       document.getElementById("execution-report-rows").innerHTML = reportRows.length
-        ? reportRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.fill_ratio)} / ${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td><td>${escapeHtml(row.average_fill_price ?? "n/a")}</td><td>${escapeHtml(row.decision_latency_ms ?? "n/a")}</td><td>${escapeHtml(row.message ?? "")}</td></tr>`).join("")
-        : `<tr><td colspan="9" class="empty">Aucun execution report persistant.</td></tr>`;
+        ? reportRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${badge(row.origin, row.origin === "bot" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(row.classification)}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.fill_ratio)} / ${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td><td>${escapeHtml(row.average_fill_price ?? "n/a")}</td><td>${escapeHtml(row.decision_latency_ms ?? "n/a")}</td><td>${escapeHtml(row.submit_ack_latency_ms ?? "n/a")}</td><td>${escapeHtml(row.submit_to_first_report_ms ?? "n/a")}</td><td>${escapeHtml(row.submit_to_fill_ms ?? "n/a")}</td><td>${escapeHtml(row.exchange_order_age_ms ?? "n/a")}</td><td>${escapeHtml(row.message ?? "")}</td></tr>`).join("")
+        : `<tr><td colspan="15" class="empty">Aucun execution report persistant.</td></tr>`;
 
       const openRows = data.execution?.open_orders || [];
       document.getElementById("open-order-rows").innerHTML = openRows.length
-        ? openRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td></tr>`).join("")
-        : `<tr><td colspan="6" class="empty">Aucun ordre ouvert détecté.</td></tr>`;
+        ? openRows.map(row => `<tr><td>${escapeHtml(row.event_time)}</td><td>${badge(row.origin, row.origin === "bot" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(row.client_order_id)}</td><td>${escapeHtml(row.symbol)}</td><td>${badge(row.status, stateClass(row.status))}</td><td>${escapeHtml(row.filled_quantity)}</td><td>${escapeHtml(row.requested_price ?? "n/a")}</td><td>${escapeHtml(row.exchange_order_age_ms ?? "n/a")}</td></tr>`).join("")
+        : `<tr><td colspan="8" class="empty">Aucun ordre ouvert détecté.</td></tr>`;
 
       const fills = data.execution?.recent_fills || [];
       document.getElementById("fill-rows").innerHTML = fills.length
-        ? fills.map(fill => `<tr><td>${escapeHtml(fill.event_time)}</td><td>${escapeHtml(fill.trade_id)}</td><td>${escapeHtml(fill.symbol)}</td><td>${badge(fill.side, fill.side === "Buy" ? "state-trading" : "state-reduced")}</td><td>${escapeHtml(fill.price)}</td><td>${escapeHtml(fill.quantity)}</td><td>${escapeHtml(fill.fee_quote ?? fill.fee)} ${escapeHtml(fill.fee_asset)}</td></tr>`).join("")
-        : `<tr><td colspan="7" class="empty">Aucun fill persistant.</td></tr>`;
+        ? fills.map(fill => `<tr><td>${escapeHtml(fill.event_time)}</td><td>${badge(fill.origin, fill.origin === "bot" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(fill.trade_id)}</td><td>${escapeHtml(fill.symbol)}</td><td>${badge(fill.side, fill.side === "Buy" ? "state-trading" : "state-reduced")}</td><td>${escapeHtml(fill.price)}</td><td>${escapeHtml(fill.quantity)}</td><td>${escapeHtml(fill.fee_quote ?? fill.fee)} ${escapeHtml(fill.fee_asset)}</td></tr>`).join("")
+        : `<tr><td colspan="8" class="empty">Aucun fill persistant.</td></tr>`;
     };
 
     const renderRisk = (data) => {
@@ -301,13 +354,13 @@
     const renderStrategy = (data) => {
       const latest = data.strategy?.latest_by_symbol || [];
       document.getElementById("strategy-symbol-grid").innerHTML = latest.length
-        ? latest.map(item => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(item.symbol)}</h3>${badge(`${item.strategy} / ${item.status}`, item.status === "actionable" ? "state-trading" : "state-paused")}</div><div class="metric-list"><div class="metric-row"><span>Runtime / Risk</span><strong>${escapeHtml(item.runtime_state)} / ${escapeHtml(item.risk_mode)}</strong></div><div class="metric-row"><span>Edge net</span><strong>${escapeHtml(item.best_edge_after_cost_bps)}</strong></div><div class="metric-row"><span>Inventory base</span><strong>${escapeHtml(item.inventory_base)}</strong></div><div class="metric-row"><span>Spread / Toxicity</span><strong>${escapeHtml(item.spread_bps)} / ${escapeHtml(item.toxicity_score)}</strong></div><div class="metric-row"><span>Momentum / Flow</span><strong>${escapeHtml(item.local_momentum_bps)} / ${escapeHtml(item.trade_flow_imbalance)}</strong></div><div class="metric-row"><span>Standby</span><strong>${escapeHtml(item.standby_reason)}</strong></div></div></div>`).join("")
+        ? latest.map(item => `<div class="symbol-card"><div class="symbol-title"><h3>${escapeHtml(item.symbol)}</h3>${badge(`${item.strategy} / ${item.status}`, item.status === "actionable" ? "state-trading" : "state-paused")}</div><div class="metric-list"><div class="metric-row"><span>Runtime / Risk</span><strong>${escapeHtml(item.runtime_state)} / ${escapeHtml(item.risk_mode)}</strong></div><div class="metric-row"><span>Edge net</span><strong>${escapeHtml(item.best_edge_after_cost_bps)}</strong></div><div class="metric-row"><span>Inventory base</span><strong>${escapeHtml(item.inventory_base)}</strong></div><div class="metric-row"><span>Spread / Toxicity</span><strong>${escapeHtml(item.spread_bps)} / ${escapeHtml(item.toxicity_score)}</strong></div><div class="metric-row"><span>Momentum / Flow</span><strong>${escapeHtml(item.local_momentum_bps)} / ${escapeHtml(item.trade_flow_imbalance)}</strong></div><div class="metric-row"><span>Edge buckets</span><strong>${escapeHtml(`low ${item.low_edge_intents} | med ${item.medium_edge_intents} | high ${item.high_edge_intents}`)}</strong></div><div class="metric-row"><span>Risk intents</span><strong>${escapeHtml(`reduce ${item.reduce_risk_intents} | add ${item.add_risk_intents}`)}</strong></div><div class="metric-row"><span>Slots</span><strong>${escapeHtml(`${item.open_order_slots_used} / ${item.max_open_order_slots}`)}</strong></div><div class="metric-row"><span>Standby</span><strong>${escapeHtml(item.standby_reason)}</strong></div></div></div>`).join("")
         : `<div class="empty">Aucun strategy outcome persistant pour l’instant.</div>`;
 
       const rows = data.strategy?.recent || [];
       document.getElementById("strategy-rows").innerHTML = rows.length
-        ? rows.map(item => `<tr><td>${escapeHtml(item.observed_at)}</td><td>${escapeHtml(item.symbol)}</td><td>${escapeHtml(item.strategy)}</td><td>${badge(item.status, item.status === "actionable" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(item.best_edge_after_cost_bps)}</td><td>${escapeHtml(String(item.intent_count))} / reduce-only ${escapeHtml(String(item.reduce_only_intents))}</td><td>${escapeHtml(item.standby_reason)}</td><td>${escapeHtml(`spread=${item.spread_bps} tox=${item.toxicity_score} mom=${item.local_momentum_bps} flow=${item.trade_flow_imbalance}`)}</td></tr>`).join("")
-        : `<tr><td colspan="8" class="empty">Aucun strategy outcome récent.</td></tr>`;
+        ? rows.map(item => `<tr><td>${escapeHtml(item.observed_at)}</td><td>${escapeHtml(item.symbol)}</td><td>${escapeHtml(item.strategy)}</td><td>${badge(item.status, item.status === "actionable" ? "state-trading" : "state-paused")}</td><td>${escapeHtml(item.best_edge_after_cost_bps)}</td><td>${escapeHtml(`count ${item.intent_count} | reduce-only ${item.reduce_only_intents}`)}</td><td>${escapeHtml(`low ${item.low_edge_intents} | med ${item.medium_edge_intents} | high ${item.high_edge_intents}`)}</td><td>${escapeHtml(`reduce ${item.reduce_risk_intents} | add ${item.add_risk_intents} | slots ${item.open_order_slots_used}/${item.max_open_order_slots}`)}</td><td>${escapeHtml(item.standby_reason)}</td><td>${escapeHtml(`spread=${item.spread_bps} tox=${item.toxicity_score} mom=${item.local_momentum_bps} flow=${item.trade_flow_imbalance}`)}</td></tr>`).join("")
+        : `<tr><td colspan="10" class="empty">Aucun strategy outcome récent.</td></tr>`;
     };
 
     const renderLogs = (data) => {

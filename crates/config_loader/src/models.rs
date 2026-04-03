@@ -135,6 +135,10 @@ impl AppConfig {
             execution.fill_recovery_fetch_limit > 0,
             "calibration.execution.fill_recovery_fetch_limit must be > 0"
         );
+        ensure_positive_decimal(
+            "calibration.execution.local_min_notional_quote",
+            execution.local_min_notional_quote,
+        )?;
         ensure!(
             self.risk.stale_market_data_ms > execution.loop_interval_ms,
             "risk.stale_market_data_ms must stay above calibration.execution.loop_interval_ms"
@@ -395,6 +399,7 @@ pub struct ExecutionCalibrationConfig {
     pub stale_order_cancel_ms: i64,
     pub bootstrap_trade_seed_limit: usize,
     pub fill_recovery_fetch_limit: usize,
+    pub local_min_notional_quote: Decimal,
 }
 
 impl Default for ExecutionCalibrationConfig {
@@ -404,6 +409,7 @@ impl Default for ExecutionCalibrationConfig {
             stale_order_cancel_ms: 6_000,
             bootstrap_trade_seed_limit: 50,
             fill_recovery_fetch_limit: 50,
+            local_min_notional_quote: dec("10.00"),
         }
     }
 }
@@ -586,6 +592,10 @@ mod tests {
         assert!(
             config.calibration.execution.stale_order_cancel_ms
                 >= config.calibration.market_making.quote_ttl_secs * 1_000
+        );
+        assert_eq!(
+            config.calibration.execution.local_min_notional_quote,
+            dec("10.00")
         );
         assert!(
             config.calibration.selection.scalp_activation_momentum_bps

@@ -166,8 +166,13 @@ where
             bail!("bootstrap failed: no enabled symbols");
         }
 
+        let rest_started_at = now_utc();
         self.gateway.ping_rest().await?;
-        self.health_tracker.record_rest_success(now_utc());
+        let rest_observed_at = now_utc();
+        self.health_tracker.record_rest_success(
+            rest_observed_at,
+            (rest_observed_at - rest_started_at).whole_milliseconds() as i64,
+        );
 
         let exchange_time = self.gateway.sync_clock().await?;
         let drift_ms = self.health_tracker.record_clock_sample(exchange_time);
@@ -259,6 +264,7 @@ where
             .account_snapshot()
             .await
             .context("missing account snapshot before pipeline evaluation")?;
+        self.storage.persist_account_snapshot(&account).await?;
         let open_orders = self.execution.open_orders().await;
         let mid_prices = self.collect_mid_prices().await;
         for (&symbol, &mark_price) in &mid_prices {
@@ -319,6 +325,14 @@ where
                 .get(&symbol)
                 .cloned()
                 .unwrap_or_else(|| empty_inventory(symbol));
+            let open_bot_orders_for_symbol = open_orders
+                .iter()
+                .filter(|order| {
+                    order.symbol == symbol
+                        && order.status.is_open()
+                        && is_bot_managed_client_order_id(&order.client_order_id)
+                })
+                .count() as u32;
 
             let context = StrategyContext {
                 symbol,
@@ -328,6 +342,9 @@ where
                 inventory,
                 soft_inventory_base: pair.soft_inventory_base,
                 max_inventory_base: pair.max_inventory_base,
+                local_min_notional_quote: self.config.calibration.execution.local_min_notional_quote,
+                open_bot_orders_for_symbol,
+                max_open_orders_for_symbol: self.config.risk.max_open_orders_per_symbol,
                 runtime_state: self.state(),
                 risk_mode: risk_context_health_mode(&health, self.state()),
             };
@@ -545,8 +562,15 @@ where
     }
 
     async fn refresh_health(&mut self) {
+        let rest_started_at = now_utc();
         match self.gateway.ping_rest().await {
-            Ok(_) => self.health_tracker.record_rest_success(now_utc()),
+            Ok(_) => {
+                let rest_observed_at = now_utc();
+                self.health_tracker.record_rest_success(
+                    rest_observed_at,
+                    (rest_observed_at - rest_started_at).whole_milliseconds() as i64,
+                )
+            }
             Err(error) => {
                 warn!(?error, "REST ping failed");
                 self.health_tracker.record_rest_failure();
@@ -751,8 +775,8 @@ where
             self.health_tracker
                 .record_user_ws_message(execution.transaction_time);
         }
-        self.execution.apply_execution_event(&execution).await?;
-        self.handle_execution_report(&execution.report).await?;
+        let report = self.execution.apply_execution_event(&execution).await?;
+        self.handle_execution_report(&report).await?;
 
         if let Some(fill) = execution.fill.clone() {
             self.apply_fill_if_new(fill).await?;
@@ -803,6 +827,7 @@ where
         }
 
         for (symbol, recoveries) in recoveries_by_symbol {
+            let rest_started_at = now_utc();
             match self
                 .gateway
                 .fetch_recent_fills(
@@ -812,7 +837,11 @@ where
                 .await
             {
                 Ok(fills) => {
-                    self.health_tracker.record_rest_success(now_utc());
+                    let rest_observed_at = now_utc();
+                    self.health_tracker.record_rest_success(
+                        rest_observed_at,
+                        (rest_observed_at - rest_started_at).whole_milliseconds() as i64,
+                    );
                     let recovered_by_trade = fills
                         .into_iter()
                         .map(|fill| (FillKey::from_fill(&fill), fill))
@@ -1272,6 +1301,10 @@ fn strategy_selection_label(selection: StrategySelection) -> &'static str {
     }
 }
 
+fn is_bot_managed_client_order_id(client_order_id: &str) -> bool {
+    client_order_id.starts_with("bot-")
+}
+
 fn build_strategy_coordinator(config: &AppConfig) -> DefaultStrategyCoordinator {
     DefaultStrategyCoordinator::new(
         StrategySelectionConfig {
@@ -1562,6 +1595,10 @@ mod tests {
                 requested_price: Some(price),
                 slippage_bps: Some(Decimal::ZERO),
                 decision_latency_ms: Some(10),
+                submit_ack_latency_ms: Some(25),
+                submit_to_first_report_ms: Some(40),
+                submit_to_fill_ms: Some(120),
+                exchange_order_age_ms: Some(120),
                 message: None,
                 event_time: now_utc(),
             },
@@ -1657,7 +1694,12 @@ mod tests {
     #[tokio::test]
     async fn pipeline_places_simple_orders_when_healthy() {
         let gateway = MockBinanceSpotGateway::new();
-        gateway.seed_account(sample_account()).await;
+        gateway
+            .seed_account(sample_account_with_positions(
+                Decimal::from_str_exact("0.002").unwrap(),
+                Decimal::ZERO,
+            ))
+            .await;
         gateway.seed_orderbook(sample_book()).await;
         gateway.seed_trades(Symbol::BtcUsdc, sample_trades()).await;
         gateway.set_clock_time(now_utc()).await;

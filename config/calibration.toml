@@ -4,6 +4,7 @@ loop_interval_ms = 1000
 stale_order_cancel_ms = 7000
 bootstrap_trade_seed_limit = 50
 fill_recovery_fetch_limit = 50
+local_min_notional_quote = "10.00"
 
 # Coordinator thresholds that decide when the bot escalates from MM to scalp.
 [selection]
@@ -21,7 +22,7 @@ max_toxicity_score = "0.55"
 base_skew_bps = "10"
 momentum_skew_weight = "0.20"
 volatility_widening_weight = "0.22"
-quote_size_fraction = "0.10"
+quote_size_fraction = "0.18"
 quote_ttl_secs = 6
 
 # Opportunistic scalp calibration kept tighter than passive MM on toxicity, size, and inventory usage.
@@ -31,6 +32,6 @@ slippage_buffer_bps = "0.50"
 min_entry_score = "6.5"
 min_momentum_bps = "1.20"
 max_toxicity_score = "0.50"
-max_position_fraction = "0.18"
-quote_size_fraction = "0.04"
+max_position_fraction = "0.25"
+quote_size_fraction = "0.07"
 quote_ttl_secs = 2

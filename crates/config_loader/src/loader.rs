@@ -141,6 +141,10 @@ enable_write_routes = false
         assert_eq!(config.calibration.execution.loop_interval_ms, 1_000);
         assert_eq!(config.calibration.market_making.quote_ttl_secs, 5);
         assert_eq!(config.calibration.scalping.quote_ttl_secs, 2);
+        assert_eq!(
+            config.calibration.execution.local_min_notional_quote,
+            common::Decimal::from_str_exact("10.00").unwrap()
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -223,6 +227,10 @@ enable_write_routes = false
 
         assert_eq!(config.calibration.execution.loop_interval_ms, 800);
         assert_eq!(config.calibration.execution.stale_order_cancel_ms, 6_000);
+        assert_eq!(
+            config.calibration.execution.local_min_notional_quote,
+            common::Decimal::from_str_exact("10.00").unwrap()
+        );
         assert_eq!(
             config.calibration.selection.scalp_activation_flow_imbalance,
             common::Decimal::from_str_exact("0.20").unwrap()

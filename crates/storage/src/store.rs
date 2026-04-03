@@ -1,8 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use common::Decimal;
 use domain::{
-    ExecutionReport, ExecutionStats, FillEvent, InventorySnapshot, PnlSnapshot, RiskDecision,
-    RuntimeTransition, StrategyContext, StrategyOutcome, SymbolBudget, SystemHealth,
+    AccountSnapshot, ExecutionReport, ExecutionStats, FillEvent, InventorySnapshot, PnlSnapshot,
+    RiskDecision, RuntimeTransition, StrategyContext, StrategyOutcome, SymbolBudget, SystemHealth,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
@@ -16,6 +17,7 @@ use tokio::sync::{OnceCell, RwLock};
 pub trait StorageEngine: Send + Sync {
     async fn persist_runtime_transition(&self, transition: &RuntimeTransition) -> Result<()>;
     async fn persist_health_snapshot(&self, health: &SystemHealth) -> Result<()>;
+    async fn persist_account_snapshot(&self, snapshot: &AccountSnapshot) -> Result<()>;
     async fn persist_risk_decision(&self, decision: &RiskDecision) -> Result<()>;
     async fn persist_execution_report(&self, report: &ExecutionReport) -> Result<()>;
     async fn persist_execution_stats(&self, stats: &ExecutionStats) -> Result<()>;
@@ -55,6 +57,14 @@ impl StorageEngine for MemoryStorage {
             .write()
             .await
             .push(format!("health {:?}", health.overall_state));
+        Ok(())
+    }
+
+    async fn persist_account_snapshot(&self, snapshot: &AccountSnapshot) -> Result<()> {
+        self.events
+            .write()
+            .await
+            .push(format!("account {}", snapshot.balances.len()));
         Ok(())
     }
 
@@ -190,7 +200,29 @@ impl SqliteStorage {
                         account_events_state TEXT NOT NULL,
                         clock_drift_state TEXT NOT NULL,
                         clock_drift_ms INTEGER NOT NULL,
-                        fallback_active INTEGER NOT NULL
+                        fallback_active INTEGER NOT NULL,
+                        rest_roundtrip_ms INTEGER
+                    );
+                    "#,
+                )
+                .execute(&self.pool)
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "health_snapshots",
+                    "rest_roundtrip_ms",
+                    "INTEGER",
+                )
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS account_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        updated_at TEXT NOT NULL,
+                        asset TEXT NOT NULL,
+                        free TEXT NOT NULL,
+                        locked TEXT NOT NULL
                     );
                     "#,
                 )
@@ -226,13 +258,45 @@ impl SqliteStorage {
                         fill_ratio TEXT NOT NULL,
                         requested_price TEXT,
                         slippage_bps TEXT,
-                        decision_latency_ms INTEGER
+                        decision_latency_ms INTEGER,
+                        submit_ack_latency_ms INTEGER,
+                        submit_to_first_report_ms INTEGER,
+                        submit_to_fill_ms INTEGER,
+                        exchange_order_age_ms INTEGER
                     );
                     "#,
                 )
                 .execute(&self.pool)
                 .await?;
                 add_column_if_missing(&self.pool, "execution_reports", "message", "TEXT").await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "submit_ack_latency_ms",
+                    "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "submit_to_first_report_ms",
+                    "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "submit_to_fill_ms",
+                    "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "exchange_order_age_ms",
+                    "INTEGER",
+                )
+                .await?;
 
                 sqlx::query(
                     r#"
@@ -241,20 +305,132 @@ impl SqliteStorage {
                         updated_at TEXT NOT NULL,
                         total_submitted INTEGER NOT NULL,
                         total_rejected INTEGER NOT NULL,
+                        total_local_validation_rejects INTEGER NOT NULL,
+                        total_benign_exchange_rejected INTEGER NOT NULL,
+                        risk_scored_rejections INTEGER NOT NULL,
                         total_canceled INTEGER NOT NULL,
                         total_manual_cancels INTEGER NOT NULL,
+                        total_external_cancels INTEGER NOT NULL,
                         total_filled_reports INTEGER NOT NULL,
                         total_stale_cancels INTEGER NOT NULL,
                         total_duplicate_intents INTEGER NOT NULL,
                         total_equivalent_order_skips INTEGER NOT NULL,
                         reject_rate TEXT NOT NULL,
+                        risk_reject_rate TEXT NOT NULL,
                         avg_fill_ratio TEXT NOT NULL,
                         avg_slippage_bps TEXT NOT NULL,
-                        avg_decision_latency_ms TEXT NOT NULL
+                        avg_decision_latency_ms TEXT NOT NULL,
+                        avg_submit_ack_latency_ms TEXT NOT NULL,
+                        avg_submit_to_first_report_ms TEXT NOT NULL,
+                        avg_submit_to_fill_ms TEXT NOT NULL,
+                        avg_cancel_ack_latency_ms TEXT NOT NULL,
+                        decision_latency_samples INTEGER NOT NULL DEFAULT 0,
+                        submit_ack_latency_samples INTEGER NOT NULL DEFAULT 0,
+                        submit_to_first_report_samples INTEGER NOT NULL DEFAULT 0,
+                        submit_to_fill_samples INTEGER NOT NULL DEFAULT 0,
+                        cancel_ack_latency_samples INTEGER NOT NULL DEFAULT 0
                     );
                     "#,
                 )
                 .execute(&self.pool)
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "total_local_validation_rejects",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "total_benign_exchange_rejected",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "risk_scored_rejections",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "total_external_cancels",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "risk_reject_rate",
+                    "TEXT NOT NULL DEFAULT '0'",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "avg_submit_ack_latency_ms",
+                    "TEXT NOT NULL DEFAULT '0'",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "avg_submit_to_first_report_ms",
+                    "TEXT NOT NULL DEFAULT '0'",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "avg_submit_to_fill_ms",
+                    "TEXT NOT NULL DEFAULT '0'",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "avg_cancel_ack_latency_ms",
+                    "TEXT NOT NULL DEFAULT '0'",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "decision_latency_samples",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "submit_ack_latency_samples",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "submit_to_first_report_samples",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "submit_to_fill_samples",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_stats_snapshots",
+                    "cancel_ack_latency_samples",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
                 .await?;
 
                 sqlx::query(
@@ -319,11 +495,67 @@ impl SqliteStorage {
                         toxicity_score TEXT NOT NULL,
                         local_momentum_bps TEXT NOT NULL,
                         trade_flow_imbalance TEXT NOT NULL,
-                        orderbook_imbalance TEXT
+                        orderbook_imbalance TEXT,
+                        low_edge_intents INTEGER NOT NULL DEFAULT 0,
+                        medium_edge_intents INTEGER NOT NULL DEFAULT 0,
+                        high_edge_intents INTEGER NOT NULL DEFAULT 0,
+                        reduce_risk_intents INTEGER NOT NULL DEFAULT 0,
+                        add_risk_intents INTEGER NOT NULL DEFAULT 0,
+                        open_order_slots_used INTEGER NOT NULL DEFAULT 0,
+                        max_open_order_slots INTEGER NOT NULL DEFAULT 0
                     );
                     "#,
                 )
                 .execute(&self.pool)
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "low_edge_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "medium_edge_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "high_edge_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "reduce_risk_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "add_risk_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "open_order_slots_used",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "max_open_order_slots",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
                 .await?;
 
                 sqlx::query(
@@ -405,8 +637,8 @@ impl StorageEngine for SqliteStorage {
                 market_ws_reconnect_count, user_ws_state, user_ws_age_ms,
                 user_ws_reconnect_count, rest_state, rest_consecutive_failures,
                 market_data_state, account_events_state, clock_drift_state,
-                clock_drift_ms, fallback_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                clock_drift_ms, fallback_active, rest_roundtrip_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(health.updated_at.to_string())
@@ -424,8 +656,25 @@ impl StorageEngine for SqliteStorage {
         .bind(format!("{:?}", health.clock_drift.state))
         .bind(health.clock_drift.drift_ms)
         .bind(if health.fallback_active { 1_i64 } else { 0_i64 })
+        .bind(health.rest.roundtrip_ms)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn persist_account_snapshot(&self, snapshot: &AccountSnapshot) -> Result<()> {
+        self.ensure_schema().await?;
+        for balance in &snapshot.balances {
+            sqlx::query(
+                "INSERT INTO account_snapshots (updated_at, asset, free, locked) VALUES (?, ?, ?, ?)",
+            )
+            .bind(snapshot.updated_at.to_string())
+            .bind(&balance.asset)
+            .bind(balance.free.to_string())
+            .bind(balance.locked.to_string())
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -451,8 +700,9 @@ impl StorageEngine for SqliteStorage {
             INSERT INTO execution_reports (
                 event_time, client_order_id, exchange_order_id, symbol, status,
                 filled_quantity, average_fill_price, fill_ratio, requested_price,
-                slippage_bps, decision_latency_ms, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                slippage_bps, decision_latency_ms, submit_ack_latency_ms,
+                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(report.event_time.to_string())
@@ -466,6 +716,10 @@ impl StorageEngine for SqliteStorage {
         .bind(report.requested_price.map(|value| value.to_string()))
         .bind(report.slippage_bps.map(|value| value.to_string()))
         .bind(report.decision_latency_ms)
+        .bind(report.submit_ack_latency_ms)
+        .bind(report.submit_to_first_report_ms)
+        .bind(report.submit_to_fill_ms)
+        .bind(report.exchange_order_age_ms)
         .bind(&report.message)
         .execute(&self.pool)
         .await?;
@@ -477,26 +731,46 @@ impl StorageEngine for SqliteStorage {
         sqlx::query(
             r#"
             INSERT INTO execution_stats_snapshots (
-                updated_at, total_submitted, total_rejected, total_canceled,
-                total_manual_cancels, total_filled_reports, total_stale_cancels,
-                total_duplicate_intents, total_equivalent_order_skips, reject_rate,
-                avg_fill_ratio, avg_slippage_bps, avg_decision_latency_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                updated_at, total_submitted, total_rejected, total_local_validation_rejects,
+                total_benign_exchange_rejected, risk_scored_rejections, total_canceled,
+                total_manual_cancels, total_external_cancels, total_filled_reports,
+                total_stale_cancels, total_duplicate_intents, total_equivalent_order_skips,
+                reject_rate, risk_reject_rate, avg_fill_ratio, avg_slippage_bps,
+                avg_decision_latency_ms, avg_submit_ack_latency_ms,
+                avg_submit_to_first_report_ms, avg_submit_to_fill_ms, avg_cancel_ack_latency_ms,
+                decision_latency_samples, submit_ack_latency_samples,
+                submit_to_first_report_samples, submit_to_fill_samples,
+                cancel_ack_latency_samples
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(stats.updated_at.to_string())
         .bind(i64::try_from(stats.total_submitted).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_rejected).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.total_local_validation_rejects).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.total_benign_exchange_rejected).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.risk_scored_rejections).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_canceled).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_manual_cancels).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.total_external_cancels).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_filled_reports).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_stale_cancels).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_duplicate_intents).unwrap_or(i64::MAX))
         .bind(i64::try_from(stats.total_equivalent_order_skips).unwrap_or(i64::MAX))
         .bind(stats.reject_rate.to_string())
+        .bind(stats.risk_reject_rate.to_string())
         .bind(stats.avg_fill_ratio.to_string())
         .bind(stats.avg_slippage_bps.to_string())
         .bind(stats.avg_decision_latency_ms.to_string())
+        .bind(stats.avg_submit_ack_latency_ms.to_string())
+        .bind(stats.avg_submit_to_first_report_ms.to_string())
+        .bind(stats.avg_submit_to_fill_ms.to_string())
+        .bind(stats.avg_cancel_ack_latency_ms.to_string())
+        .bind(i64::try_from(stats.decision_latency_samples).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.submit_ack_latency_samples).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.submit_to_first_report_samples).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.submit_to_fill_samples).unwrap_or(i64::MAX))
+        .bind(i64::try_from(stats.cancel_ack_latency_samples).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -583,6 +857,27 @@ impl StorageEngine for SqliteStorage {
             .iter()
             .filter(|intent| intent.reduce_only)
             .count();
+        let low_edge_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| intent.edge_after_cost_bps < dec("2.0"))
+            .count();
+        let medium_edge_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| intent.edge_after_cost_bps >= dec("2.0") && intent.edge_after_cost_bps < dec("5.0"))
+            .count();
+        let high_edge_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| intent.edge_after_cost_bps >= dec("5.0"))
+            .count();
+        let reduce_risk_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| intent_reduces_inventory(context.inventory.base_position, intent))
+            .count();
+        let add_risk_intents = outcome.intents.len().saturating_sub(reduce_risk_intents);
         let status = if outcome.intents.is_empty() {
             "standby"
         } else {
@@ -604,8 +899,10 @@ impl StorageEngine for SqliteStorage {
                 observed_at, symbol, strategy, status, standby_reason, intent_count,
                 best_edge_after_cost_bps, reduce_only_intents, sample_reason,
                 runtime_state, risk_mode, inventory_base, spread_bps, toxicity_score,
-                local_momentum_bps, trade_flow_imbalance, orderbook_imbalance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
+                low_edge_intents, medium_edge_intents, high_edge_intents,
+                reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(context.features.computed_at.to_string())
@@ -625,6 +922,13 @@ impl StorageEngine for SqliteStorage {
         .bind(context.features.local_momentum_bps.to_string())
         .bind(context.features.trade_flow_imbalance.to_string())
         .bind(context.features.orderbook_imbalance.map(|value| value.to_string()))
+        .bind(i64::try_from(low_edge_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(medium_edge_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(high_edge_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(reduce_risk_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(add_risk_intents).unwrap_or(i64::MAX))
+        .bind(i64::from(context.open_bot_orders_for_symbol))
+        .bind(i64::from(context.max_open_orders_for_symbol))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -705,12 +1009,23 @@ fn is_duplicate_column_error(error: &sqlx::Error, column: &str) -> bool {
         .contains(&format!("duplicate column name: {}", column.to_ascii_lowercase()))
 }
 
+fn intent_reduces_inventory(position: Decimal, intent: &domain::TradeIntent) -> bool {
+    intent.reduce_only
+        || (position > Decimal::ZERO && matches!(intent.side, domain::Side::Sell))
+        || (position < Decimal::ZERO && matches!(intent.side, domain::Side::Buy))
+}
+
+fn dec(raw: &str) -> Decimal {
+    Decimal::from_str_exact(raw).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use common::{Decimal, now_utc};
     use domain::{
-        ExecutionReport, OrderStatus, RuntimeState, RuntimeTransition, Symbol, SymbolPnlSnapshot,
+        AccountSnapshot, Balance, ExecutionReport, OrderStatus, RuntimeState, RuntimeTransition,
+        Symbol, SymbolPnlSnapshot,
     };
     use tokio::fs;
 
@@ -741,6 +1056,10 @@ mod tests {
                 requested_price: Some(Decimal::from(60_000u32)),
                 slippage_bps: None,
                 decision_latency_ms: Some(10),
+                submit_ack_latency_ms: Some(15),
+                submit_to_first_report_ms: None,
+                submit_to_fill_ms: None,
+                exchange_order_age_ms: None,
                 message: Some("accepted".to_string()),
                 event_time: now_utc(),
             })
@@ -785,5 +1104,33 @@ mod tests {
 
         assert_eq!(storage.count_rows("pnl_snapshots").await.unwrap(), 1);
         assert_eq!(storage.count_rows("pnl_symbol_snapshots").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_storage_persists_account_snapshot_rows() {
+        let temp_dir = std::env::temp_dir().join("bot_trading_pro_storage_test_account_snapshot");
+        let _ = fs::remove_dir_all(&temp_dir).await;
+        let storage = SqliteStorage::new(temp_dir.join("bot.db")).unwrap();
+
+        storage
+            .persist_account_snapshot(&AccountSnapshot {
+                balances: vec![
+                    Balance {
+                        asset: "USDC".to_string(),
+                        free: Decimal::from(1000u32),
+                        locked: Decimal::from(10u32),
+                    },
+                    Balance {
+                        asset: "BTC".to_string(),
+                        free: Decimal::from_str_exact("0.001").unwrap(),
+                        locked: Decimal::ZERO,
+                    },
+                ],
+                updated_at: now_utc(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.count_rows("account_snapshots").await.unwrap(), 2);
     }
 }

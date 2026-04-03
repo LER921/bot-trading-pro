@@ -6,7 +6,7 @@ use domain::{
     ExecutionReport, ExecutionStats, OpenOrder, OrderRequest, OrderStatus, OrderType, RiskDecision,
     RiskMode, Symbol, TimeInForce, TradeIntent,
 };
-use exchange_binance_spot::{BinanceExecutionEvent, BinanceSpotGateway};
+use exchange_binance_spot::{BinanceExecutionEvent, BinanceSpotGateway, PreparedOrder};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,7 +19,7 @@ pub trait ExecutionEngine: Send + Sync {
     async fn cancel_stale_orders(&self, max_age_ms: i64, mid_prices: &HashMap<Symbol, Decimal>) -> Result<usize>;
     async fn reconcile(&self) -> Result<Vec<OpenOrder>>;
     async fn sync_open_orders(&self, open_orders: Vec<OpenOrder>) -> Result<Vec<OpenOrder>>;
-    async fn apply_execution_event(&self, event: &BinanceExecutionEvent) -> Result<()>;
+    async fn apply_execution_event(&self, event: &BinanceExecutionEvent) -> Result<ExecutionReport>;
     async fn stats(&self) -> ExecutionStats;
     async fn open_orders(&self) -> Vec<OpenOrder>;
 }
@@ -31,16 +31,35 @@ struct TrackedOrder {
     status: OrderStatus,
     filled_quantity: Decimal,
     updated_at: common::Timestamp,
+    submit_started_at: Option<common::Timestamp>,
+    decision_latency_ms: Option<i64>,
+    submit_ack_latency_ms: Option<i64>,
+    first_report_observed_at: Option<common::Timestamp>,
+    first_fill_observed_at: Option<common::Timestamp>,
 }
 
 impl TrackedOrder {
-    fn from_request(request: OrderRequest, report: &ExecutionReport) -> Self {
+    fn from_request(
+        request: OrderRequest,
+        report: &ExecutionReport,
+        submit_started_at: Option<common::Timestamp>,
+        observed_at: Option<common::Timestamp>,
+    ) -> Self {
         Self {
             request,
             exchange_order_id: report.exchange_order_id.clone(),
             status: report.status,
             filled_quantity: report.filled_quantity,
             updated_at: report.event_time,
+            submit_started_at,
+            decision_latency_ms: report.decision_latency_ms,
+            submit_ack_latency_ms: report.submit_ack_latency_ms,
+            first_report_observed_at: None,
+            first_fill_observed_at: if report.filled_quantity > Decimal::ZERO {
+                observed_at
+            } else {
+                None
+            },
         }
     }
 
@@ -66,6 +85,11 @@ impl TrackedOrder {
             status: order.status,
             filled_quantity: order.executed_quantity,
             updated_at: order.updated_at,
+            submit_started_at: None,
+            decision_latency_ms: None,
+            submit_ack_latency_ms: None,
+            first_report_observed_at: None,
+            first_fill_observed_at: None,
         }
     }
 
@@ -139,8 +163,12 @@ struct StaleOrderEvaluation {
 struct ExecutionAggregate {
     total_submitted: u64,
     total_rejected: u64,
+    total_local_validation_rejects: u64,
+    total_benign_exchange_rejected: u64,
+    risk_scored_rejections: u64,
     total_canceled: u64,
     total_manual_cancels: u64,
+    total_external_cancels: u64,
     total_filled_reports: u64,
     total_stale_cancels: u64,
     total_duplicate_intents: u64,
@@ -151,6 +179,14 @@ struct ExecutionAggregate {
     slippage_bps_samples: u64,
     decision_latency_ms_sum: Decimal,
     decision_latency_samples: u64,
+    submit_ack_latency_ms_sum: Decimal,
+    submit_ack_latency_samples: u64,
+    submit_to_first_report_ms_sum: Decimal,
+    submit_to_first_report_samples: u64,
+    submit_to_fill_ms_sum: Decimal,
+    submit_to_fill_samples: u64,
+    cancel_ack_latency_ms_sum: Decimal,
+    cancel_ack_latency_samples: u64,
 }
 
 #[derive(Debug, Default)]
@@ -205,7 +241,25 @@ where
             return Ok(None);
         };
 
-        let request = build_order_request(intent);
+        let original_request = build_order_request(intent);
+        let request = match self.gateway.prepare_order(original_request.clone()).await? {
+            PreparedOrder::Ready(request) => request,
+            PreparedOrder::Rejected(raw_report) => {
+                let report =
+                    enrich_report(raw_report, &original_request, intent.created_at, None, now_utc());
+                let mut state = self.state.write().await;
+                state.processed_intents.insert(intent.intent_id.clone());
+                update_aggregate_from_report(&mut state.aggregate, &report);
+                record_decision_latency(&mut state.aggregate, report.decision_latency_ms);
+                warn!(
+                    symbol = %report.symbol,
+                    client_order_id = report.client_order_id,
+                    message = ?report.message,
+                    "execution rejected order locally before exchange submit"
+                );
+                return Ok(Some(report));
+            }
+        };
         {
             let mut state = self.state.write().await;
             if state.processed_intents.contains(&intent.intent_id) {
@@ -239,19 +293,36 @@ where
             "sending order to exchange"
         );
 
+        let submit_started_at = now_utc();
         let raw_report = retry_async(&self.retry_policy, |_| {
             let gateway = gateway.clone();
             let request = request_for_retry.clone();
             async move { gateway.place_order(request).await }
         })
         .await?;
-        let report = enrich_report(raw_report, &request, intent.created_at);
+        let ack_observed_at = now_utc();
+        let report = enrich_report(
+            raw_report,
+            &request,
+            intent.created_at,
+            Some(submit_started_at),
+            ack_observed_at,
+        );
 
         let mut state = self.state.write().await;
         state.processed_intents.insert(intent.intent_id.clone());
         state.aggregate.total_submitted = state.aggregate.total_submitted.saturating_add(1);
         update_aggregate_from_report(&mut state.aggregate, &report);
-        upsert_state_from_request_report(&mut state, request, &report);
+        record_decision_latency(&mut state.aggregate, report.decision_latency_ms);
+        record_submit_ack_latency(&mut state.aggregate, report.submit_ack_latency_ms);
+        record_submit_to_fill_latency(&mut state.aggregate, report.submit_to_fill_ms);
+        upsert_state_from_request_report(
+            &mut state,
+            request,
+            &report,
+            Some(submit_started_at),
+            Some(ack_observed_at),
+        );
 
         info!(
             status = ?report.status,
@@ -264,23 +335,41 @@ where
     }
 
     async fn cancel_all(&self, symbol: Option<Symbol>) -> Result<()> {
-        let canceled = match symbol {
-            Some(symbol) => {
-                self.gateway.cancel_all_orders(symbol).await?;
-                let mut state = self.state.write().await;
-                mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Manual)
-            }
-            None => {
-                for &symbol in &self.symbols {
-                    self.gateway.cancel_all_orders(symbol).await?;
-                }
-                let mut state = self.state.write().await;
-                let symbols = self.symbols.clone();
-                symbols
-                    .into_iter()
-                    .map(|symbol| mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Manual))
-                    .sum()
-            }
+        let orders_to_cancel = {
+            let state = self.state.read().await;
+            state
+                .open_orders
+                .values()
+                .filter(|order| {
+                    is_bot_managed_client_order_id(&order.client_order_id)
+                        && symbol.map(|value| value == order.symbol).unwrap_or(true)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        for order in &orders_to_cancel {
+            let cancel_started_at = now_utc();
+            self.gateway.cancel_order(order).await?;
+            let cancel_observed_at = now_utc();
+            let cancel_ack_latency_ms =
+                (cancel_observed_at - cancel_started_at).whole_milliseconds() as i64;
+            let mut state = self.state.write().await;
+            record_cancel_ack_latency(&mut state.aggregate, Some(cancel_ack_latency_ms));
+        }
+
+        let canceled = {
+            let mut state = self.state.write().await;
+            orders_to_cancel
+                .iter()
+                .filter(|order| {
+                    mark_order_canceled(
+                        &mut state,
+                        &order.client_order_id,
+                        PendingCancelKind::Manual,
+                    )
+                })
+                .count()
         };
 
         info!(?symbol, canceled, cancel_kind = "manual", "cancel-all completed");
@@ -289,33 +378,43 @@ where
 
     async fn cancel_stale_orders(&self, max_age_ms: i64, mid_prices: &HashMap<Symbol, Decimal>) -> Result<usize> {
         let now = now_utc();
-        let stale_symbols = {
+        let stale_orders = {
             let state = self.state.read().await;
-            let mut evaluations_by_symbol: HashMap<Symbol, Vec<StaleOrderEvaluation>> = HashMap::new();
-
-            for order in state.open_orders.values() {
-                let evaluation =
-                    evaluate_stale_order(order, max_age_ms, now, mid_prices.get(&order.symbol).copied());
-                evaluations_by_symbol.entry(order.symbol).or_default().push(evaluation);
-            }
-
-            evaluations_by_symbol
-                .into_iter()
-                .filter_map(|(symbol, evaluations)| should_cancel_symbol(&evaluations).then_some(symbol))
+            state
+                .open_orders
+                .values()
+                .filter(|order| is_bot_managed_client_order_id(&order.client_order_id))
+                .filter_map(|order| {
+                    let evaluation =
+                        evaluate_stale_order(order, max_age_ms, now, mid_prices.get(&order.symbol).copied());
+                    should_cancel_order(evaluation).then_some(order.clone())
+                })
                 .collect::<Vec<_>>()
         };
 
         let mut canceled = 0usize;
-        for symbol in stale_symbols {
-            self.gateway.cancel_all_orders(symbol).await?;
-            let mut state = self.state.write().await;
-            let count = mark_symbol_canceled(&mut state, symbol, PendingCancelKind::Stale);
-            if count > 0 {
+        for order in stale_orders {
+            let cancel_started_at = now_utc();
+            self.gateway.cancel_order(&order).await?;
+            let cancel_observed_at = now_utc();
+            let count = {
+                let mut state = self.state.write().await;
+                let cancel_ack_latency_ms =
+                    (cancel_observed_at - cancel_started_at).whole_milliseconds() as i64;
+                record_cancel_ack_latency(&mut state.aggregate, Some(cancel_ack_latency_ms));
+                usize::from(mark_order_canceled(
+                    &mut state,
+                    &order.client_order_id,
+                    PendingCancelKind::Stale,
+                ))
+            };
+            if count != 0 {
                 info!(
-                    symbol = %symbol,
+                    symbol = %order.symbol,
+                    client_order_id = %order.client_order_id,
                     canceled = count,
                     cancel_kind = "stale",
-                    "stale orders canceled after execution-quality evaluation"
+                    "stale bot order canceled after execution-quality evaluation"
                 );
             }
             canceled += count;
@@ -358,40 +457,74 @@ where
         state.open_orders = next_open_orders;
         state.tracked_orders = next_tracked;
 
-        info!(open_orders = state.open_orders.len(), "execution reconciliation completed");
+        let bot_open_orders = state
+            .open_orders
+            .values()
+            .filter(|order| is_bot_managed_client_order_id(&order.client_order_id))
+            .count();
+        let external_open_orders = state.open_orders.len().saturating_sub(bot_open_orders);
+        info!(
+            open_orders = state.open_orders.len(),
+            bot_open_orders,
+            external_open_orders,
+            "execution reconciliation completed"
+        );
         Ok(state.open_orders.values().cloned().collect())
     }
 
-    async fn apply_execution_event(&self, event: &BinanceExecutionEvent) -> Result<()> {
+    async fn apply_execution_event(&self, event: &BinanceExecutionEvent) -> Result<ExecutionReport> {
         let client_order_id = event.report.client_order_id.clone();
+        let observed_at = now_utc();
         let mut state = self.state.write().await;
+        let mut correlated_report = event.report.clone();
+        let mut first_report_latency = None;
+        let mut first_fill_latency = None;
 
         let report_progressed = if let Some(tracked) = state.tracked_orders.get_mut(&client_order_id) {
             tracked.merge_event_fields(event);
-            tracked.update_from_report(&event.report)
+            correlated_report = correlate_report_with_tracked(
+                event.report.clone(),
+                tracked,
+                observed_at,
+                &mut first_report_latency,
+                &mut first_fill_latency,
+            );
+            tracked.update_from_report(&correlated_report)
         } else {
+            correlated_report.exchange_order_age_ms = event
+                .order_created_at
+                .map(|created_at| (event.report.event_time - created_at).whole_milliseconds() as i64);
             true
         };
 
         let pending_cancel_kind = state.pending_cancel_reports.remove(&client_order_id);
+        record_submit_to_first_report_latency(&mut state.aggregate, first_report_latency);
+        record_submit_to_fill_latency(&mut state.aggregate, first_fill_latency);
         if report_progressed {
-            update_aggregate_from_report(&mut state.aggregate, &event.report);
-            if matches!(event.report.status, OrderStatus::Canceled) && pending_cancel_kind.is_none() {
+            update_aggregate_from_report(&mut state.aggregate, &correlated_report);
+            if matches!(correlated_report.status, OrderStatus::Canceled) && pending_cancel_kind.is_none() {
                 state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(1);
+                state.aggregate.total_external_cancels =
+                    state.aggregate.total_external_cancels.saturating_add(1);
             }
         }
 
-        match event.report.status {
+        match correlated_report.status {
             status if status.is_open() => {
                 if let Some(kind) = pending_cancel_kind {
                     undo_pending_cancel(&mut state.aggregate, kind);
                 }
 
                 let tracked = state.tracked_orders.entry(client_order_id.clone()).or_insert_with(|| {
-                    TrackedOrder::from_request(build_request_from_event(event), &event.report)
+                    TrackedOrder::from_request(
+                        build_request_from_event(event),
+                        &correlated_report,
+                        None,
+                        Some(observed_at),
+                    )
                 });
                 tracked.merge_event_fields(event);
-                tracked.update_from_report(&event.report);
+                tracked.update_from_report(&correlated_report);
 
                 if let Some(open_order) = tracked.to_open_order() {
                     state.open_orders.insert(client_order_id.clone(), open_order);
@@ -412,10 +545,10 @@ where
 
         info!(
             client_order_id = event.report.client_order_id,
-            status = ?event.report.status,
+            status = ?correlated_report.status,
             "execution state updated from user stream event"
         );
-        Ok(())
+        Ok(correlated_report)
     }
 
     async fn stats(&self) -> ExecutionStats {
@@ -470,7 +603,13 @@ fn build_request_from_event(event: &BinanceExecutionEvent) -> OrderRequest {
     }
 }
 
-fn enrich_report(mut report: ExecutionReport, request: &OrderRequest, intent_created_at: common::Timestamp) -> ExecutionReport {
+fn enrich_report(
+    mut report: ExecutionReport,
+    request: &OrderRequest,
+    intent_created_at: common::Timestamp,
+    submit_started_at: Option<common::Timestamp>,
+    observed_at: common::Timestamp,
+) -> ExecutionReport {
     report.requested_price = request.price;
     report.fill_ratio = if request.quantity.is_zero() {
         Decimal::ZERO
@@ -483,7 +622,19 @@ fn enrich_report(mut report: ExecutionReport, request: &OrderRequest, intent_cre
         ),
         _ => None,
     };
-    report.decision_latency_ms = Some((report.event_time - intent_created_at).whole_milliseconds() as i64);
+    report.decision_latency_ms = Some(
+        submit_started_at
+            .map(|started_at| (started_at - intent_created_at).whole_milliseconds() as i64)
+            .unwrap_or_else(|| (observed_at - intent_created_at).whole_milliseconds() as i64),
+    );
+    report.submit_ack_latency_ms = submit_started_at
+        .map(|started_at| (observed_at - started_at).whole_milliseconds() as i64);
+    report.submit_to_first_report_ms = None;
+    report.submit_to_fill_ms = if report.filled_quantity > Decimal::ZERO {
+        report.submit_ack_latency_ms
+    } else {
+        None
+    };
     report
 }
 
@@ -491,9 +642,11 @@ fn upsert_state_from_request_report(
     state: &mut ExecutionState,
     request: OrderRequest,
     report: &ExecutionReport,
+    submit_started_at: Option<common::Timestamp>,
+    observed_at: Option<common::Timestamp>,
 ) {
     if report.status.is_open() {
-        let tracked = TrackedOrder::from_request(request, report);
+        let tracked = TrackedOrder::from_request(request, report, submit_started_at, observed_at);
         if let Some(open_order) = tracked.to_open_order() {
             state
                 .open_orders
@@ -508,11 +661,53 @@ fn upsert_state_from_request_report(
     }
 }
 
+fn correlate_report_with_tracked(
+    mut report: ExecutionReport,
+    tracked: &mut TrackedOrder,
+    observed_at: common::Timestamp,
+    first_report_latency: &mut Option<i64>,
+    first_fill_latency: &mut Option<i64>,
+) -> ExecutionReport {
+    report.decision_latency_ms = tracked.decision_latency_ms;
+    report.submit_ack_latency_ms = tracked.submit_ack_latency_ms;
+
+    if let Some(submit_started_at) = tracked.submit_started_at {
+        let first_report_observed_at = tracked.first_report_observed_at.get_or_insert(observed_at);
+        let report_latency_ms =
+            (*first_report_observed_at - submit_started_at).whole_milliseconds() as i64;
+        report.submit_to_first_report_ms = Some(report_latency_ms);
+        if *first_report_observed_at == observed_at {
+            *first_report_latency = Some(report_latency_ms);
+        }
+
+        if report.filled_quantity > Decimal::ZERO {
+            let first_fill_observed_at = tracked.first_fill_observed_at.get_or_insert(observed_at);
+            let latency_ms = (*first_fill_observed_at - submit_started_at).whole_milliseconds() as i64;
+            report.submit_to_fill_ms = Some(latency_ms);
+            if *first_fill_observed_at == observed_at {
+                *first_fill_latency = Some(latency_ms);
+            }
+        } else {
+            report.submit_to_fill_ms = tracked
+                .first_fill_observed_at
+                .map(|first_fill_observed_at| {
+                    (first_fill_observed_at - submit_started_at).whole_milliseconds() as i64
+                });
+        }
+    }
+
+    report
+}
+
 fn find_equivalent_open_order(state: &ExecutionState, request: &OrderRequest) -> Option<String> {
     state
         .tracked_orders
         .iter()
-        .find(|(_, tracked)| tracked.status.is_open() && equivalent_request(&tracked.request, request))
+        .find(|(client_order_id, tracked)| {
+            is_bot_managed_client_order_id(client_order_id)
+                && tracked.status.is_open()
+                && equivalent_request(&tracked.request, request)
+        })
         .map(|(client_order_id, _)| client_order_id.clone())
 }
 
@@ -522,8 +717,8 @@ fn equivalent_request(left: &OrderRequest, right: &OrderRequest) -> bool {
         && left.order_type == right.order_type
         && left.post_only == right.post_only
         && left.reduce_only == right.reduce_only
-        && price_distance_bps(left.price, right.price) <= dec("1.0")
-        && quantity_distance_ratio(left.quantity, right.quantity) <= dec("0.15")
+        && price_distance_bps(left.price, right.price) <= dec("4.5")
+        && quantity_distance_ratio(left.quantity, right.quantity) <= dec("0.50")
 }
 
 fn quantity_distance_ratio(left: Decimal, right: Decimal) -> Decimal {
@@ -561,14 +756,14 @@ fn evaluate_stale_order(
         order.executed_quantity / order.original_quantity
     };
     let keep_distance_bps = if fill_ratio > Decimal::ZERO {
-        dec("8.0")
+        dec("14.0")
     } else {
-        dec("6.0")
+        dec("12.0")
     };
     let hard_distance_bps = if fill_ratio > Decimal::ZERO {
-        dec("24.0")
+        dec("34.0")
     } else {
-        dec("18.0")
+        dec("28.0")
     };
 
     let distance_bps = match (order.price, mid_price) {
@@ -579,7 +774,7 @@ fn evaluate_stale_order(
     };
 
     let hard_stale = age_ms > max_age_ms.saturating_mul(3) || distance_bps > hard_distance_bps;
-    let cancel_candidate = hard_stale || (age_ms > max_age_ms && distance_bps > dec("4.0"));
+    let cancel_candidate = hard_stale || (age_ms > max_age_ms && distance_bps > dec("8.0"));
     let keep_worthy = age_ms <= max_age_ms && distance_bps <= keep_distance_bps;
 
     StaleOrderEvaluation {
@@ -589,60 +784,38 @@ fn evaluate_stale_order(
     }
 }
 
-fn should_cancel_symbol(evaluations: &[StaleOrderEvaluation]) -> bool {
-    if evaluations.is_empty() {
+fn should_cancel_order(evaluation: StaleOrderEvaluation) -> bool {
+    evaluation.hard_stale || (evaluation.cancel_candidate && !evaluation.keep_worthy)
+}
+
+fn mark_order_canceled(
+    state: &mut ExecutionState,
+    client_order_id: &str,
+    cancel_kind: PendingCancelKind,
+) -> bool {
+    if !state.open_orders.contains_key(client_order_id) {
         return false;
     }
 
-    let any_hard_stale = evaluations.iter().any(|evaluation| evaluation.hard_stale);
-    let any_keep_worthy = evaluations.iter().any(|evaluation| evaluation.keep_worthy);
-    let all_problematic = evaluations
-        .iter()
-        .all(|evaluation| evaluation.cancel_candidate || !evaluation.keep_worthy);
+    state
+        .pending_cancel_reports
+        .insert(client_order_id.to_string(), cancel_kind);
 
-    any_hard_stale && all_problematic && !any_keep_worthy
-}
-
-fn mark_symbol_canceled(
-    state: &mut ExecutionState,
-    symbol: Symbol,
-    cancel_kind: PendingCancelKind,
-) -> usize {
-    let client_order_ids = state
-        .open_orders
-        .values()
-        .filter(|order| order.symbol == symbol)
-        .map(|order| order.client_order_id.clone())
-        .collect::<Vec<_>>();
-
-    let count = client_order_ids.len();
-    if count == 0 {
-        return 0;
-    }
-
-    for client_order_id in &client_order_ids {
-        state
-            .pending_cancel_reports
-            .insert(client_order_id.clone(), cancel_kind);
-    }
-
-    state.open_orders.retain(|_, order| order.symbol != symbol);
-    state.tracked_orders.retain(|client_order_id, tracked| {
-        tracked.request.symbol != symbol && !client_order_ids.contains(client_order_id)
-    });
-    state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(count as u64);
+    state.open_orders.remove(client_order_id);
+    state.tracked_orders.remove(client_order_id);
+    state.aggregate.total_canceled = state.aggregate.total_canceled.saturating_add(1);
     match cancel_kind {
         PendingCancelKind::Manual => {
             state.aggregate.total_manual_cancels =
-                state.aggregate.total_manual_cancels.saturating_add(count as u64);
+                state.aggregate.total_manual_cancels.saturating_add(1);
         }
         PendingCancelKind::Stale => {
             state.aggregate.total_stale_cancels =
-                state.aggregate.total_stale_cancels.saturating_add(count as u64);
+                state.aggregate.total_stale_cancels.saturating_add(1);
         }
     }
 
-    count
+    true
 }
 
 fn undo_pending_cancel(aggregate: &mut ExecutionAggregate, cancel_kind: PendingCancelKind) {
@@ -658,8 +831,24 @@ fn undo_pending_cancel(aggregate: &mut ExecutionAggregate, cancel_kind: PendingC
 }
 
 fn update_aggregate_from_report(aggregate: &mut ExecutionAggregate, report: &ExecutionReport) {
+    if !is_bot_managed_client_order_id(&report.client_order_id) {
+        return;
+    }
+
     if matches!(report.status, OrderStatus::Rejected) {
-        aggregate.total_rejected = aggregate.total_rejected.saturating_add(1);
+        if is_local_validation_reject(report) {
+            aggregate.total_local_validation_rejects =
+                aggregate.total_local_validation_rejects.saturating_add(1);
+        } else {
+            aggregate.total_rejected = aggregate.total_rejected.saturating_add(1);
+            if is_benign_exchange_reject(report) {
+                aggregate.total_benign_exchange_rejected =
+                    aggregate.total_benign_exchange_rejected.saturating_add(1);
+            } else {
+                aggregate.risk_scored_rejections =
+                    aggregate.risk_scored_rejections.saturating_add(1);
+            }
+        }
     }
 
     if matches!(report.status, OrderStatus::Filled | OrderStatus::PartiallyFilled) {
@@ -673,10 +862,44 @@ fn update_aggregate_from_report(aggregate: &mut ExecutionAggregate, report: &Exe
         aggregate.slippage_bps_sum += slippage_bps;
         aggregate.slippage_bps_samples = aggregate.slippage_bps_samples.saturating_add(1);
     }
+}
 
-    if let Some(latency_ms) = report.decision_latency_ms {
+fn record_decision_latency(aggregate: &mut ExecutionAggregate, latency_ms: Option<i64>) {
+    if let Some(latency_ms) = latency_ms {
         aggregate.decision_latency_ms_sum += Decimal::from(latency_ms);
         aggregate.decision_latency_samples = aggregate.decision_latency_samples.saturating_add(1);
+    }
+}
+
+fn record_submit_ack_latency(aggregate: &mut ExecutionAggregate, latency_ms: Option<i64>) {
+    if let Some(latency_ms) = latency_ms {
+        aggregate.submit_ack_latency_ms_sum += Decimal::from(latency_ms);
+        aggregate.submit_ack_latency_samples = aggregate.submit_ack_latency_samples.saturating_add(1);
+    }
+}
+
+fn record_submit_to_first_report_latency(
+    aggregate: &mut ExecutionAggregate,
+    latency_ms: Option<i64>,
+) {
+    if let Some(latency_ms) = latency_ms {
+        aggregate.submit_to_first_report_ms_sum += Decimal::from(latency_ms);
+        aggregate.submit_to_first_report_samples =
+            aggregate.submit_to_first_report_samples.saturating_add(1);
+    }
+}
+
+fn record_submit_to_fill_latency(aggregate: &mut ExecutionAggregate, latency_ms: Option<i64>) {
+    if let Some(latency_ms) = latency_ms {
+        aggregate.submit_to_fill_ms_sum += Decimal::from(latency_ms);
+        aggregate.submit_to_fill_samples = aggregate.submit_to_fill_samples.saturating_add(1);
+    }
+}
+
+fn record_cancel_ack_latency(aggregate: &mut ExecutionAggregate, latency_ms: Option<i64>) {
+    if let Some(latency_ms) = latency_ms {
+        aggregate.cancel_ack_latency_ms_sum += Decimal::from(latency_ms);
+        aggregate.cancel_ack_latency_samples = aggregate.cancel_ack_latency_samples.saturating_add(1);
     }
 }
 
@@ -685,8 +908,12 @@ fn build_stats(aggregate: &ExecutionAggregate) -> ExecutionStats {
     ExecutionStats {
         total_submitted: aggregate.total_submitted,
         total_rejected: aggregate.total_rejected,
+        total_local_validation_rejects: aggregate.total_local_validation_rejects,
+        total_benign_exchange_rejected: aggregate.total_benign_exchange_rejected,
+        risk_scored_rejections: aggregate.risk_scored_rejections,
         total_canceled: aggregate.total_canceled,
         total_manual_cancels: aggregate.total_manual_cancels,
+        total_external_cancels: aggregate.total_external_cancels,
         total_filled_reports: aggregate.total_filled_reports,
         total_stale_cancels: aggregate.total_stale_cancels,
         total_duplicate_intents: aggregate.total_duplicate_intents,
@@ -695,6 +922,11 @@ fn build_stats(aggregate: &ExecutionAggregate) -> ExecutionStats {
             Decimal::ZERO
         } else {
             Decimal::from(aggregate.total_rejected) / Decimal::from(aggregate.total_submitted)
+        },
+        risk_reject_rate: if aggregate.total_submitted == 0 {
+            Decimal::ZERO
+        } else {
+            Decimal::from(aggregate.risk_scored_rejections) / Decimal::from(aggregate.total_submitted)
         },
         avg_fill_ratio: if aggregate.fill_ratio_samples == 0 {
             Decimal::ZERO
@@ -711,8 +943,56 @@ fn build_stats(aggregate: &ExecutionAggregate) -> ExecutionStats {
         } else {
             aggregate.decision_latency_ms_sum / Decimal::from(aggregate.decision_latency_samples)
         },
+        avg_submit_ack_latency_ms: if aggregate.submit_ack_latency_samples == 0 {
+            Decimal::ZERO
+        } else {
+            aggregate.submit_ack_latency_ms_sum / Decimal::from(aggregate.submit_ack_latency_samples)
+        },
+        avg_submit_to_first_report_ms: if aggregate.submit_to_first_report_samples == 0 {
+            Decimal::ZERO
+        } else {
+            aggregate.submit_to_first_report_ms_sum
+                / Decimal::from(aggregate.submit_to_first_report_samples)
+        },
+        avg_submit_to_fill_ms: if aggregate.submit_to_fill_samples == 0 {
+            Decimal::ZERO
+        } else {
+            aggregate.submit_to_fill_ms_sum / Decimal::from(aggregate.submit_to_fill_samples)
+        },
+        avg_cancel_ack_latency_ms: if aggregate.cancel_ack_latency_samples == 0 {
+            Decimal::ZERO
+        } else {
+            aggregate.cancel_ack_latency_ms_sum / Decimal::from(aggregate.cancel_ack_latency_samples)
+        },
+        decision_latency_samples: aggregate.decision_latency_samples,
+        submit_ack_latency_samples: aggregate.submit_ack_latency_samples,
+        submit_to_first_report_samples: aggregate.submit_to_first_report_samples,
+        submit_to_fill_samples: aggregate.submit_to_fill_samples,
+        cancel_ack_latency_samples: aggregate.cancel_ack_latency_samples,
         updated_at,
     }
+}
+
+fn is_bot_managed_client_order_id(client_order_id: &str) -> bool {
+    client_order_id.starts_with("bot-")
+}
+
+fn is_local_validation_reject(report: &ExecutionReport) -> bool {
+    report
+        .message
+        .as_deref()
+        .map(|message| message.to_ascii_lowercase().starts_with("local order rejection:"))
+        .unwrap_or(false)
+}
+
+fn is_benign_exchange_reject(report: &ExecutionReport) -> bool {
+    let Some(message) = report.message.as_deref() else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("immediately match and take")
+        || normalized.contains("would match and take")
+        || normalized.contains("post only")
 }
 
 #[allow(dead_code)]
@@ -728,6 +1008,10 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         requested_price: request.price,
         slippage_bps: None,
         decision_latency_ms: None,
+        submit_ack_latency_ms: None,
+        submit_to_first_report_ms: None,
+        submit_to_fill_ms: None,
+        exchange_order_age_ms: None,
         message: Some("execution rejection".to_string()),
         event_time: now_utc(),
     }
@@ -755,8 +1039,9 @@ mod tests {
     struct TestGatewayState {
         clock_time: common::Timestamp,
         placed_orders: Vec<OrderRequest>,
-        canceled_symbols: Vec<Symbol>,
+        canceled_orders: Vec<String>,
         fetched_open_orders: HashMap<Symbol, Vec<OpenOrder>>,
+        prepared_order: Option<PreparedOrder>,
     }
 
     impl Default for TestGatewayState {
@@ -764,8 +1049,9 @@ mod tests {
             Self {
                 clock_time: now_utc(),
                 placed_orders: Vec::new(),
-                canceled_symbols: Vec::new(),
+                canceled_orders: Vec::new(),
                 fetched_open_orders: HashMap::new(),
+                prepared_order: None,
             }
         }
     }
@@ -786,8 +1072,12 @@ mod tests {
             self.state.read().await.placed_orders.clone()
         }
 
-        async fn canceled_symbols(&self) -> Vec<Symbol> {
-            self.state.read().await.canceled_symbols.clone()
+        async fn canceled_orders(&self) -> Vec<String> {
+            self.state.read().await.canceled_orders.clone()
+        }
+
+        async fn set_prepared_order(&self, prepared_order: PreparedOrder) {
+            self.state.write().await.prepared_order = Some(prepared_order);
         }
     }
 
@@ -878,6 +1168,16 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn prepare_order(&self, request: OrderRequest) -> Result<PreparedOrder> {
+            Ok(self
+                .state
+                .read()
+                .await
+                .prepared_order
+                .clone()
+                .unwrap_or(PreparedOrder::Ready(request)))
+        }
+
         async fn place_order(&self, request: OrderRequest) -> Result<ExecutionReport> {
             let mut state = self.state.write().await;
             state.placed_orders.push(request.clone());
@@ -902,6 +1202,14 @@ mod tests {
                 requested_price: request.price,
                 slippage_bps: None,
                 decision_latency_ms: Some(0),
+                submit_ack_latency_ms: Some(0),
+                submit_to_first_report_ms: None,
+                submit_to_fill_ms: if matches!(status, OrderStatus::Filled) {
+                    Some(0)
+                } else {
+                    None
+                },
+                exchange_order_age_ms: None,
                 message: Some("mock accepted".to_string()),
                 event_time: state.clock_time,
             })
@@ -909,8 +1217,16 @@ mod tests {
 
         async fn cancel_all_orders(&self, symbol: Symbol) -> Result<()> {
             let mut state = self.state.write().await;
-            state.canceled_symbols.push(symbol);
             state.fetched_open_orders.remove(&symbol);
+            Ok(())
+        }
+
+        async fn cancel_order(&self, order: &OpenOrder) -> Result<()> {
+            let mut state = self.state.write().await;
+            state.canceled_orders.push(order.client_order_id.clone());
+            if let Some(orders) = state.fetched_open_orders.get_mut(&order.symbol) {
+                orders.retain(|candidate| candidate.client_order_id != order.client_order_id);
+            }
             Ok(())
         }
 
@@ -1012,7 +1328,11 @@ mod tests {
                 },
                 requested_price: request.price,
                 slippage_bps: None,
-                decision_latency_ms: Some(1),
+                decision_latency_ms: None,
+                submit_ack_latency_ms: None,
+                submit_to_first_report_ms: None,
+                submit_to_fill_ms: None,
+                exchange_order_age_ms: None,
                 message: Some("event".to_string()),
                 event_time: now_utc(),
             },
@@ -1049,7 +1369,7 @@ mod tests {
 
         engine
             .sync_open_orders(vec![sample_open_order(
-                "btc-stale",
+                "bot-btc-stale",
                 Symbol::BtcUsdc,
                 Side::Buy,
                 dec("90"),
@@ -1064,7 +1384,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(canceled, 1);
-        assert_eq!(gateway.canceled_symbols().await, vec![Symbol::BtcUsdc]);
+        assert_eq!(gateway.canceled_orders().await, vec!["bot-btc-stale".to_string()]);
         assert!(engine.open_orders().await.is_empty());
     }
 
@@ -1075,7 +1395,7 @@ mod tests {
 
         engine
             .sync_open_orders(vec![sample_open_order(
-                "btc-keep",
+                "bot-btc-keep",
                 Symbol::BtcUsdc,
                 Side::Buy,
                 dec("99.98"),
@@ -1090,20 +1410,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(canceled, 0);
-        assert!(gateway.canceled_symbols().await.is_empty());
+        assert!(gateway.canceled_orders().await.is_empty());
         assert_eq!(engine.open_orders().await.len(), 1);
     }
 
     #[tokio::test]
-    async fn mixed_orders_only_cancel_fully_problematic_symbol() {
+    async fn mixed_orders_cancel_only_truly_stale_orders() {
         let gateway = TestGateway::new();
         let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc, Symbol::EthUsdc]);
 
         engine
             .sync_open_orders(vec![
-                sample_open_order("btc-stale", Symbol::BtcUsdc, Side::Buy, dec("88"), 7_000),
-                sample_open_order("btc-keep", Symbol::BtcUsdc, Side::Sell, dec("100.03"), 900),
-                sample_open_order("eth-stale", Symbol::EthUsdc, Side::Buy, dec("1500"), 7_000),
+                sample_open_order("bot-btc-stale", Symbol::BtcUsdc, Side::Buy, dec("88"), 7_000),
+                sample_open_order("bot-btc-keep", Symbol::BtcUsdc, Side::Sell, dec("100.03"), 900),
+                sample_open_order("bot-eth-stale", Symbol::EthUsdc, Side::Buy, dec("1500"), 7_000),
             ])
             .await
             .unwrap();
@@ -1116,11 +1436,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(canceled, 1);
-        assert_eq!(gateway.canceled_symbols().await, vec![Symbol::EthUsdc]);
+        assert_eq!(canceled, 2);
+        let mut canceled_orders = gateway.canceled_orders().await;
+        canceled_orders.sort();
+        assert_eq!(
+            canceled_orders,
+            vec!["bot-btc-stale".to_string(), "bot-eth-stale".to_string()]
+        );
         let remaining = engine.open_orders().await;
-        assert_eq!(remaining.len(), 2);
-        assert!(remaining.iter().all(|order| order.symbol == Symbol::BtcUsdc));
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].client_order_id, "bot-btc-keep");
     }
 
     #[tokio::test]
@@ -1179,6 +1504,206 @@ mod tests {
         let stats = engine.stats().await;
         assert_eq!(stats.total_equivalent_order_skips, 1);
         assert_eq!(stats.total_duplicate_intents, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_order_is_the_one_sent_to_exchange_and_tracked() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+        let mut normalized_request =
+            build_order_request(&sample_intent("intent-1", Symbol::BtcUsdc, Side::Buy, dec("100"), dec("0.010")));
+        normalized_request.price = Some(dec("99.99"));
+        normalized_request.quantity = dec("0.009");
+        gateway
+            .set_prepared_order(PreparedOrder::Ready(normalized_request.clone()))
+            .await;
+
+        let report = engine
+            .execute(sample_decision(sample_intent(
+                "intent-1",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("100"),
+                dec("0.010"),
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(gateway.placed_orders().await, vec![normalized_request.clone()]);
+        let open_orders = engine.open_orders().await;
+        assert_eq!(open_orders.len(), 1);
+        assert_eq!(open_orders[0].price, normalized_request.price);
+        assert_eq!(open_orders[0].original_quantity, normalized_request.quantity);
+        assert_eq!(report.requested_price, normalized_request.price);
+    }
+
+    #[tokio::test]
+    async fn local_prepare_rejection_returns_report_without_exchange_submit() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+        let rejected_request =
+            build_order_request(&sample_intent("intent-1", Symbol::BtcUsdc, Side::Buy, dec("100"), dec("0.010")));
+        gateway
+            .set_prepared_order(PreparedOrder::Rejected(ExecutionReport {
+                client_order_id: rejected_request.client_order_id.clone(),
+                exchange_order_id: None,
+                symbol: rejected_request.symbol,
+                status: OrderStatus::Rejected,
+                filled_quantity: Decimal::ZERO,
+                average_fill_price: None,
+                fill_ratio: Decimal::ZERO,
+                requested_price: rejected_request.price,
+                slippage_bps: None,
+                decision_latency_ms: None,
+                submit_ack_latency_ms: None,
+                submit_to_first_report_ms: None,
+                submit_to_fill_ms: None,
+                exchange_order_age_ms: None,
+                message: Some("local order rejection: invalid LOT_SIZE".to_string()),
+                event_time: now_utc(),
+            }))
+            .await;
+
+        let report = engine
+            .execute(sample_decision(sample_intent(
+                "intent-1",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("100"),
+                dec("0.010"),
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(report.status, OrderStatus::Rejected);
+        assert!(report
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local order rejection"));
+        assert!(gateway.placed_orders().await.is_empty());
+        let stats = engine.stats().await;
+        assert_eq!(stats.total_submitted, 0);
+        assert_eq!(stats.total_rejected, 0);
+        assert_eq!(stats.total_local_validation_rejects, 1);
+        assert_eq!(stats.decision_latency_samples, 1);
+        assert_eq!(stats.submit_ack_latency_samples, 0);
+        assert_eq!(stats.submit_to_first_report_samples, 0);
+        assert_eq!(stats.submit_to_fill_samples, 0);
+    }
+
+    #[tokio::test]
+    async fn first_user_stream_report_latency_is_separate_from_submit_ack_latency() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        let report = engine
+            .execute(sample_decision(sample_intent(
+                "intent-1",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("100"),
+                dec("0.010"),
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.submit_ack_latency_ms.is_some());
+        assert!(report.submit_to_first_report_ms.is_none());
+
+        let request = gateway.placed_orders().await[0].clone();
+        let mut event = execution_event_from_request(&request, OrderStatus::New, Decimal::ZERO);
+        event.report.exchange_order_id = report.exchange_order_id.clone();
+        let correlated = engine.apply_execution_event(&event).await.unwrap();
+
+        assert_eq!(correlated.decision_latency_ms, report.decision_latency_ms);
+        assert_eq!(correlated.submit_ack_latency_ms, report.submit_ack_latency_ms);
+        assert!(correlated.submit_to_first_report_ms.is_some());
+
+        let stats = engine.stats().await;
+        assert_eq!(stats.submit_ack_latency_samples, 1);
+        assert_eq!(stats.submit_to_first_report_samples, 1);
+    }
+
+    #[tokio::test]
+    async fn external_execution_events_do_not_pollute_bot_latency_stats() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        let event = BinanceExecutionEvent {
+            report: ExecutionReport {
+                client_order_id: "manual-1".to_string(),
+                exchange_order_id: Some("manual-exchange-1".to_string()),
+                symbol: Symbol::BtcUsdc,
+                status: OrderStatus::New,
+                filled_quantity: Decimal::ZERO,
+                average_fill_price: Some(dec("100")),
+                fill_ratio: Decimal::ZERO,
+                requested_price: Some(dec("100")),
+                slippage_bps: None,
+                decision_latency_ms: None,
+                submit_ack_latency_ms: None,
+                submit_to_first_report_ms: None,
+                submit_to_fill_ms: None,
+                exchange_order_age_ms: Some(8_000),
+                message: Some("manual".to_string()),
+                event_time: now_utc(),
+            },
+            side: Side::Buy,
+            order_type: OrderType::LimitMaker,
+            time_in_force: Some(TimeInForce::Gtc),
+            original_quantity: dec("0.01"),
+            price: Some(dec("100")),
+            cumulative_filled_quantity: Decimal::ZERO,
+            cumulative_quote_quantity: Decimal::ZERO,
+            last_executed_quantity: Decimal::ZERO,
+            last_executed_price: Some(dec("100")),
+            reject_reason: None,
+            is_working: true,
+            is_maker: true,
+            order_created_at: Some(timestamp_minus_ms(8_000)),
+            transaction_time: now_utc(),
+            fill: None,
+            fill_recovery: None,
+        };
+
+        let correlated = engine.apply_execution_event(&event).await.unwrap();
+        let exchange_order_age_ms = correlated.exchange_order_age_ms.unwrap_or_default();
+        assert!(exchange_order_age_ms >= 7_900);
+        assert!(exchange_order_age_ms <= 8_100);
+
+        let stats = engine.stats().await;
+        assert_eq!(stats.total_submitted, 0);
+        assert_eq!(stats.decision_latency_samples, 0);
+        assert_eq!(stats.submit_ack_latency_samples, 0);
+        assert_eq!(stats.submit_to_first_report_samples, 0);
+        assert_eq!(stats.submit_to_fill_samples, 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_tracks_cancel_ack_latency_without_execution_reports() {
+        let gateway = TestGateway::new();
+        let engine = BinanceExecutionEngine::new(gateway.clone(), vec![Symbol::BtcUsdc]);
+
+        engine
+            .sync_open_orders(vec![sample_open_order(
+                "bot-btc-cancel",
+                Symbol::BtcUsdc,
+                Side::Buy,
+                dec("100"),
+                1_000,
+            )])
+            .await
+            .unwrap();
+
+        engine.cancel_all(Some(Symbol::BtcUsdc)).await.unwrap();
+
+        let stats = engine.stats().await;
+        assert_eq!(stats.cancel_ack_latency_samples, 1);
+        assert_eq!(stats.submit_ack_latency_samples, 0);
+        assert_eq!(stats.submit_to_fill_samples, 0);
     }
 
     #[tokio::test]
