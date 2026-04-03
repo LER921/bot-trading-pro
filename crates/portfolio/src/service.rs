@@ -122,6 +122,9 @@ impl PortfolioService for InMemoryPortfolioService {
             quote_position: Decimal::ZERO,
             mark_price: Some(fill.price),
             average_entry_price: None,
+            position_opened_at: None,
+            last_fill_at: None,
+            first_reduce_at: None,
             updated_at: fill.event_time,
         });
         apply_fill_to_inventory(entry, &fill);
@@ -136,6 +139,9 @@ impl PortfolioService for InMemoryPortfolioService {
             quote_position: Decimal::ZERO,
             mark_price: Some(mark_price),
             average_entry_price: None,
+            position_opened_at: None,
+            last_fill_at: None,
+            first_reduce_at: None,
             updated_at: now_utc(),
         });
         entry.mark_price = Some(mark_price);
@@ -212,6 +218,9 @@ fn sync_inventory(
         quote_position: Decimal::ZERO,
         mark_price: None,
         average_entry_price: None,
+        position_opened_at: None,
+        last_fill_at: None,
+        first_reduce_at: None,
         updated_at,
     });
 
@@ -233,6 +242,14 @@ fn sync_inventory(
     if entry.base_position.is_zero() {
         entry.quote_position = Decimal::ZERO;
         entry.average_entry_price = None;
+        entry.position_opened_at = None;
+        entry.last_fill_at = None;
+        entry.first_reduce_at = None;
+    } else if same_nonzero_direction(previous_base, entry.base_position) {
+        entry.position_opened_at = entry.position_opened_at.or(Some(updated_at));
+    } else {
+        entry.position_opened_at = Some(updated_at);
+        entry.first_reduce_at = None;
     }
     entry.updated_at = updated_at;
 }
@@ -242,6 +259,13 @@ fn apply_fill_to_inventory(entry: &mut InventorySnapshot, fill: &FillEvent) {
     let signed_quantity = signed_fill_quantity(fill.side, fill.quantity);
     let next_base = previous_base + signed_quantity;
     let previous_average_entry = entry.average_entry_price;
+    let was_flat = previous_base.is_zero();
+    let position_reversed =
+        !was_flat && !next_base.is_zero() && direction(previous_base) != direction(next_base);
+    let reduced_existing_position = !was_flat
+        && !position_reversed
+        && direction(previous_base) != direction(signed_quantity)
+        && next_base.abs() < previous_base.abs();
 
     entry.base_position = next_base;
     entry.average_entry_price = match previous_average_entry {
@@ -266,6 +290,16 @@ fn apply_fill_to_inventory(entry: &mut InventorySnapshot, fill: &FillEvent) {
         Some(average_entry_price) => signed_quote_position(next_base, average_entry_price),
         None => Decimal::ZERO,
     };
+    if next_base.is_zero() {
+        entry.position_opened_at = None;
+        entry.first_reduce_at = None;
+    } else if was_flat || position_reversed {
+        entry.position_opened_at = Some(fill.event_time);
+        entry.first_reduce_at = None;
+    } else if reduced_existing_position && entry.first_reduce_at.is_none() {
+        entry.first_reduce_at = Some(fill.event_time);
+    }
+    entry.last_fill_at = Some(fill.event_time);
     entry.mark_price = Some(fill.price);
     entry.updated_at = fill.event_time;
 }

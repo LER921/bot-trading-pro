@@ -175,6 +175,9 @@ struct InventoryView {
     quote_position: String,
     average_entry_price: Option<String>,
     mark_price: Option<String>,
+    position_opened_at: Option<String>,
+    last_fill_at: Option<String>,
+    first_reduce_at: Option<String>,
     exposure_quote: Option<f64>,
     reserved_quote_notional: String,
     max_quote_notional: String,
@@ -240,6 +243,9 @@ struct ExecutionReportView {
     submit_to_first_report_ms: Option<i64>,
     submit_to_fill_ms: Option<i64>,
     exchange_order_age_ms: Option<i64>,
+    intent_role: Option<String>,
+    exit_stage: Option<String>,
+    exit_reason: Option<String>,
     message: Option<String>,
 }
 
@@ -317,12 +323,42 @@ struct StrategyOutcomeView {
     add_risk_intents: u64,
     open_order_slots_used: u64,
     max_open_order_slots: u64,
+    passive_exit_intents: u64,
+    aggressive_exit_intents: u64,
+    forced_unwind_intents: u64,
+    timeout_exit_intents: u64,
+    reversal_exit_intents: u64,
+    inventory_pressure_exit_intents: u64,
+    adverse_exit_intents: u64,
+    profit_capture_exit_intents: u64,
+    oldest_inventory_age_ms: Option<i64>,
+    stale_inventory_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct StrategyPanel {
     latest_by_symbol: Vec<StrategyOutcomeView>,
     recent: Vec<StrategyOutcomeView>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct LifecycleSymbolView {
+    symbol: String,
+    average_hold_time_ms: Option<i64>,
+    average_time_to_first_exit_ms: Option<i64>,
+    average_time_to_flat_ms: Option<i64>,
+    oldest_live_inventory_age_ms: Option<i64>,
+    inventory_stuck_count: u64,
+    stale_inventory_count: u64,
+    passive_exit_count: u64,
+    aggressive_exit_count: u64,
+    forced_unwind_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct LifecyclePanel {
+    by_symbol: Vec<LifecycleSymbolView>,
+    exit_reasons: Vec<StatusCountView>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -355,6 +391,7 @@ struct DashboardSummary {
     execution: ExecutionPanel,
     risk: RiskPanel,
     strategy: StrategyPanel,
+    lifecycle: LifecyclePanel,
     logs: LogsPanel,
 }
 
@@ -448,6 +485,7 @@ async fn build_summary(state: &AppState) -> Result<DashboardSummary> {
         .collect::<Vec<_>>();
     let latest_strategy = fetch_latest_strategy_by_symbol(&state.pool).await?;
     let recent_strategy = fetch_recent_strategy_outcomes(&state.pool).await?;
+    let lifecycle = fetch_lifecycle_panel(&state.pool, session_started_at).await?;
     let logs = fetch_logs(&state.log_path).await?;
 
     Ok(DashboardSummary {
@@ -486,6 +524,7 @@ async fn build_summary(state: &AppState) -> Result<DashboardSummary> {
             latest_by_symbol: latest_strategy,
             recent: recent_strategy,
         },
+        lifecycle,
         logs,
     })
 }
@@ -899,7 +938,8 @@ async fn fetch_inventory(pool: &Pool<Sqlite>) -> Result<Vec<InventoryView>> {
                 GROUP BY symbol
             )
             SELECT i.observed_at, i.symbol, i.base_position, i.quote_position, i.mark_price,
-                   i.average_entry_price, i.max_quote_notional, i.reserved_quote_notional,
+                   i.average_entry_price, i.position_opened_at, i.last_fill_at, i.first_reduce_at,
+                   i.max_quote_notional, i.reserved_quote_notional,
                    i.soft_inventory_base, i.max_inventory_base,
                    i.neutralization_clip_fraction, i.reduce_only_trigger_ratio
             FROM inventory_snapshots i
@@ -927,6 +967,9 @@ async fn fetch_inventory(pool: &Pool<Sqlite>) -> Result<Vec<InventoryView>> {
                 quote_position: quote_position.clone(),
                 average_entry_price: row.get("average_entry_price"),
                 mark_price: mark_price.clone(),
+                position_opened_at: row.get("position_opened_at"),
+                last_fill_at: row.get("last_fill_at"),
+                first_reduce_at: row.get("first_reduce_at"),
                 exposure_quote: compute_exposure_quote(
                     &base_position,
                     mark_price.as_deref(),
@@ -1048,7 +1091,8 @@ async fn fetch_recent_execution_reports(
                 SELECT event_time, client_order_id, exchange_order_id, symbol, status,
                        filled_quantity, average_fill_price, fill_ratio, requested_price,
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
-                       submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms, message
+                       submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                       intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 WHERE event_time >= ?
                 ORDER BY id DESC
@@ -1064,7 +1108,8 @@ async fn fetch_recent_execution_reports(
                 SELECT event_time, client_order_id, exchange_order_id, symbol, status,
                        filled_quantity, average_fill_price, fill_ratio, requested_price,
                        slippage_bps, decision_latency_ms, submit_ack_latency_ms,
-                       submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms, message
+                       submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                       intent_role, exit_stage, exit_reason, message
                 FROM execution_reports
                 ORDER BY id DESC
                 LIMIT 25
@@ -1089,7 +1134,8 @@ async fn fetch_open_orders(pool: &Pool<Sqlite>) -> Result<Vec<ExecutionReportVie
             SELECT e.event_time, e.client_order_id, e.exchange_order_id, e.symbol, e.status,
                    e.filled_quantity, e.average_fill_price, e.fill_ratio, e.requested_price,
                    e.slippage_bps, e.decision_latency_ms, e.submit_ack_latency_ms,
-                   e.submit_to_first_report_ms, e.submit_to_fill_ms, e.exchange_order_age_ms, e.message
+                   e.submit_to_first_report_ms, e.submit_to_fill_ms, e.exchange_order_age_ms,
+                   e.intent_role, e.exit_stage, e.exit_reason, e.message
             FROM execution_reports e
             JOIN latest l ON l.max_id = e.id
             WHERE e.status IN ('New', 'PartiallyFilled')
@@ -1397,7 +1443,11 @@ async fn fetch_latest_strategy_by_symbol(pool: &Pool<Sqlite>) -> Result<Vec<Stra
                    s.runtime_state, s.risk_mode, s.inventory_base, s.spread_bps,
                    s.toxicity_score, s.local_momentum_bps, s.trade_flow_imbalance, s.orderbook_imbalance,
                    s.low_edge_intents, s.medium_edge_intents, s.high_edge_intents,
-                   s.reduce_risk_intents, s.add_risk_intents, s.open_order_slots_used, s.max_open_order_slots
+                   s.reduce_risk_intents, s.add_risk_intents, s.open_order_slots_used, s.max_open_order_slots,
+                   s.passive_exit_intents, s.aggressive_exit_intents, s.forced_unwind_intents,
+                   s.timeout_exit_intents, s.reversal_exit_intents, s.inventory_pressure_exit_intents,
+                   s.adverse_exit_intents, s.profit_capture_exit_intents, s.oldest_inventory_age_ms,
+                   s.stale_inventory_count
             FROM strategy_outcomes s
             JOIN latest l ON l.max_id = s.id
             ORDER BY s.symbol ASC
@@ -1418,7 +1468,11 @@ async fn fetch_recent_strategy_outcomes(pool: &Pool<Sqlite>) -> Result<Vec<Strat
                    runtime_state, risk_mode, inventory_base, spread_bps,
                    toxicity_score, local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
                    low_edge_intents, medium_edge_intents, high_edge_intents,
-                   reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots
+                   reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots,
+                   passive_exit_intents, aggressive_exit_intents, forced_unwind_intents,
+                   timeout_exit_intents, reversal_exit_intents, inventory_pressure_exit_intents,
+                   adverse_exit_intents, profit_capture_exit_intents, oldest_inventory_age_ms,
+                   stale_inventory_count
             FROM strategy_outcomes
             ORDER BY id DESC
             LIMIT 25
@@ -1428,6 +1482,197 @@ async fn fetch_recent_strategy_outcomes(pool: &Pool<Sqlite>) -> Result<Vec<Strat
         .await,
     )?;
     Ok(rows.into_iter().map(map_strategy_outcome).collect())
+}
+
+async fn fetch_lifecycle_panel(
+    pool: &Pool<Sqlite>,
+    session_started_at: Option<&str>,
+) -> Result<LifecyclePanel> {
+    let per_symbol_rows = default_if_missing(
+        if let Some(since) = session_started_at {
+            sqlx::query(
+                r#"
+                WITH exit_stats AS (
+                    SELECT symbol,
+                           AVG(hold_time_ms) AS average_hold_time_ms,
+                           AVG(time_to_first_exit_ms) AS average_time_to_first_exit_ms,
+                           AVG(hold_time_ms) AS average_time_to_flat_ms,
+                           SUM(CASE WHEN passive_exit != 0 THEN 1 ELSE 0 END) AS passive_exit_count,
+                           SUM(CASE WHEN aggressive_exit != 0 THEN 1 ELSE 0 END) AS aggressive_exit_count,
+                           SUM(CASE WHEN forced_unwind != 0 THEN 1 ELSE 0 END) AS forced_unwind_count
+                    FROM position_exit_events
+                    WHERE closed_at >= ?
+                    GROUP BY symbol
+                ),
+                latest_inventory AS (
+                    SELECT i.symbol, i.position_opened_at
+                    FROM inventory_snapshots i
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM inventory_snapshots
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = i.id
+                ),
+                latest_strategy AS (
+                    SELECT s.symbol, s.oldest_inventory_age_ms, s.stale_inventory_count
+                    FROM strategy_outcomes s
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM strategy_outcomes
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = s.id
+                ),
+                universe AS (
+                    SELECT symbol FROM latest_inventory
+                    UNION
+                    SELECT symbol FROM exit_stats
+                    UNION
+                    SELECT symbol FROM latest_strategy
+                )
+                SELECT u.symbol,
+                       CAST(ROUND(es.average_hold_time_ms) AS INTEGER) AS average_hold_time_ms,
+                       CAST(ROUND(es.average_time_to_first_exit_ms) AS INTEGER) AS average_time_to_first_exit_ms,
+                       CAST(ROUND(es.average_time_to_flat_ms) AS INTEGER) AS average_time_to_flat_ms,
+                       ls.oldest_inventory_age_ms,
+                       ls.stale_inventory_count,
+                       CASE
+                           WHEN li.position_opened_at IS NOT NULL AND ls.oldest_inventory_age_ms IS NOT NULL AND ls.oldest_inventory_age_ms >= 45000 THEN 1
+                           ELSE 0
+                       END AS inventory_stuck_count,
+                       COALESCE(es.passive_exit_count, 0) AS passive_exit_count,
+                       COALESCE(es.aggressive_exit_count, 0) AS aggressive_exit_count,
+                       COALESCE(es.forced_unwind_count, 0) AS forced_unwind_count
+                FROM universe u
+                LEFT JOIN exit_stats es ON es.symbol = u.symbol
+                LEFT JOIN latest_inventory li ON li.symbol = u.symbol
+                LEFT JOIN latest_strategy ls ON ls.symbol = u.symbol
+                ORDER BY u.symbol ASC
+                "#,
+            )
+            .bind(since)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                WITH exit_stats AS (
+                    SELECT symbol,
+                           AVG(hold_time_ms) AS average_hold_time_ms,
+                           AVG(time_to_first_exit_ms) AS average_time_to_first_exit_ms,
+                           AVG(hold_time_ms) AS average_time_to_flat_ms,
+                           SUM(CASE WHEN passive_exit != 0 THEN 1 ELSE 0 END) AS passive_exit_count,
+                           SUM(CASE WHEN aggressive_exit != 0 THEN 1 ELSE 0 END) AS aggressive_exit_count,
+                           SUM(CASE WHEN forced_unwind != 0 THEN 1 ELSE 0 END) AS forced_unwind_count
+                    FROM position_exit_events
+                    GROUP BY symbol
+                ),
+                latest_inventory AS (
+                    SELECT i.symbol, i.position_opened_at
+                    FROM inventory_snapshots i
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM inventory_snapshots
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = i.id
+                ),
+                latest_strategy AS (
+                    SELECT s.symbol, s.oldest_inventory_age_ms, s.stale_inventory_count
+                    FROM strategy_outcomes s
+                    JOIN (
+                        SELECT symbol, MAX(id) AS max_id
+                        FROM strategy_outcomes
+                        GROUP BY symbol
+                    ) latest ON latest.max_id = s.id
+                ),
+                universe AS (
+                    SELECT symbol FROM latest_inventory
+                    UNION
+                    SELECT symbol FROM exit_stats
+                    UNION
+                    SELECT symbol FROM latest_strategy
+                )
+                SELECT u.symbol,
+                       CAST(ROUND(es.average_hold_time_ms) AS INTEGER) AS average_hold_time_ms,
+                       CAST(ROUND(es.average_time_to_first_exit_ms) AS INTEGER) AS average_time_to_first_exit_ms,
+                       CAST(ROUND(es.average_time_to_flat_ms) AS INTEGER) AS average_time_to_flat_ms,
+                       ls.oldest_inventory_age_ms,
+                       ls.stale_inventory_count,
+                       CASE
+                           WHEN li.position_opened_at IS NOT NULL AND ls.oldest_inventory_age_ms IS NOT NULL AND ls.oldest_inventory_age_ms >= 45000 THEN 1
+                           ELSE 0
+                       END AS inventory_stuck_count,
+                       COALESCE(es.passive_exit_count, 0) AS passive_exit_count,
+                       COALESCE(es.aggressive_exit_count, 0) AS aggressive_exit_count,
+                       COALESCE(es.forced_unwind_count, 0) AS forced_unwind_count
+                FROM universe u
+                LEFT JOIN exit_stats es ON es.symbol = u.symbol
+                LEFT JOIN latest_inventory li ON li.symbol = u.symbol
+                LEFT JOIN latest_strategy ls ON ls.symbol = u.symbol
+                ORDER BY u.symbol ASC
+                "#,
+            )
+            .fetch_all(pool)
+            .await
+        },
+    )?;
+
+    let exit_reason_rows = default_if_missing(
+        if let Some(since) = session_started_at {
+            sqlx::query(
+                r#"
+                SELECT exit_reason, COUNT(*) AS count
+                FROM position_exit_events
+                WHERE closed_at >= ?
+                  AND exit_reason IS NOT NULL
+                  AND TRIM(exit_reason) <> ''
+                GROUP BY exit_reason
+                ORDER BY count DESC, exit_reason ASC
+                LIMIT 12
+                "#,
+            )
+            .bind(since)
+            .fetch_all(pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                SELECT exit_reason, COUNT(*) AS count
+                FROM position_exit_events
+                WHERE exit_reason IS NOT NULL AND TRIM(exit_reason) <> ''
+                GROUP BY exit_reason
+                ORDER BY count DESC, exit_reason ASC
+                LIMIT 12
+                "#,
+            )
+            .fetch_all(pool)
+            .await
+        },
+    )?;
+
+    Ok(LifecyclePanel {
+        by_symbol: per_symbol_rows
+            .into_iter()
+            .map(|row| LifecycleSymbolView {
+                symbol: row.get("symbol"),
+                average_hold_time_ms: row.get("average_hold_time_ms"),
+                average_time_to_first_exit_ms: row.get("average_time_to_first_exit_ms"),
+                average_time_to_flat_ms: row.get("average_time_to_flat_ms"),
+                oldest_live_inventory_age_ms: row.get("oldest_inventory_age_ms"),
+                inventory_stuck_count: row.get::<i64, _>("inventory_stuck_count").max(0) as u64,
+                stale_inventory_count: row.get::<i64, _>("stale_inventory_count").max(0) as u64,
+                passive_exit_count: row.get::<i64, _>("passive_exit_count").max(0) as u64,
+                aggressive_exit_count: row.get::<i64, _>("aggressive_exit_count").max(0) as u64,
+                forced_unwind_count: row.get::<i64, _>("forced_unwind_count").max(0) as u64,
+            })
+            .collect(),
+        exit_reasons: exit_reason_rows
+            .into_iter()
+            .map(|row| StatusCountView {
+                status: row.get("exit_reason"),
+                count: row.get::<i64, _>("count").max(0) as u64,
+            })
+            .collect(),
+    })
 }
 
 async fn fetch_logs(path: &Path) -> Result<LogsPanel> {
@@ -1564,6 +1809,9 @@ fn map_execution_report(row: SqliteRow) -> ExecutionReportView {
         submit_to_first_report_ms: row.get("submit_to_first_report_ms"),
         submit_to_fill_ms: row.get("submit_to_fill_ms"),
         exchange_order_age_ms: row.get("exchange_order_age_ms"),
+        intent_role: row.get("intent_role"),
+        exit_stage: row.get("exit_stage"),
+        exit_reason: row.get("exit_reason"),
         message,
     }
 }
@@ -1594,6 +1842,19 @@ fn map_strategy_outcome(row: SqliteRow) -> StrategyOutcomeView {
         add_risk_intents: row.get::<i64, _>("add_risk_intents").max(0) as u64,
         open_order_slots_used: row.get::<i64, _>("open_order_slots_used").max(0) as u64,
         max_open_order_slots: row.get::<i64, _>("max_open_order_slots").max(0) as u64,
+        passive_exit_intents: row.get::<i64, _>("passive_exit_intents").max(0) as u64,
+        aggressive_exit_intents: row.get::<i64, _>("aggressive_exit_intents").max(0) as u64,
+        forced_unwind_intents: row.get::<i64, _>("forced_unwind_intents").max(0) as u64,
+        timeout_exit_intents: row.get::<i64, _>("timeout_exit_intents").max(0) as u64,
+        reversal_exit_intents: row.get::<i64, _>("reversal_exit_intents").max(0) as u64,
+        inventory_pressure_exit_intents: row
+            .get::<i64, _>("inventory_pressure_exit_intents")
+            .max(0) as u64,
+        adverse_exit_intents: row.get::<i64, _>("adverse_exit_intents").max(0) as u64,
+        profit_capture_exit_intents: row.get::<i64, _>("profit_capture_exit_intents").max(0)
+            as u64,
+        oldest_inventory_age_ms: row.get("oldest_inventory_age_ms"),
+        stale_inventory_count: row.get::<i64, _>("stale_inventory_count").max(0) as u64,
     }
 }
 
@@ -1865,7 +2126,10 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             submit_ack_latency_ms INTEGER,
             submit_to_first_report_ms INTEGER,
             submit_to_fill_ms INTEGER,
-            exchange_order_age_ms INTEGER
+            exchange_order_age_ms INTEGER,
+            intent_role TEXT,
+            exit_stage TEXT,
+            exit_reason TEXT
         );
         "#,
     )
@@ -1882,6 +2146,9 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
     .await?;
     add_column_if_missing(pool, "execution_reports", "submit_to_fill_ms", "INTEGER").await?;
     add_column_if_missing(pool, "execution_reports", "exchange_order_age_ms", "INTEGER").await?;
+    add_column_if_missing(pool, "execution_reports", "intent_role", "TEXT").await?;
+    add_column_if_missing(pool, "execution_reports", "exit_stage", "TEXT").await?;
+    add_column_if_missing(pool, "execution_reports", "exit_reason", "TEXT").await?;
 
     sqlx::query(
         r#"
@@ -2048,12 +2315,40 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             quote_position TEXT NOT NULL,
             mark_price TEXT,
             average_entry_price TEXT,
+            position_opened_at TEXT,
+            last_fill_at TEXT,
+            first_reduce_at TEXT,
             max_quote_notional TEXT NOT NULL,
             reserved_quote_notional TEXT NOT NULL,
             soft_inventory_base TEXT NOT NULL,
             max_inventory_base TEXT NOT NULL,
             neutralization_clip_fraction TEXT NOT NULL,
             reduce_only_trigger_ratio TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    add_column_if_missing(pool, "inventory_snapshots", "position_opened_at", "TEXT").await?;
+    add_column_if_missing(pool, "inventory_snapshots", "last_fill_at", "TEXT").await?;
+    add_column_if_missing(pool, "inventory_snapshots", "first_reduce_at", "TEXT").await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS position_exit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            opened_at TEXT NOT NULL,
+            first_exit_at TEXT,
+            closed_at TEXT NOT NULL,
+            hold_time_ms INTEGER NOT NULL,
+            time_to_first_exit_ms INTEGER,
+            intent_role TEXT,
+            exit_stage TEXT,
+            exit_reason TEXT,
+            passive_exit INTEGER NOT NULL,
+            aggressive_exit INTEGER NOT NULL,
+            forced_unwind INTEGER NOT NULL
         );
         "#,
     )
@@ -2087,7 +2382,17 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
             reduce_risk_intents INTEGER NOT NULL DEFAULT 0,
             add_risk_intents INTEGER NOT NULL DEFAULT 0,
             open_order_slots_used INTEGER NOT NULL DEFAULT 0,
-            max_open_order_slots INTEGER NOT NULL DEFAULT 0
+            max_open_order_slots INTEGER NOT NULL DEFAULT 0,
+            passive_exit_intents INTEGER NOT NULL DEFAULT 0,
+            aggressive_exit_intents INTEGER NOT NULL DEFAULT 0,
+            forced_unwind_intents INTEGER NOT NULL DEFAULT 0,
+            timeout_exit_intents INTEGER NOT NULL DEFAULT 0,
+            reversal_exit_intents INTEGER NOT NULL DEFAULT 0,
+            inventory_pressure_exit_intents INTEGER NOT NULL DEFAULT 0,
+            adverse_exit_intents INTEGER NOT NULL DEFAULT 0,
+            profit_capture_exit_intents INTEGER NOT NULL DEFAULT 0,
+            oldest_inventory_age_ms INTEGER,
+            stale_inventory_count INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )
@@ -2139,6 +2444,71 @@ async fn ensure_dashboard_schema(pool: &Pool<Sqlite>) -> Result<()> {
         pool,
         "strategy_outcomes",
         "max_open_order_slots",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "passive_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "aggressive_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "forced_unwind_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "timeout_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "reversal_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "inventory_pressure_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "adverse_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "profit_capture_exit_intents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(pool, "strategy_outcomes", "oldest_inventory_age_ms", "INTEGER")
+        .await?;
+    add_column_if_missing(
+        pool,
+        "strategy_outcomes",
+        "stale_inventory_count",
         "INTEGER NOT NULL DEFAULT 0",
     )
     .await?;
@@ -2601,5 +2971,119 @@ mod tests {
         assert_eq!(reports[0].submit_to_first_report_ms, Some(95));
         assert_eq!(reports[0].submit_to_fill_ms, Some(410));
         assert_eq!(reports[0].exchange_order_age_ms, Some(5_200));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_panel_exposes_hold_times_and_exit_reasons() {
+        let pool = test_pool().await;
+        let session_start = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(8);
+
+        sqlx::query(
+            r#"
+            INSERT INTO inventory_snapshots (
+                observed_at, symbol, base_position, quote_position, mark_price, average_entry_price,
+                position_opened_at, last_fill_at, first_reduce_at, max_quote_notional,
+                reserved_quote_notional, soft_inventory_base, max_inventory_base,
+                neutralization_clip_fraction, reduce_only_trigger_ratio
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind((session_start + time::Duration::seconds(40)).to_string())
+        .bind("BTCUSDC")
+        .bind("0.015")
+        .bind("0")
+        .bind(Some("65050"))
+        .bind(Some("64980"))
+        .bind(Some(session_start.to_string()))
+        .bind(Some((session_start + time::Duration::seconds(10)).to_string()))
+        .bind(Some((session_start + time::Duration::seconds(18)).to_string()))
+        .bind("2000")
+        .bind("150")
+        .bind("0.018")
+        .bind("0.030")
+        .bind("0.50")
+        .bind("0.85")
+        .execute(&pool)
+        .await
+        .expect("insert inventory snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO strategy_outcomes (
+                observed_at, symbol, strategy, status, standby_reason, intent_count,
+                best_edge_after_cost_bps, reduce_only_intents, sample_reason,
+                runtime_state, risk_mode, inventory_base, spread_bps, toxicity_score,
+                local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
+                oldest_inventory_age_ms, stale_inventory_count, passive_exit_intents,
+                aggressive_exit_intents, forced_unwind_intents
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind((session_start + time::Duration::seconds(40)).to_string())
+        .bind("BTCUSDC")
+        .bind("market_making")
+        .bind("actionable")
+        .bind("")
+        .bind(1_i64)
+        .bind("4.2")
+        .bind(1_i64)
+        .bind("stale inventory exit")
+        .bind("Trading")
+        .bind("Normal")
+        .bind("0.015")
+        .bind("2.5")
+        .bind("0.22")
+        .bind("-1.5")
+        .bind("-0.18")
+        .bind(Some("-0.24"))
+        .bind(52_000_i64)
+        .bind(1_i64)
+        .bind(2_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert strategy lifecycle snapshot");
+
+        sqlx::query(
+            r#"
+            INSERT INTO position_exit_events (
+                symbol, opened_at, first_exit_at, closed_at, hold_time_ms, time_to_first_exit_ms,
+                intent_role, exit_stage, exit_reason, passive_exit, aggressive_exit, forced_unwind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("BTCUSDC")
+        .bind(session_start.to_string())
+        .bind((session_start + time::Duration::seconds(14)).to_string())
+        .bind((session_start + time::Duration::seconds(32)).to_string())
+        .bind(32_000_i64)
+        .bind(14_000_i64)
+        .bind(Some("ForcedUnwind"))
+        .bind(Some("Aggressive"))
+        .bind(Some("market making aggressive unwind: reversal/toxicity pressure exceeded passive tolerance"))
+        .bind(0_i64)
+        .bind(1_i64)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .expect("insert position exit event");
+
+        let panel = fetch_lifecycle_panel(&pool, Some(&session_start.to_string()))
+            .await
+            .expect("lifecycle panel");
+
+        assert_eq!(panel.by_symbol.len(), 1);
+        assert_eq!(panel.by_symbol[0].symbol, "BTCUSDC");
+        assert_eq!(panel.by_symbol[0].average_hold_time_ms, Some(32_000));
+        assert_eq!(panel.by_symbol[0].average_time_to_first_exit_ms, Some(14_000));
+        assert_eq!(panel.by_symbol[0].aggressive_exit_count, 1);
+        assert_eq!(panel.by_symbol[0].forced_unwind_count, 1);
+        assert_eq!(panel.by_symbol[0].stale_inventory_count, 1);
+        assert!(!panel.exit_reasons.is_empty());
+        assert_eq!(
+            panel.exit_reasons[0].status,
+            "market making aggressive unwind: reversal/toxicity pressure exceeded passive tolerance"
+        );
     }
 }

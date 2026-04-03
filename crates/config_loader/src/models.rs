@@ -190,6 +190,18 @@ impl AppConfig {
             "calibration.market_making.quote_ttl_secs must be > 0"
         );
         ensure!(
+            market_making.soft_hold_secs > 0,
+            "calibration.market_making.soft_hold_secs must be > 0"
+        );
+        ensure!(
+            market_making.stale_hold_secs > market_making.soft_hold_secs,
+            "calibration.market_making.stale_hold_secs must be > calibration.market_making.soft_hold_secs"
+        );
+        ensure!(
+            market_making.aggressive_exit_secs > market_making.stale_hold_secs,
+            "calibration.market_making.aggressive_exit_secs must be > calibration.market_making.stale_hold_secs"
+        );
+        ensure!(
             market_making.min_market_spread_bps <= dec("5.0"),
             "calibration.market_making.min_market_spread_bps must stay in a realistic live gating range"
         );
@@ -232,6 +244,18 @@ impl AppConfig {
         ensure!(
             scalping.quote_ttl_secs > 0,
             "calibration.scalping.quote_ttl_secs must be > 0"
+        );
+        ensure!(
+            scalping.soft_hold_secs > 0,
+            "calibration.scalping.soft_hold_secs must be > 0"
+        );
+        ensure!(
+            scalping.stale_hold_secs > scalping.soft_hold_secs,
+            "calibration.scalping.stale_hold_secs must be > calibration.scalping.soft_hold_secs"
+        );
+        ensure!(
+            scalping.aggressive_exit_secs > scalping.stale_hold_secs,
+            "calibration.scalping.aggressive_exit_secs must be > calibration.scalping.stale_hold_secs"
         );
         ensure!(
             scalping.max_position_fraction < self.risk.inventory.reduce_only_trigger_ratio,
@@ -443,6 +467,9 @@ pub struct MarketMakingCalibrationConfig {
     pub volatility_widening_weight: Decimal,
     pub quote_size_fraction: Decimal,
     pub quote_ttl_secs: i64,
+    pub soft_hold_secs: i64,
+    pub stale_hold_secs: i64,
+    pub aggressive_exit_secs: i64,
 }
 
 impl Default for MarketMakingCalibrationConfig {
@@ -458,6 +485,9 @@ impl Default for MarketMakingCalibrationConfig {
             volatility_widening_weight: dec("0.30"),
             quote_size_fraction: dec("0.12"),
             quote_ttl_secs: 5,
+            soft_hold_secs: 20,
+            stale_hold_secs: 45,
+            aggressive_exit_secs: 75,
         }
     }
 }
@@ -473,6 +503,9 @@ pub struct ScalpingCalibrationConfig {
     pub max_position_fraction: Decimal,
     pub quote_size_fraction: Decimal,
     pub quote_ttl_secs: i64,
+    pub soft_hold_secs: i64,
+    pub stale_hold_secs: i64,
+    pub aggressive_exit_secs: i64,
 }
 
 impl Default for ScalpingCalibrationConfig {
@@ -486,6 +519,9 @@ impl Default for ScalpingCalibrationConfig {
             max_position_fraction: dec("0.40"),
             quote_size_fraction: dec("0.08"),
             quote_ttl_secs: 2,
+            soft_hold_secs: 6,
+            stale_hold_secs: 14,
+            aggressive_exit_secs: 24,
         }
     }
 }

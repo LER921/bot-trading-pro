@@ -1483,6 +1483,9 @@ fn rejected_execution_report(request: &OrderRequest, reason: impl Into<String>) 
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        intent_role: Some(request.intent_role),
+        exit_stage: request.exit_stage,
+        exit_reason: request.exit_reason.clone(),
         message: Some(reason.into()),
         event_time: now_utc(),
     }
@@ -1512,6 +1515,9 @@ fn parse_open_order_response(response: BinanceOpenOrderResponse) -> Result<OpenO
         executed_quantity: parse_decimal(&response.executed_quantity)?,
         status: parse_order_status(&response.status)?,
         reduce_only: false,
+        intent_role: domain::IntentRole::AddRisk,
+        exit_stage: None,
+        exit_reason: None,
         updated_at: millis_timestamp(response.time as i64)?,
     })
 }
@@ -1575,6 +1581,9 @@ fn parse_order_response(expected_symbol: Symbol, response: BinanceOrderResponse)
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        intent_role: None,
+        exit_stage: None,
+        exit_reason: None,
         message: Some(format!("order accepted for {}", expected_symbol)),
         event_time: millis_timestamp(response.transact_time as i64)?,
     })
@@ -1711,6 +1720,9 @@ fn parse_execution_report_event(event: &Value) -> Result<BinanceUserStreamEvent>
                 .and_then(Value::as_i64)
                 .map(|created| required_i64(event, "E").map(|event_time| event_time - created))
                 .transpose()?,
+            intent_role: None,
+            exit_stage: None,
+            exit_reason: None,
             message: non_empty_string(event.get("r").and_then(Value::as_str))
                 .filter(|reason| reason != "NONE"),
             event_time: millis_timestamp(required_i64(event, "E")?)?,
@@ -2270,6 +2282,9 @@ impl BinanceSpotGateway for MockBinanceSpotGateway {
                 None
             },
             exchange_order_age_ms: None,
+            intent_role: Some(request.intent_role),
+            exit_stage: request.exit_stage,
+            exit_reason: request.exit_reason.clone(),
             message: Some("mock order accepted".to_string()),
             event_time: state.clock_time,
         };

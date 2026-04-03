@@ -24,6 +24,9 @@ momentum_skew_weight = "0.20"
 volatility_widening_weight = "0.22"
 quote_size_fraction = "0.18"
 quote_ttl_secs = 6
+soft_hold_secs = 18
+stale_hold_secs = 45
+aggressive_exit_secs = 75
 
 # Opportunistic scalp calibration kept tighter than passive MM on toxicity, size, and inventory usage.
 [scalping]
@@ -35,3 +38,6 @@ max_toxicity_score = "0.50"
 max_position_fraction = "0.25"
 quote_size_fraction = "0.07"
 quote_ttl_secs = 2
+soft_hold_secs = 6
+stale_hold_secs = 14
+aggressive_exit_secs = 24

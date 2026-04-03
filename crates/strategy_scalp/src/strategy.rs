@@ -1,5 +1,8 @@
 use common::{Decimal, ids::new_id, now_utc};
-use domain::{RegimeState, Side, StrategyContext, StrategyKind, StrategyOutcome, TimeInForce, TradeIntent};
+use domain::{
+    ExitStage, IntentRole, RegimeState, Side, StrategyContext, StrategyKind, StrategyOutcome,
+    TimeInForce, TradeIntent,
+};
 
 #[derive(Debug, Clone)]
 pub struct ScalpingConfig {
@@ -11,6 +14,9 @@ pub struct ScalpingConfig {
     pub max_position_fraction: Decimal,
     pub quote_size_fraction: Decimal,
     pub quote_ttl_secs: i64,
+    pub soft_hold_secs: i64,
+    pub stale_hold_secs: i64,
+    pub aggressive_exit_secs: i64,
 }
 
 impl Default for ScalpingConfig {
@@ -24,6 +30,9 @@ impl Default for ScalpingConfig {
             max_position_fraction: Decimal::from_str_exact("0.50").unwrap(),
             quote_size_fraction: Decimal::from_str_exact("0.10").unwrap(),
             quote_ttl_secs: 2,
+            soft_hold_secs: 6,
+            stale_hold_secs: 14,
+            aggressive_exit_secs: 24,
         }
     }
 }
@@ -53,8 +62,13 @@ struct ExitAnalysis {
     tp_bps: Decimal,
     stop_bps: Decimal,
     invalidation_pressure: Decimal,
+    inventory_pressure: Decimal,
+    position_age_secs: i64,
+    stale_inventory: bool,
     take_profit_ready: bool,
     capital_protection: bool,
+    passive_viable: bool,
+    aggressive_unwind: bool,
     exit_quantity: Decimal,
 }
 
@@ -81,7 +95,7 @@ impl ScalpingStrategy {
 
         if context.inventory.base_position > Decimal::ZERO {
             if let Some(exit) =
-                self.exit_intent(context, best.bid_price, base_quote_size, max_position, entry_cost_bps, expires_at)
+                self.exit_intent(context, best, base_quote_size, max_position, entry_cost_bps, expires_at)
             {
                 return StrategyOutcome {
                     intents: vec![exit],
@@ -156,6 +170,9 @@ impl ScalpingStrategy {
                 post_only: false,
                 reduce_only: false,
                 time_in_force: Some(TimeInForce::Ioc),
+                role: IntentRole::AddRisk,
+                exit_stage: None,
+                exit_reason: None,
                 expected_edge_bps: entry.expected_edge_bps,
                 expected_fee_bps: self.config.taker_fee_bps,
                 expected_slippage_bps: self.config.slippage_buffer_bps,
@@ -185,7 +202,7 @@ impl ScalpingStrategy {
     fn exit_intent(
         &self,
         context: &StrategyContext,
-        exit_price: Decimal,
+        best: &domain::BestBidAsk,
         base_quote_size: Decimal,
         max_position: Decimal,
         entry_cost_bps: Decimal,
@@ -196,38 +213,91 @@ impl ScalpingStrategy {
             return None;
         }
 
-        let exit = analyze_exit(context, base_quote_size, max_position, average_entry, exit_price);
-        if !(exit.capital_protection || exit.take_profit_ready || exit.invalidation_pressure >= dec("0.60")) {
+        let exit = analyze_exit(context, &self.config, base_quote_size, max_position, average_entry, best);
+        if !(exit.capital_protection
+            || exit.take_profit_ready
+            || exit.invalidation_pressure >= dec("0.60")
+            || exit.stale_inventory)
+        {
             return None;
         }
 
+        let (role, exit_stage, post_only, time_in_force, limit_price) = if exit.aggressive_unwind {
+            (
+                if exit.position_age_secs >= self.config.aggressive_exit_secs {
+                    IntentRole::EmergencyExit
+                } else {
+                    IntentRole::ForcedUnwind
+                },
+                Some(if exit.position_age_secs >= self.config.aggressive_exit_secs {
+                    ExitStage::Emergency
+                } else {
+                    ExitStage::Aggressive
+                }),
+                false,
+                Some(TimeInForce::Ioc),
+                best.bid_price,
+            )
+        } else if exit.passive_viable {
+            (
+                if exit.take_profit_ready {
+                    IntentRole::PassiveProfitTake
+                } else {
+                    IntentRole::DefensiveExit
+                },
+                Some(ExitStage::Passive),
+                true,
+                Some(TimeInForce::Gtc),
+                best.ask_price,
+            )
+        } else {
+            (
+                IntentRole::DefensiveExit,
+                Some(ExitStage::Tighten),
+                true,
+                Some(TimeInForce::Gtc),
+                best.ask_price,
+            )
+        };
+
         let reason = if exit.capital_protection {
             format!(
-                "scalp exit protect: pnl_bps={} stop_bps={} invalidation={} flow={} mom1={} regime={:?}",
+                "scalp exit protect: pnl_bps={} stop_bps={} invalidation={} flow={} mom1={} age_secs={} regime={:?}",
                 exit.pnl_bps,
                 exit.stop_bps,
                 exit.invalidation_pressure,
                 context.features.trade_flow_imbalance,
                 context.features.momentum_1s_bps,
+                exit.position_age_secs,
                 context.regime.state
             )
         } else if exit.take_profit_ready {
             format!(
-                "scalp exit take-profit: pnl_bps={} tp_bps={} invalidation={} vwap_dist={} flow={}",
+                "scalp exit take-profit: pnl_bps={} tp_bps={} invalidation={} vwap_dist={} flow={} age_secs={}",
                 exit.pnl_bps,
                 exit.tp_bps,
                 exit.invalidation_pressure,
                 context.features.vwap_distance_bps,
-                context.features.trade_flow_imbalance
+                context.features.trade_flow_imbalance,
+                exit.position_age_secs,
+            )
+        } else if exit.stale_inventory {
+            format!(
+                "scalp stale inventory exit: pnl_bps={} invalidation={} inventory_pressure={} age_secs={}",
+                exit.pnl_bps,
+                exit.invalidation_pressure,
+                exit.inventory_pressure,
+                exit.position_age_secs,
             )
         } else {
             format!(
-                "scalp exit invalidation: pnl_bps={} invalidation={} flow={} book={} mom1={}",
+                "scalp exit invalidation: pnl_bps={} invalidation={} flow={} book={} mom1={} age_secs={}",
                 exit.pnl_bps,
                 exit.invalidation_pressure,
                 context.features.trade_flow_imbalance,
                 orderbook_signal(context),
-                context.features.momentum_1s_bps
+                context.features.momentum_1s_bps,
+                exit.position_age_secs,
             )
         };
 
@@ -237,15 +307,22 @@ impl ScalpingStrategy {
             strategy: StrategyKind::Scalping,
             side: Side::Sell,
             quantity: exit.exit_quantity.min(context.inventory.base_position),
-            limit_price: Some(exit_price),
+            limit_price: Some(limit_price),
             max_slippage_bps: self.config.slippage_buffer_bps,
-            post_only: false,
+            post_only,
             reduce_only: true,
-            time_in_force: Some(TimeInForce::Ioc),
+            time_in_force,
+            role,
+            exit_stage,
+            exit_reason: Some(reason.clone()),
             expected_edge_bps: exit.pnl_bps.abs().max(exit.tp_bps / dec("2.0")),
             expected_fee_bps: self.config.taker_fee_bps,
             expected_slippage_bps: self.config.slippage_buffer_bps,
-            edge_after_cost_bps: exit.pnl_bps.abs() - entry_cost_bps,
+            edge_after_cost_bps: exit.pnl_bps - if post_only {
+                self.config.taker_fee_bps * dec("0.75")
+            } else {
+                entry_cost_bps
+            },
             reason,
             created_at: now_utc(),
             expires_at,
@@ -321,11 +398,13 @@ fn analyze_long_entry(context: &StrategyContext, entry_cost_bps: Decimal, config
 
 fn analyze_exit(
     context: &StrategyContext,
+    config: &ScalpingConfig,
     base_quote_size: Decimal,
     max_position: Decimal,
     average_entry: Decimal,
-    exit_price: Decimal,
+    best: &domain::BestBidAsk,
 ) -> ExitAnalysis {
+    let exit_price = best.bid_price;
     let pnl_bps = ((exit_price - average_entry) / average_entry) * Decimal::from(10_000u32);
     let momentum_signal_bps = short_momentum_signal_bps(context);
     let orderbook_signal = orderbook_signal(context);
@@ -345,17 +424,42 @@ fn analyze_exit(
             + toxicity_pressure * dec("0.10")
             + regime_exit * dec("0.10"),
     );
+    let inventory_pressure = if max_position <= Decimal::ZERO {
+        Decimal::ZERO
+    } else {
+        clamp_unit((context.inventory.base_position / max_position).max(Decimal::ZERO))
+    };
+    let position_age_secs = context
+        .inventory
+        .position_opened_at
+        .map(|opened_at| (context.features.computed_at - opened_at).whole_seconds())
+        .unwrap_or_default();
     let tp_bps = context.features.realized_volatility_bps.max(dec("4.0"));
     let stop_bps = (context.features.realized_volatility_bps * dec("0.60")).max(dec("3.0"));
     let take_profit_ready = pnl_bps >= tp_bps
         && (invalidation_pressure >= dec("0.25")
             || context.features.vwap_distance_bps >= dec("6.0")
             || context.features.momentum_1s_bps <= dec("1.0"));
+    let edge_decay = position_age_secs >= config.soft_hold_secs
+        && pnl_bps <= tp_bps / dec("2.0")
+        && best.ask_price > Decimal::ZERO
+        && ((best.ask_price - best.bid_price) / best.ask_price) * Decimal::from(10_000u32)
+            <= dec("1.2");
+    let stale_inventory = position_age_secs >= config.stale_hold_secs
+        || (inventory_pressure >= dec("0.72") && position_age_secs >= config.soft_hold_secs);
     let capital_protection = pnl_bps <= -stop_bps
         || invalidation_pressure >= dec("0.80")
-        || context.features.toxicity_score >= dec("0.80");
+        || context.features.toxicity_score >= dec("0.80")
+        || (edge_decay && inventory_pressure >= dec("0.55"));
+    let aggressive_unwind = capital_protection
+        || position_age_secs >= config.aggressive_exit_secs
+        || (stale_inventory && invalidation_pressure >= dec("0.60"))
+        || (negative_flow >= dec("0.75") && negative_book >= dec("0.60"));
+    let passive_viable = (take_profit_ready || edge_decay || stale_inventory)
+        && !aggressive_unwind
+        && pnl_bps > -(stop_bps / dec("2.0"));
 
-    let full_exit = capital_protection || invalidation_pressure >= dec("0.70");
+    let full_exit = aggressive_unwind || invalidation_pressure >= dec("0.70");
     let partial_exit_size = (base_quote_size * dec("1.20"))
         .max(context.inventory.base_position * dec("0.50"))
         .min(max_position.max(base_quote_size));
@@ -370,8 +474,13 @@ fn analyze_exit(
         tp_bps,
         stop_bps,
         invalidation_pressure,
+        inventory_pressure,
+        position_age_secs,
+        stale_inventory,
         take_profit_ready,
         capital_protection,
+        passive_viable,
+        aggressive_unwind,
         exit_quantity,
     }
 }
@@ -559,6 +668,9 @@ mod tests {
                 quote_position: dec("1000"),
                 mark_price: Some(dec("100.01")),
                 average_entry_price: None,
+                position_opened_at: None,
+                last_fill_at: None,
+                first_reduce_at: None,
                 updated_at: now_utc(),
             },
             soft_inventory_base: dec("0.020"),

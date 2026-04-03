@@ -3,7 +3,8 @@ use async_trait::async_trait;
 use common::Decimal;
 use domain::{
     AccountSnapshot, ExecutionReport, ExecutionStats, FillEvent, InventorySnapshot, PnlSnapshot,
-    RiskDecision, RuntimeTransition, StrategyContext, StrategyOutcome, SymbolBudget, SystemHealth,
+    PositionExitEvent, RiskDecision, RuntimeTransition, StrategyContext, StrategyOutcome,
+    SymbolBudget, SystemHealth,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
@@ -27,6 +28,7 @@ pub trait StorageEngine: Send + Sync {
         inventory: &[InventorySnapshot],
         budgets: &[SymbolBudget],
     ) -> Result<()>;
+    async fn persist_position_exit_event(&self, event: &PositionExitEvent) -> Result<()>;
     async fn persist_strategy_outcome(
         &self,
         strategy: &str,
@@ -109,6 +111,14 @@ impl StorageEngine for MemoryStorage {
             .write()
             .await
             .push(format!("inventory {}", inventory.len()));
+        Ok(())
+    }
+
+    async fn persist_position_exit_event(&self, event: &PositionExitEvent) -> Result<()> {
+        self.events
+            .write()
+            .await
+            .push(format!("position-exit {} {}", event.symbol, event.hold_time_ms));
         Ok(())
     }
 
@@ -262,7 +272,10 @@ impl SqliteStorage {
                         submit_ack_latency_ms INTEGER,
                         submit_to_first_report_ms INTEGER,
                         submit_to_fill_ms INTEGER,
-                        exchange_order_age_ms INTEGER
+                        exchange_order_age_ms INTEGER,
+                        intent_role TEXT,
+                        exit_stage TEXT,
+                        exit_reason TEXT
                     );
                     "#,
                 )
@@ -295,6 +308,27 @@ impl SqliteStorage {
                     "execution_reports",
                     "exchange_order_age_ms",
                     "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "intent_role",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "exit_stage",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "execution_reports",
+                    "exit_reason",
+                    "TEXT",
                 )
                 .await?;
 
@@ -463,12 +497,58 @@ impl SqliteStorage {
                         quote_position TEXT NOT NULL,
                         mark_price TEXT,
                         average_entry_price TEXT,
+                        position_opened_at TEXT,
+                        last_fill_at TEXT,
+                        first_reduce_at TEXT,
                         max_quote_notional TEXT NOT NULL,
                         reserved_quote_notional TEXT NOT NULL,
                         soft_inventory_base TEXT NOT NULL,
                         max_inventory_base TEXT NOT NULL,
                         neutralization_clip_fraction TEXT NOT NULL,
                         reduce_only_trigger_ratio TEXT NOT NULL
+                    );
+                    "#,
+                )
+                .execute(&self.pool)
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "inventory_snapshots",
+                    "position_opened_at",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "inventory_snapshots",
+                    "last_fill_at",
+                    "TEXT",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "inventory_snapshots",
+                    "first_reduce_at",
+                    "TEXT",
+                )
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    CREATE TABLE IF NOT EXISTS position_exit_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT NOT NULL,
+                        opened_at TEXT NOT NULL,
+                        first_exit_at TEXT,
+                        closed_at TEXT NOT NULL,
+                        hold_time_ms INTEGER NOT NULL,
+                        time_to_first_exit_ms INTEGER,
+                        intent_role TEXT,
+                        exit_stage TEXT,
+                        exit_reason TEXT,
+                        passive_exit INTEGER NOT NULL,
+                        aggressive_exit INTEGER NOT NULL,
+                        forced_unwind INTEGER NOT NULL
                     );
                     "#,
                 )
@@ -502,7 +582,17 @@ impl SqliteStorage {
                         reduce_risk_intents INTEGER NOT NULL DEFAULT 0,
                         add_risk_intents INTEGER NOT NULL DEFAULT 0,
                         open_order_slots_used INTEGER NOT NULL DEFAULT 0,
-                        max_open_order_slots INTEGER NOT NULL DEFAULT 0
+                        max_open_order_slots INTEGER NOT NULL DEFAULT 0,
+                        passive_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        aggressive_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        forced_unwind_intents INTEGER NOT NULL DEFAULT 0,
+                        timeout_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        reversal_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        inventory_pressure_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        adverse_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        profit_capture_exit_intents INTEGER NOT NULL DEFAULT 0,
+                        oldest_inventory_age_ms INTEGER,
+                        stale_inventory_count INTEGER NOT NULL DEFAULT 0
                     );
                     "#,
                 )
@@ -554,6 +644,76 @@ impl SqliteStorage {
                     &self.pool,
                     "strategy_outcomes",
                     "max_open_order_slots",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "passive_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "aggressive_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "forced_unwind_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "timeout_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "reversal_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "inventory_pressure_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "adverse_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "profit_capture_exit_intents",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "oldest_inventory_age_ms",
+                    "INTEGER",
+                )
+                .await?;
+                add_column_if_missing(
+                    &self.pool,
+                    "strategy_outcomes",
+                    "stale_inventory_count",
                     "INTEGER NOT NULL DEFAULT 0",
                 )
                 .await?;
@@ -701,8 +861,9 @@ impl StorageEngine for SqliteStorage {
                 event_time, client_order_id, exchange_order_id, symbol, status,
                 filled_quantity, average_fill_price, fill_ratio, requested_price,
                 slippage_bps, decision_latency_ms, submit_ack_latency_ms,
-                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms, message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                submit_to_first_report_ms, submit_to_fill_ms, exchange_order_age_ms,
+                intent_role, exit_stage, exit_reason, message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(report.event_time.to_string())
@@ -720,6 +881,9 @@ impl StorageEngine for SqliteStorage {
         .bind(report.submit_to_first_report_ms)
         .bind(report.submit_to_fill_ms)
         .bind(report.exchange_order_age_ms)
+        .bind(report.intent_role.map(|value| format!("{value:?}")))
+        .bind(report.exit_stage.map(|value| format!("{value:?}")))
+        .bind(&report.exit_reason)
         .bind(&report.message)
         .execute(&self.pool)
         .await?;
@@ -815,10 +979,11 @@ impl StorageEngine for SqliteStorage {
                 r#"
                 INSERT INTO inventory_snapshots (
                     observed_at, symbol, base_position, quote_position, mark_price,
-                    average_entry_price, max_quote_notional, reserved_quote_notional,
+                    average_entry_price, position_opened_at, last_fill_at, first_reduce_at,
+                    max_quote_notional, reserved_quote_notional,
                     soft_inventory_base, max_inventory_base,
                     neutralization_clip_fraction, reduce_only_trigger_ratio
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
             .bind(snapshot.updated_at.to_string())
@@ -827,6 +992,9 @@ impl StorageEngine for SqliteStorage {
             .bind(snapshot.quote_position.to_string())
             .bind(snapshot.mark_price.map(|value| value.to_string()))
             .bind(snapshot.average_entry_price.map(|value| value.to_string()))
+            .bind(snapshot.position_opened_at.map(|value| value.to_string()))
+            .bind(snapshot.last_fill_at.map(|value| value.to_string()))
+            .bind(snapshot.first_reduce_at.map(|value| value.to_string()))
             .bind(budget.max_quote_notional.to_string())
             .bind(budget.reserved_quote_notional.to_string())
             .bind(budget.soft_inventory_base.to_string())
@@ -836,6 +1004,34 @@ impl StorageEngine for SqliteStorage {
             .execute(&self.pool)
             .await?;
         }
+        Ok(())
+    }
+
+    async fn persist_position_exit_event(&self, event: &PositionExitEvent) -> Result<()> {
+        self.ensure_schema().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO position_exit_events (
+                symbol, opened_at, first_exit_at, closed_at, hold_time_ms,
+                time_to_first_exit_ms, intent_role, exit_stage, exit_reason,
+                passive_exit, aggressive_exit, forced_unwind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.symbol.as_str())
+        .bind(event.opened_at.to_string())
+        .bind(event.first_exit_at.map(|value| value.to_string()))
+        .bind(event.closed_at.to_string())
+        .bind(event.hold_time_ms)
+        .bind(event.time_to_first_exit_ms)
+        .bind(event.intent_role.map(|value| format!("{value:?}")))
+        .bind(event.exit_stage.map(|value| format!("{value:?}")))
+        .bind(&event.exit_reason)
+        .bind(if event.passive_exit { 1_i64 } else { 0_i64 })
+        .bind(if event.aggressive_exit { 1_i64 } else { 0_i64 })
+        .bind(if event.forced_unwind { 1_i64 } else { 0_i64 })
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -878,6 +1074,82 @@ impl StorageEngine for SqliteStorage {
             .filter(|intent| intent_reduces_inventory(context.inventory.base_position, intent))
             .count();
         let add_risk_intents = outcome.intents.len().saturating_sub(reduce_risk_intents);
+        let passive_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| matches!(intent.exit_stage, Some(domain::ExitStage::Passive)))
+            .count();
+        let aggressive_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent.exit_stage,
+                    Some(domain::ExitStage::Aggressive | domain::ExitStage::Emergency)
+                )
+            })
+            .count();
+        let forced_unwind_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                matches!(
+                    intent.role,
+                    domain::IntentRole::ForcedUnwind | domain::IntentRole::EmergencyExit
+                )
+            })
+            .count();
+        let timeout_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                intent
+                    .exit_reason
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("hold")
+                    || intent.reason.contains("hold")
+                    || intent.reason.contains("stale")
+            })
+            .count();
+        let reversal_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                intent.reason.contains("reversal") || intent.reason.contains("invalidation")
+            })
+            .count();
+        let inventory_pressure_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                intent.reason.contains("inventory pressure") || intent.reason.contains("inventory")
+            })
+            .count();
+        let adverse_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                intent.reason.contains("toxicity")
+                    || intent.reason.contains("reversal")
+                    || intent.reason.contains("adverse")
+            })
+            .count();
+        let profit_capture_exit_intents = outcome
+            .intents
+            .iter()
+            .filter(|intent| {
+                matches!(intent.role, domain::IntentRole::PassiveProfitTake)
+                    || intent.reason.contains("take-profit")
+                    || intent.reason.contains("profit-take")
+            })
+            .count();
+        let oldest_inventory_age_ms = context.inventory.position_opened_at.map(|opened_at| {
+            (context.features.computed_at - opened_at).whole_milliseconds() as i64
+        });
+        let stale_inventory_count = oldest_inventory_age_ms
+            .map(|age_ms| usize::from(age_ms >= 30_000))
+            .unwrap_or(0);
         let status = if outcome.intents.is_empty() {
             "standby"
         } else {
@@ -901,8 +1173,12 @@ impl StorageEngine for SqliteStorage {
                 runtime_state, risk_mode, inventory_base, spread_bps, toxicity_score,
                 local_momentum_bps, trade_flow_imbalance, orderbook_imbalance,
                 low_edge_intents, medium_edge_intents, high_edge_intents,
-                reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                reduce_risk_intents, add_risk_intents, open_order_slots_used, max_open_order_slots,
+                passive_exit_intents, aggressive_exit_intents, forced_unwind_intents,
+                timeout_exit_intents, reversal_exit_intents, inventory_pressure_exit_intents,
+                adverse_exit_intents, profit_capture_exit_intents, oldest_inventory_age_ms,
+                stale_inventory_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(context.features.computed_at.to_string())
@@ -929,6 +1205,16 @@ impl StorageEngine for SqliteStorage {
         .bind(i64::try_from(add_risk_intents).unwrap_or(i64::MAX))
         .bind(i64::from(context.open_bot_orders_for_symbol))
         .bind(i64::from(context.max_open_orders_for_symbol))
+        .bind(i64::try_from(passive_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(aggressive_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(forced_unwind_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(timeout_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(reversal_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(inventory_pressure_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(adverse_exit_intents).unwrap_or(i64::MAX))
+        .bind(i64::try_from(profit_capture_exit_intents).unwrap_or(i64::MAX))
+        .bind(oldest_inventory_age_ms)
+        .bind(i64::try_from(stale_inventory_count).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1024,8 +1310,8 @@ mod tests {
     use super::*;
     use common::{Decimal, now_utc};
     use domain::{
-        AccountSnapshot, Balance, ExecutionReport, OrderStatus, RuntimeState, RuntimeTransition,
-        Symbol, SymbolPnlSnapshot,
+        AccountSnapshot, Balance, ExecutionReport, ExitStage, IntentRole, OrderStatus,
+        PositionExitEvent, RuntimeState, RuntimeTransition, Symbol, SymbolPnlSnapshot,
     };
     use tokio::fs;
 
@@ -1060,6 +1346,9 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                intent_role: Some(IntentRole::AddRisk),
+                exit_stage: None,
+                exit_reason: None,
                 message: Some("accepted".to_string()),
                 event_time: now_utc(),
             })
@@ -1132,5 +1421,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(storage.count_rows("account_snapshots").await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_storage_persists_position_exit_events() {
+        let temp_dir = std::env::temp_dir().join("bot_trading_pro_storage_test_position_exit");
+        let _ = fs::remove_dir_all(&temp_dir).await;
+        let storage = SqliteStorage::new(temp_dir.join("bot.db")).unwrap();
+        let opened_at = now_utc();
+        let first_exit_at = opened_at;
+        let closed_at = opened_at;
+
+        storage
+            .persist_position_exit_event(&PositionExitEvent {
+                symbol: Symbol::BtcUsdc,
+                opened_at,
+                first_exit_at: Some(first_exit_at),
+                closed_at,
+                hold_time_ms: 31_000,
+                time_to_first_exit_ms: Some(12_000),
+                intent_role: Some(IntentRole::ForcedUnwind),
+                exit_stage: Some(ExitStage::Aggressive),
+                exit_reason: Some("market making aggressive unwind".to_string()),
+                passive_exit: false,
+                aggressive_exit: true,
+                forced_unwind: true,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(storage.count_rows("position_exit_events").await.unwrap(), 1);
     }
 }

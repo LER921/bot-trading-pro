@@ -4,9 +4,9 @@ use anyhow::{bail, Context, Result};
 use common::{Decimal, now_utc};
 use config_loader::AppConfig;
 use domain::{
-    ControlPlaneDecision, ControlPlaneRequest, ExecutionReport, HealthState,
-    InventorySnapshot, MarketSnapshot, OpenOrder, OperatorCommand, RuntimeState,
-    StrategyContext, Symbol, SymbolBudget, SystemHealth,
+    ControlPlaneDecision, ControlPlaneRequest, ExecutionReport, ExitStage, HealthState,
+    IntentRole, InventorySnapshot, MarketSnapshot, OpenOrder, OperatorCommand,
+    PositionExitEvent, RuntimeState, StrategyContext, Symbol, SymbolBudget, SystemHealth,
 };
 use execution::{BinanceExecutionEngine, ExecutionEngine};
 use exchange_binance_spot::{
@@ -36,6 +36,13 @@ use tracing::{info, warn};
 struct FillKey {
     symbol: Symbol,
     trade_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExitMetadata {
+    intent_role: Option<IntentRole>,
+    exit_stage: Option<ExitStage>,
+    exit_reason: Option<String>,
 }
 
 impl FillKey {
@@ -75,6 +82,7 @@ where
     telemetry: TracingTelemetry,
     seen_fills: HashSet<FillKey>,
     pending_fill_recoveries: HashMap<FillKey, BinanceFillRecoveryRequest>,
+    exit_metadata_by_exchange_order_id: HashMap<String, ExitMetadata>,
     operator_pause_active: bool,
     consecutive_cycle_failures: u32,
     risk_off_cancel_applied: bool,
@@ -134,6 +142,7 @@ where
             telemetry: TracingTelemetry,
             seen_fills: HashSet::new(),
             pending_fill_recoveries: HashMap::new(),
+            exit_metadata_by_exchange_order_id: HashMap::new(),
             operator_pause_active,
             consecutive_cycle_failures: 0,
             risk_off_cancel_applied: false,
@@ -807,9 +816,21 @@ where
 
         self.pending_fill_recoveries.remove(&fill_key);
         self.health_tracker.record_fill(fill.event_time);
+        let before_inventory = self
+            .portfolio
+            .inventory(fill.symbol)
+            .await
+            .unwrap_or_else(|| empty_inventory(fill.symbol));
         self.portfolio.apply_fill(fill.clone()).await?;
         self.accounting.record_fill(&fill).await?;
         self.storage.persist_fill(&fill).await?;
+        let after_inventory = self
+            .portfolio
+            .inventory(fill.symbol)
+            .await
+            .unwrap_or_else(|| empty_inventory(fill.symbol));
+        self.maybe_persist_position_exit_event(&before_inventory, &after_inventory, &fill)
+            .await?;
         Ok(true)
     }
 
@@ -1193,8 +1214,59 @@ where
     }
 
     async fn handle_execution_report(&mut self, report: &ExecutionReport) -> Result<()> {
+        if let Some(exchange_order_id) = &report.exchange_order_id {
+            self.exit_metadata_by_exchange_order_id.insert(
+                exchange_order_id.clone(),
+                ExitMetadata {
+                    intent_role: report.intent_role,
+                    exit_stage: report.exit_stage,
+                    exit_reason: report.exit_reason.clone().or_else(|| report.message.clone()),
+                },
+            );
+        }
         self.storage.persist_execution_report(report).await?;
         self.telemetry.emit_execution_report(report).await?;
+        Ok(())
+    }
+
+    async fn maybe_persist_position_exit_event(
+        &mut self,
+        before: &InventorySnapshot,
+        after: &InventorySnapshot,
+        fill: &domain::FillEvent,
+    ) -> Result<()> {
+        if before.base_position <= Decimal::ZERO || !after.base_position.is_zero() {
+            return Ok(());
+        }
+
+        let Some(opened_at) = before.position_opened_at else {
+            return Ok(());
+        };
+        let first_exit_at = before.first_reduce_at.or(Some(fill.event_time));
+        let metadata = self.exit_metadata_by_exchange_order_id.get(&fill.order_id).cloned();
+        let intent_role = metadata.as_ref().and_then(|value| value.intent_role);
+        let exit_stage = metadata.as_ref().and_then(|value| value.exit_stage);
+        let exit_reason = metadata
+            .as_ref()
+            .and_then(|value| value.exit_reason.clone())
+            .or_else(|| Some("unclassified_exit".to_string()));
+        let event = PositionExitEvent {
+            symbol: fill.symbol,
+            opened_at,
+            first_exit_at,
+            closed_at: fill.event_time,
+            hold_time_ms: (fill.event_time - opened_at).whole_milliseconds() as i64,
+            time_to_first_exit_ms: first_exit_at
+                .map(|first_exit_at| (first_exit_at - opened_at).whole_milliseconds() as i64),
+            intent_role,
+            exit_stage,
+            exit_reason,
+            passive_exit: matches!(exit_stage, Some(ExitStage::Passive | ExitStage::Tighten)),
+            aggressive_exit: matches!(exit_stage, Some(ExitStage::Aggressive | ExitStage::Emergency)),
+            forced_unwind: matches!(intent_role, Some(IntentRole::ForcedUnwind | IntentRole::EmergencyExit)),
+        };
+        self.storage.persist_position_exit_event(&event).await?;
+        self.exit_metadata_by_exchange_order_id.remove(&fill.order_id);
         Ok(())
     }
 
@@ -1276,6 +1348,9 @@ fn empty_inventory(symbol: Symbol) -> InventorySnapshot {
         quote_position: Decimal::ZERO,
         mark_price: None,
         average_entry_price: None,
+        position_opened_at: None,
+        last_fill_at: None,
+        first_reduce_at: None,
         updated_at: now_utc(),
     }
 }
@@ -1332,6 +1407,9 @@ fn build_strategy_coordinator(config: &AppConfig) -> DefaultStrategyCoordinator 
                     .volatility_widening_weight,
                 quote_size_fraction: config.calibration.market_making.quote_size_fraction,
                 quote_ttl_secs: config.calibration.market_making.quote_ttl_secs,
+                soft_hold_secs: config.calibration.market_making.soft_hold_secs,
+                stale_hold_secs: config.calibration.market_making.stale_hold_secs,
+                aggressive_exit_secs: config.calibration.market_making.aggressive_exit_secs,
             },
         },
         ScalpingStrategy {
@@ -1344,6 +1422,9 @@ fn build_strategy_coordinator(config: &AppConfig) -> DefaultStrategyCoordinator 
                 max_position_fraction: config.calibration.scalping.max_position_fraction,
                 quote_size_fraction: config.calibration.scalping.quote_size_fraction,
                 quote_ttl_secs: config.calibration.scalping.quote_ttl_secs,
+                soft_hold_secs: config.calibration.scalping.soft_hold_secs,
+                stale_hold_secs: config.calibration.scalping.stale_hold_secs,
+                aggressive_exit_secs: config.calibration.scalping.aggressive_exit_secs,
             },
         },
     )
@@ -1599,6 +1680,9 @@ mod tests {
                 submit_to_first_report_ms: Some(40),
                 submit_to_fill_ms: Some(120),
                 exchange_order_age_ms: Some(120),
+                intent_role: Some(IntentRole::AddRisk),
+                exit_stage: None,
+                exit_reason: None,
                 message: None,
                 event_time: now_utc(),
             },

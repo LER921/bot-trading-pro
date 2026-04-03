@@ -1,4 +1,4 @@
-use crate::Symbol;
+use crate::{ExitStage, IntentRole, Symbol};
 use common::{Decimal, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,9 @@ pub struct InventorySnapshot {
     pub quote_position: Decimal,
     pub mark_price: Option<Decimal>,
     pub average_entry_price: Option<Decimal>,
+    pub position_opened_at: Option<Timestamp>,
+    pub last_fill_at: Option<Timestamp>,
+    pub first_reduce_at: Option<Timestamp>,
     pub updated_at: Timestamp,
 }
 
@@ -62,6 +65,22 @@ pub struct SymbolPnlSnapshot {
     pub fees_quote: Decimal,
     pub peak_net_pnl_quote: Decimal,
     pub drawdown_quote: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PositionExitEvent {
+    pub symbol: Symbol,
+    pub opened_at: Timestamp,
+    pub first_exit_at: Option<Timestamp>,
+    pub closed_at: Timestamp,
+    pub hold_time_ms: i64,
+    pub time_to_first_exit_ms: Option<i64>,
+    pub intent_role: Option<IntentRole>,
+    pub exit_stage: Option<ExitStage>,
+    pub exit_reason: Option<String>,
+    pub passive_exit: bool,
+    pub aggressive_exit: bool,
+    pub forced_unwind: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

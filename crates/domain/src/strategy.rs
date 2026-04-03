@@ -12,6 +12,26 @@ pub enum StrategyKind {
     Scalping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentRole {
+    AddRisk,
+    ReduceRisk,
+    PassiveProfitTake,
+    DefensiveExit,
+    ForcedUnwind,
+    EmergencyExit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitStage {
+    Passive,
+    Tighten,
+    Aggressive,
+    Emergency,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrategyContext {
     pub symbol: Symbol,
@@ -40,6 +60,9 @@ pub struct TradeIntent {
     pub post_only: bool,
     pub reduce_only: bool,
     pub time_in_force: Option<TimeInForce>,
+    pub role: IntentRole,
+    pub exit_stage: Option<ExitStage>,
+    pub exit_reason: Option<String>,
     pub expected_edge_bps: Decimal,
     pub expected_fee_bps: Decimal,
     pub expected_slippage_bps: Decimal,

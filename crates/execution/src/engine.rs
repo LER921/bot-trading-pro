@@ -79,6 +79,9 @@ impl TrackedOrder {
                 time_in_force: Some(TimeInForce::Gtc),
                 post_only: false,
                 reduce_only: order.reduce_only,
+                intent_role: order.intent_role,
+                exit_stage: order.exit_stage,
+                exit_reason: order.exit_reason.clone(),
                 source_intent_id: format!("reconciled-{}", order.client_order_id),
             },
             exchange_order_id: order.exchange_order_id.clone(),
@@ -141,6 +144,9 @@ impl TrackedOrder {
             executed_quantity: self.filled_quantity,
             status: self.status,
             reduce_only: self.request.reduce_only,
+            intent_role: self.request.intent_role,
+            exit_stage: self.request.exit_stage,
+            exit_reason: self.request.exit_reason.clone(),
             updated_at: self.updated_at,
         })
     }
@@ -584,6 +590,9 @@ fn build_order_request(intent: &TradeIntent) -> OrderRequest {
         time_in_force: intent.time_in_force,
         post_only: intent.post_only,
         reduce_only: intent.reduce_only,
+        intent_role: intent.role,
+        exit_stage: intent.exit_stage,
+        exit_reason: intent.exit_reason.clone(),
         source_intent_id: intent.intent_id.clone(),
     }
 }
@@ -599,6 +608,9 @@ fn build_request_from_event(event: &BinanceExecutionEvent) -> OrderRequest {
         time_in_force: event.time_in_force,
         post_only: matches!(event.order_type, OrderType::LimitMaker),
         reduce_only: false,
+        intent_role: domain::IntentRole::AddRisk,
+        exit_stage: None,
+        exit_reason: None,
         source_intent_id: "user-stream".to_string(),
     }
 }
@@ -635,6 +647,9 @@ fn enrich_report(
     } else {
         None
     };
+    report.intent_role = Some(request.intent_role);
+    report.exit_stage = request.exit_stage;
+    report.exit_reason = request.exit_reason.clone();
     report
 }
 
@@ -750,17 +765,30 @@ fn evaluate_stale_order(
     mid_price: Option<Decimal>,
 ) -> StaleOrderEvaluation {
     let age_ms = (now - order.updated_at).whole_milliseconds() as i64;
+    let age_budget_ms = if order.reduce_only {
+        max_age_ms.saturating_mul(3) / 4
+    } else {
+        max_age_ms
+    };
     let fill_ratio = if order.original_quantity.is_zero() {
         Decimal::ZERO
     } else {
         order.executed_quantity / order.original_quantity
     };
-    let keep_distance_bps = if fill_ratio > Decimal::ZERO {
+    let keep_distance_bps = if order.reduce_only && fill_ratio > Decimal::ZERO {
+        dec("11.0")
+    } else if order.reduce_only {
+        dec("9.0")
+    } else if fill_ratio > Decimal::ZERO {
         dec("14.0")
     } else {
         dec("12.0")
     };
-    let hard_distance_bps = if fill_ratio > Decimal::ZERO {
+    let hard_distance_bps = if order.reduce_only && fill_ratio > Decimal::ZERO {
+        dec("24.0")
+    } else if order.reduce_only {
+        dec("20.0")
+    } else if fill_ratio > Decimal::ZERO {
         dec("34.0")
     } else {
         dec("28.0")
@@ -774,8 +802,15 @@ fn evaluate_stale_order(
     };
 
     let hard_stale = age_ms > max_age_ms.saturating_mul(3) || distance_bps > hard_distance_bps;
-    let cancel_candidate = hard_stale || (age_ms > max_age_ms && distance_bps > dec("8.0"));
-    let keep_worthy = age_ms <= max_age_ms && distance_bps <= keep_distance_bps;
+    let cancel_candidate = hard_stale
+        || (age_ms > age_budget_ms
+            && distance_bps
+                > if order.reduce_only {
+                    dec("5.5")
+                } else {
+                    dec("8.0")
+                });
+    let keep_worthy = age_ms <= age_budget_ms && distance_bps <= keep_distance_bps;
 
     StaleOrderEvaluation {
         cancel_candidate,
@@ -1012,6 +1047,9 @@ fn _rejected_report(request: &OrderRequest) -> ExecutionReport {
         submit_to_first_report_ms: None,
         submit_to_fill_ms: None,
         exchange_order_age_ms: None,
+        intent_role: Some(request.intent_role),
+        exit_stage: request.exit_stage,
+        exit_reason: request.exit_reason.clone(),
         message: Some("execution rejection".to_string()),
         event_time: now_utc(),
     }
@@ -1210,6 +1248,9 @@ mod tests {
                     None
                 },
                 exchange_order_age_ms: None,
+                intent_role: Some(request.intent_role),
+                exit_stage: request.exit_stage,
+                exit_reason: request.exit_reason.clone(),
                 message: Some("mock accepted".to_string()),
                 event_time: state.clock_time,
             })
@@ -1265,6 +1306,9 @@ mod tests {
             post_only: true,
             reduce_only: false,
             time_in_force: Some(TimeInForce::Gtc),
+            role: domain::IntentRole::AddRisk,
+            exit_stage: None,
+            exit_reason: None,
             expected_edge_bps: dec("3"),
             expected_fee_bps: dec("0.75"),
             expected_slippage_bps: Decimal::ZERO,
@@ -1303,6 +1347,9 @@ mod tests {
             executed_quantity: Decimal::ZERO,
             status: OrderStatus::New,
             reduce_only: false,
+            intent_role: domain::IntentRole::AddRisk,
+            exit_stage: None,
+            exit_reason: None,
             updated_at: timestamp_minus_ms(age_ms),
         }
     }
@@ -1333,6 +1380,9 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                intent_role: Some(request.intent_role),
+                exit_stage: request.exit_stage,
+                exit_reason: request.exit_reason.clone(),
                 message: Some("event".to_string()),
                 event_time: now_utc(),
             },
@@ -1560,6 +1610,9 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: None,
+                intent_role: Some(rejected_request.intent_role),
+                exit_stage: rejected_request.exit_stage,
+                exit_reason: rejected_request.exit_reason.clone(),
                 message: Some("local order rejection: invalid LOT_SIZE".to_string()),
                 event_time: now_utc(),
             }))
@@ -1648,6 +1701,9 @@ mod tests {
                 submit_to_first_report_ms: None,
                 submit_to_fill_ms: None,
                 exchange_order_age_ms: Some(8_000),
+                intent_role: None,
+                exit_stage: None,
+                exit_reason: None,
                 message: Some("manual".to_string()),
                 event_time: now_utc(),
             },

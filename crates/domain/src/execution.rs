@@ -1,4 +1,4 @@
-use crate::{LiquiditySide, Side, Symbol, TimeInForce};
+use crate::{ExitStage, IntentRole, LiquiditySide, Side, Symbol, TimeInForce};
 use common::{Decimal, Timestamp};
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +38,9 @@ pub struct OrderRequest {
     pub time_in_force: Option<TimeInForce>,
     pub post_only: bool,
     pub reduce_only: bool,
+    pub intent_role: IntentRole,
+    pub exit_stage: Option<ExitStage>,
+    pub exit_reason: Option<String>,
     pub source_intent_id: String,
 }
 
@@ -52,6 +55,9 @@ pub struct OpenOrder {
     pub executed_quantity: Decimal,
     pub status: OrderStatus,
     pub reduce_only: bool,
+    pub intent_role: IntentRole,
+    pub exit_stage: Option<ExitStage>,
+    pub exit_reason: Option<String>,
     pub updated_at: Timestamp,
 }
 
@@ -71,6 +77,9 @@ pub struct ExecutionReport {
     pub submit_to_first_report_ms: Option<i64>,
     pub submit_to_fill_ms: Option<i64>,
     pub exchange_order_age_ms: Option<i64>,
+    pub intent_role: Option<IntentRole>,
+    pub exit_stage: Option<ExitStage>,
+    pub exit_reason: Option<String>,
     pub message: Option<String>,
     pub event_time: Timestamp,
 }
@@ -87,6 +96,9 @@ impl ExecutionReport {
             executed_quantity: self.filled_quantity,
             status: self.status,
             reduce_only: request.reduce_only,
+            intent_role: request.intent_role,
+            exit_stage: request.exit_stage,
+            exit_reason: request.exit_reason.clone(),
             updated_at: self.event_time,
         })
     }

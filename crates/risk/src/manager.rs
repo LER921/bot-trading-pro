@@ -571,6 +571,9 @@ mod tests {
             quote_position: Decimal::ZERO,
             mark_price: Some(mark_price),
             average_entry_price: Some(mark_price),
+            position_opened_at: Some(now_utc()),
+            last_fill_at: Some(now_utc()),
+            first_reduce_at: None,
             updated_at: now_utc(),
         }
     }
@@ -608,6 +611,9 @@ mod tests {
             post_only: true,
             reduce_only: false,
             time_in_force: Some(domain::TimeInForce::Gtc),
+            role: domain::IntentRole::AddRisk,
+            exit_stage: None,
+            exit_reason: None,
             expected_edge_bps: Decimal::from(5u32),
             expected_fee_bps: Decimal::ONE,
             expected_slippage_bps: Decimal::ONE,
@@ -629,6 +635,9 @@ mod tests {
             executed_quantity: Decimal::ZERO,
             status: domain::OrderStatus::New,
             reduce_only: false,
+            intent_role: domain::IntentRole::AddRisk,
+            exit_stage: None,
+            exit_reason: None,
             updated_at: now_utc(),
         }
     }
